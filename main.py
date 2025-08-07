@@ -152,10 +152,6 @@ def eval_step(model, batch, *, key):
 
 
 def log_metrics(step: int, metrics: Dict[str, float], stats, prefix: str):
-    """
-    Log: average load, load imbalance (std), utilization,
-    mean entropy, min entropy, and max entropy across hops.
-    """
     log = {f"{prefix}/{k}": v for k, v in metrics.items()}
     log["step"] = step
 
@@ -163,13 +159,12 @@ def log_metrics(step: int, metrics: Dict[str, float], stats, prefix: str):
         load_means, load_stds, utils, entropies = [], [], [], []
 
         for hop in stats:
-            # hop["load"]: [B, E] array of token-counts per expert
-            load = hop["load"].mean(0)  # [E]: avg tokens per expert
-            norm_load = load / jnp.clip(load.sum(), 1.0)  # normalize
+            load = hop["load"].mean(0)
+            norm_load = load / jnp.clip(load.sum(), 1.0)
 
-            load_means.append(load.mean())  # avg tokens/expert
-            load_stds.append(jnp.std(norm_load))  # std of normalized loads
-            utils.append((load > 0).mean())  # fraction of experts used
+            load_means.append(load.mean())
+            load_stds.append(jnp.std(norm_load))
+            utils.append((load > 0).mean())
 
             ent = -(norm_load * jnp.log(norm_load + 1e-9)).sum() / math.log(
                 norm_load.shape[0]

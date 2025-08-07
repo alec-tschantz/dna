@@ -14,7 +14,7 @@ import wandb
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-from models import Dense, MoE, generate
+from models import Dense, DNA, generate
 
 
 @dataclass
@@ -112,7 +112,7 @@ def compute_loss(model, batch: Dict[str, Any], key, *, inference: bool = False):
 
 
 @eqx.filter_jit
-def train_step(model, opt_state, batch, *, key):
+def train_step(model, opt_state, batch, opt, *, key):
     (loss, (logits, labels, stats)), grads = eqx.filter_value_and_grad(
         compute_loss, has_aux=True
     )(model, batch, key)
@@ -235,7 +235,6 @@ def main():
     )
     wandb.log({"n_params": n_params, "capacity": cfg.capacity, "step": 0})
 
-    global opt
     opt = optax.chain(
         optax.clip_by_global_norm(cfg.clip),
         optax.adamw(
@@ -255,7 +254,7 @@ def main():
 
         t0 = time.perf_counter()
         model, opt_state, loss, acc, stats, gnorm = train_step(
-            model, opt_state, batch, key=sk
+            model, opt_state, batch, opt, key=sk
         )
         dt_ms = (time.perf_counter() - t0) * 1000
 

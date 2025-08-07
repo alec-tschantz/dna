@@ -21,17 +21,17 @@ class Config:
     model_type: str = "dna"
     vocab_size: int = 50_257
     d_model: int = 256
-    n_heads: int = 8
-    n_layers: int = 6
-    n_hops: int = 6
+    n_heads: int = 16
+    n_layers: int = 8
+    n_hops: int = 8
     n_backbone: int = 2
     n_modules: int = 16
     topk: int = 2
-    capacity: int = 32
+    capacity: int = 64
     mlp_mult: int = 4
     dropout: float = 0.1
     rope_base: float = 10_000.0
-    identity_bias: float = 0.0
+    identity_bias: float = 0.01
 
     # ---------------- training ----------------
     batch_size: int = 32
@@ -108,34 +108,43 @@ def compute_loss(model, batch: Dict[str, Any], key, *, inference: bool = False):
     vmap_model = jax.vmap(lambda x, k: model(x, key=k, inference=inference))
     logits, stats = vmap_model(ids, keys)
 
-    logits_shift = logits[:, :-1]
-    labels_shift = ids[:, 1:]
-    mask_shift = mask[:, 1:]
+    logits_shift = logits[:, :-1]  # [B, T-1, V]
+    labels_shift = ids[:, 1:]  # [B, T-1]
+    mask_shift = mask[:, 1:]  # [B, T-1]
 
     raw_loss = optax.softmax_cross_entropy_with_integer_labels(
         logits_shift, labels_shift
     )
     loss = (raw_loss * mask_shift).sum() / jnp.maximum(mask_shift.sum(), 1)
 
-    return loss, (logits_shift, labels_shift, stats)
+    return loss, (logits_shift, labels_shift, mask_shift, stats)
 
 
 @eqx.filter_jit
 def train_step(model, opt_state, batch, *, key):
-    (loss, (logits, labels, stats)), grads = eqx.filter_value_and_grad(
+    (loss, (logits, labels, mask, stats)), grads = eqx.filter_value_and_grad(
         compute_loss, has_aux=True
     )(model, batch, key)
+
     updates, opt_state = opt.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
-    acc = (jnp.argmax(logits, -1) == labels).mean()
+
+    preds = jnp.argmax(logits, -1)
+    correct = (preds == labels) * mask
+    acc = correct.sum() / jnp.maximum(mask.sum(), 1)
+
     gnorm = optax.global_norm(grads)
     return model, opt_state, loss, acc, stats, gnorm
 
 
 @eqx.filter_jit
 def eval_step(model, batch, *, key):
-    loss, (logits, labels, _) = compute_loss(model, batch, key, inference=True)
-    acc = (jnp.argmax(logits, -1) == labels).mean()
+    loss, (logits, labels, mask, _) = compute_loss(model, batch, key, inference=True)
+
+    preds = jnp.argmax(logits, -1)
+    correct = (preds == labels) * mask
+    acc = correct.sum() / jnp.maximum(mask.sum(), 1)
+
     return loss, acc
 
 
@@ -143,6 +152,10 @@ def eval_step(model, batch, *, key):
 
 
 def log_metrics(step: int, metrics: Dict[str, float], stats, prefix: str):
+    """
+    Log: average load, load imbalance (std), utilization,
+    mean entropy, min entropy, and max entropy across hops.
+    """
     log = {f"{prefix}/{k}": v for k, v in metrics.items()}
     log["step"] = step
 
@@ -152,23 +165,30 @@ def log_metrics(step: int, metrics: Dict[str, float], stats, prefix: str):
         for hop in stats:
             # hop["load"]: [B, E] array of token-counts per expert
             load = hop["load"].mean(0)  # [E]: avg tokens per expert
-            norm_load = load / jnp.clip(load.sum(), 1.0)  # normalize to a distribution
+            norm_load = load / jnp.clip(load.sum(), 1.0)  # normalize
 
-            load_means.append(load.mean())  #  avg tokens/expert
+            load_means.append(load.mean())  # avg tokens/expert
             load_stds.append(jnp.std(norm_load))  # std of normalized loads
             utils.append((load > 0).mean())  # fraction of experts used
-            # scalar: entropy of routing
-            entropies.append(
-                -(norm_load * jnp.log(norm_load + 1e-9)).sum()
-                / math.log(norm_load.shape[0])
+
+            ent = -(norm_load * jnp.log(norm_load + 1e-9)).sum() / math.log(
+                norm_load.shape[0]
             )
+            entropies.append(ent)
+
+        load_mean = jnp.mean(jnp.stack(load_means))
+        load_std = jnp.mean(jnp.stack(load_stds))
+        util = jnp.mean(jnp.stack(utils))
+        ent_arr = jnp.stack(entropies)
 
         log.update(
             {
-                f"routing/{prefix}/load_mean": float(jnp.mean(jnp.stack(load_means))),
-                f"routing/{prefix}/load_std": float(jnp.mean(jnp.stack(load_stds))),
-                f"routing/{prefix}/util": float(jnp.mean(jnp.stack(utils))),
-                f"routing/{prefix}/entropy": float(jnp.mean(jnp.stack(entropies))),
+                f"routing/{prefix}/load_mean": float(load_mean),
+                f"routing/{prefix}/load_std": float(load_std),
+                f"routing/{prefix}/util": float(util),
+                f"routing/{prefix}/entropy_mean": float(jnp.mean(ent_arr)),
+                f"routing/{prefix}/entropy_min": float(jnp.min(ent_arr)),
+                f"routing/{prefix}/entropy_max": float(jnp.max(ent_arr)),
             }
         )
 

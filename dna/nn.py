@@ -63,8 +63,6 @@ class Dropout(eqx.Module):
 
 
 class Identity(eqx.Module):
-    """A compute‑free skip expert."""
-
     def __call__(self, x, *_, **__):
         return jnp.zeros_like(x)
 

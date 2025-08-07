@@ -36,17 +36,15 @@ class Config:
     # ---------------- training ----------------
     batch_size: int = 32
     seq_len: int = 256
-    steps: int = 40_000
-    warmup: int = 1_000
-    lr_init: float = 1e-9
-    lr_peak: float = 1e-4
-    lr_final_mult: float = 0.1
+    steps: int = 20_000
+    warmup: int = 2_000
+    lr_peak: float = 2.5e-4
     wd: float = 0.01
     clip: float = 1.0
     seed: int = 42
 
     # ---------------- logging / eval ----------------
-    eval_every: int = 1_000
+    eval_every: int = 250
     log_every: int = 10
     eval_samples: int = 1_000
     example_every: int = 250
@@ -70,7 +68,10 @@ def load_tinystories(tok, seq_len: int, split="train"):
             max_length=seq_len,
             return_tensors="np",
         )
-        return {"input_ids": enc["input_ids"]}
+        return {
+            "input_ids": enc["input_ids"],
+            "attention_mask": enc["attention_mask"],
+        }
 
     return ds.map(_proc, batched=True, batch_size=1_024, remove_columns=["text"])
 
@@ -78,20 +79,21 @@ def load_tinystories(tok, seq_len: int, split="train"):
 def sample_batch(it, bsz: int):
     batch = [next(it) for _ in range(bsz)]
     ids = jnp.stack([jnp.array(b["input_ids"], dtype=jnp.int32) for b in batch])
-    return {"input_ids": ids}
+    amask = jnp.stack([jnp.array(b["attention_mask"], dtype=jnp.int32) for b in batch])
+    return {"input_ids": ids, "attention_mask": amask}
 
 
 # ───────────────────────────────────── LR schedule  ------────────────────────────────────── #
 
 
 def lr_schedule(step: jnp.ndarray):
-    lr = cfg.lr_init + (cfg.lr_peak - cfg.lr_init) * jnp.minimum(step / cfg.warmup, 1.0)
-    plateau_steps = int(cfg.steps * 0.8)
-    lr = jnp.where(step <= plateau_steps, lr, cfg.lr_peak)
-    decay_progress = (step - plateau_steps) / max(1, cfg.steps - plateau_steps)
-    decay_lr = cfg.lr_peak - decay_progress * cfg.lr_peak * (1 - cfg.lr_final_mult)
-    lr = jnp.where(step > plateau_steps, decay_lr, lr)
-    return lr
+    warmup_ratio = jnp.minimum(step / cfg.warmup, 1.0)
+    lr = cfg.lr_peak * warmup_ratio
+    decay_steps = jnp.maximum(cfg.steps - cfg.warmup, 1)
+    progress = jnp.clip((step - cfg.warmup) / decay_steps, 0.0, 1.0)
+    cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * progress))
+    lr = jnp.where(step >= cfg.warmup, cfg.lr_peak * cosine_decay, lr)
+    return jnp.array(lr, dtype=jnp.float32)
 
 
 # ───────────────────────────────────── Loss & step fns ────────────────────────────────────── #
@@ -99,13 +101,22 @@ def lr_schedule(step: jnp.ndarray):
 
 def compute_loss(model, batch: Dict[str, Any], key, *, inference: bool = False):
     ids = batch["input_ids"]  # [B, T]
+    mask = batch["attention_mask"]  # [B, T]
+
     B = ids.shape[0]
     keys = jax.random.split(key, B)
     vmap_model = jax.vmap(lambda x, k: model(x, key=k, inference=inference))
     logits, stats = vmap_model(ids, keys)
 
-    logits_shift, labels_shift = logits[:, :-1], ids[:, 1:]
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits_shift, labels_shift).mean()
+    logits_shift = logits[:, :-1]
+    labels_shift = ids[:, 1:]
+    mask_shift = mask[:, 1:]
+
+    raw_loss = optax.softmax_cross_entropy_with_integer_labels(
+        logits_shift, labels_shift
+    )
+    loss = (raw_loss * mask_shift).sum() / jnp.maximum(mask_shift.sum(), 1)
+
     return loss, (logits_shift, labels_shift, stats)
 
 
@@ -136,20 +147,31 @@ def log_metrics(step: int, metrics: Dict[str, float], stats, prefix: str):
     log["step"] = step
 
     if stats and isinstance(stats[0], dict):
-        for h, hop in enumerate(stats):
-            load, imp = hop["load"].mean(0), hop["importance"].mean(0)
-            ln = load / jnp.clip(load.sum(), 1.0)
-            inorm = imp / jnp.clip(imp.sum(), 1.0)
-            entropy = -(inorm * jnp.log(inorm + 1e-9)).sum() / math.log(inorm.shape[0])
-            log.update(
-                {
-                    f"routing/{prefix}/hop{h}_load_std": float(jnp.std(ln)),
-                    f"routing/{prefix}/hop{h}_imp_std": float(jnp.std(inorm)),
-                    f"routing/{prefix}/hop{h}_dropped": float(hop["dropped"].mean()),
-                    f"routing/{prefix}/hop{h}_util": float((load > 0).mean()),
-                    f"routing/{prefix}/hop{h}_entropy": float(entropy),
-                }
+        load_means, load_stds, utils, entropies = [], [], [], []
+
+        for hop in stats:
+            # hop["load"]: [B, E] array of token-counts per expert
+            load = hop["load"].mean(0)  # [E]: avg tokens per expert
+            norm_load = load / jnp.clip(load.sum(), 1.0)  # normalize to a distribution
+
+            load_means.append(load.mean())  #  avg tokens/expert
+            load_stds.append(jnp.std(norm_load))  # std of normalized loads
+            utils.append((load > 0).mean())  # fraction of experts used
+            # scalar: entropy of routing
+            entropies.append(
+                -(norm_load * jnp.log(norm_load + 1e-9)).sum()
+                / math.log(norm_load.shape[0])
             )
+
+        log.update(
+            {
+                f"routing/{prefix}/load_mean": float(jnp.mean(jnp.stack(load_means))),
+                f"routing/{prefix}/load_std": float(jnp.mean(jnp.stack(load_stds))),
+                f"routing/{prefix}/util": float(jnp.mean(jnp.stack(utils))),
+                f"routing/{prefix}/entropy": float(jnp.mean(jnp.stack(entropies))),
+            }
+        )
+
     wandb.log(log)
 
 

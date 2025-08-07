@@ -1,7 +1,7 @@
 import math
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import equinox as eqx
 import jax
@@ -27,7 +27,7 @@ class Config:
     n_backbone: int = 2
     n_modules: int = 32
     topk: int = 2
-    capacity: int = 32
+    capacity: int = 32  # capacity per trainable expert (identity excluded)
     mlp_mult: int = 4
     dropout: float = 0.1
     rope_base: float = 10_000.0
@@ -100,17 +100,19 @@ def lr_schedule(step: jnp.ndarray):
 
 
 def compute_loss(model, batch: Dict[str, Any], key, *, inference: bool = False):
-    ids = batch["input_ids"]  # [B, T]
-    mask = batch["attention_mask"]  # [B, T]
+    ids = batch["input_ids"]        # [B, T]
+    mask = batch["attention_mask"]  # [B, T] (1=token, 0=pad)
 
     B = ids.shape[0]
     keys = jax.random.split(key, B)
-    vmap_model = jax.vmap(lambda x, k: model(x, key=k, inference=inference))
-    logits, stats = vmap_model(ids, keys)
+    # Pass per-seq mask into the model; model expects [T] bool
+    vmap_model = jax.vmap(lambda x, m, k: model(x, m.astype(bool), key=k, inference=inference))
+    logits, stats = vmap_model(ids, mask, keys)
 
-    logits_shift = logits[:, :-1]  # [B, T-1, V]
-    labels_shift = ids[:, 1:]  # [B, T-1]
-    mask_shift = mask[:, 1:]  # [B, T-1]
+    # Standard next-token loss: shift logits left, labels right
+    logits_shift = logits[:, :-1]   # [B, T-1, V]
+    labels_shift = ids[:, 1:]       # [B, T-1]
+    mask_shift = mask[:, 1:]        # [B, T-1] aligns with labels_shift
 
     raw_loss = optax.softmax_cross_entropy_with_integer_labels(
         logits_shift, labels_shift
@@ -157,9 +159,10 @@ def log_metrics(step: int, metrics: Dict[str, float], stats, prefix: str):
 
     if stats and isinstance(stats[0], dict):
         load_means, load_stds, utils, entropies = [], [], [], []
+        cap_drop_rates = []
 
         for hop in stats:
-            load = hop["load"].mean(0)
+            load = hop["load"].mean(0)  # per-expert post-capacity load
             norm_load = load / jnp.clip(load.sum(), 1.0)
 
             load_means.append(load.mean())
@@ -171,10 +174,13 @@ def log_metrics(step: int, metrics: Dict[str, float], stats, prefix: str):
             )
             entropies.append(ent)
 
+            cap_drop_rates.append(float(hop["cap_drop_rate"]))
+
         load_mean = jnp.mean(jnp.stack(load_means))
         load_std = jnp.mean(jnp.stack(load_stds))
         util = jnp.mean(jnp.stack(utils))
         ent_arr = jnp.stack(entropies)
+        cap_drop = sum(cap_drop_rates) / max(len(cap_drop_rates), 1)
 
         log.update(
             {
@@ -184,6 +190,7 @@ def log_metrics(step: int, metrics: Dict[str, float], stats, prefix: str):
                 f"routing/{prefix}/entropy_mean": float(jnp.mean(ent_arr)),
                 f"routing/{prefix}/entropy_min": float(jnp.min(ent_arr)),
                 f"routing/{prefix}/entropy_max": float(jnp.max(ent_arr)),
+                f"routing/{prefix}/cap_drop_rate": float(cap_drop),
             }
         )
 

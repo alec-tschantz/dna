@@ -32,7 +32,7 @@ def _softmax_topk(logits, k):
 
 def _dispatch(mask, weight, n_exp, capacity):
     one_hot = mask.T.astype(weight.dtype)  # [E, T]
-    # TODO
+    # TODO
     rank = jnp.cumsum(one_hot, axis=1) - 1
     within_cap = rank < capacity
     slot = jax.nn.one_hot(jnp.clip(rank, 0, capacity - 1), capacity, dtype=weight.dtype)
@@ -74,6 +74,81 @@ class Router(eqx.Module):
         # Paper §2.3: ‘identity expert receives an additive bias β’ (identity_bias)
         logits = logits.at[:, -1].add(self.id_bias)
         return _softmax_topk(logits, self.k)  # mask, weight
+
+
+class CrossRouter(eqx.Module):
+    # Projections
+    q: eqx.nn.Linear
+    k: eqx.nn.Linear
+    # Memory bank
+    memory: jnp.ndarray  # [n_exp, d_model]
+    # Regularisation
+    dropout: Dropout
+    # Learnable temperature for scaling logits
+    tau: jnp.ndarray  # shape (), trainable
+
+    # Static hyper‑parameters
+    n_h: int = eqx.field(static=True)
+    d_h: int = eqx.field(static=True)
+    id_bias: float = eqx.field(static=True)
+    topk: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        n_exp: int,
+        k: int,
+        dropout_rate: float,
+        *,
+        id_bias: float,
+        key,
+    ) -> None:
+        self.n_h, self.d_h = n_heads, d_model // n_heads
+        k_q, k_k, k_mem, k_tau = jax.random.split(key, 4)
+        self.q = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_q)
+        self.k = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_k)
+        self.memory = 0.02 * jax.random.normal(k_mem, (n_exp, d_model))
+        self.dropout = Dropout(dropout_rate)
+        self.tau = jnp.ones(())  # learnable scalar temperature
+        self.id_bias = id_bias
+        self.topk = k
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+    def __call__(
+        self,
+        x: jnp.ndarray,  # [T, d_model]
+        cos: jnp.ndarray,
+        sin: jnp.ndarray,
+        *,
+        key,
+        inference: bool,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        T = x.shape[0]
+
+        # ---- queries ----
+        q = jax.vmap(self.q)(x).reshape(T, self.n_h, self.d_h)  # [T, n_h, d_h]
+        q = q.transpose(1, 0, 2)  # [n_h, T, d_h]
+
+        # ---- keys from memory ----
+        k_mem = jax.vmap(self.k)(self.memory)  # [E, d_model]
+        # [n_h, E, d_h]
+        k_mem = k_mem.reshape(-1, self.n_h, self.d_h).transpose(1, 0, 2)
+
+        # ---- head‑wise scores ----
+        scale = math.sqrt(self.d_h) * jnp.clip(self.tau, 0.05)
+        scores = jnp.einsum("hqd,hed->hqe", q, k_mem) / scale  # [n_h, T, E]
+
+        # ---- aggregate heads (sum keeps variance) ----
+        logits = scores.sum(axis=0)  # [T, E]
+        # logits = logits.at[:, -1].add(self.id_bias)  # identity bias
+
+        # ---- dropout on logits pre‑softmax (regularises routing) ----
+        logits = self.dropout(logits, key=key, inference=inference)
+        mask, weight = _softmax_topk(logits, self.topk)  # [T, E] each
+        return mask, weight
 
 
 # -----------------------------------------------------------------------------
@@ -171,8 +246,20 @@ class DNA(eqx.Module):
         # ---------- routers (one per hop) ----------
         router_keys = jax.random.split(k_routers, n_hops)
         total_experts = n_modules + 1  # +1 for identity expert
+        # self.routers = tuple(
+        #     Router(d_model, total_experts, topk, id_bias=identity_bias, key=k)
+        #     for k in router_keys
+        # )
         self.routers = tuple(
-            Router(d_model, total_experts, topk, id_bias=identity_bias, key=k)
+            CrossRouter(
+                d_model,
+                n_heads,
+                total_experts,
+                topk,
+                dropout,
+                id_bias=identity_bias,
+                key=k,
+            )
             for k in router_keys
         )
 
@@ -181,7 +268,8 @@ class DNA(eqx.Module):
     # ---------------------------------------------------------------------
 
     def _hop(self, h, router: Router, cos, sin, *, key, inference):
-        mask, weight = router(h)  # [T, E]
+        # mask, weight = router(h)  # [T, E]
+        mask, weight = router(h, cos, sin, key=key, inference=inference)  # [T, E]
         n_exp_total = weight.shape[-1]
         # [E, C, T]
         slot, dispatch = _dispatch(mask, weight, n_exp_total, self.capacity)

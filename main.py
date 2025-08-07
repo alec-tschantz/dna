@@ -20,18 +20,18 @@ class Config:
     # ---------------- model ----------------
     model_type: str = "dna"
     vocab_size: int = 50_257
-    d_model: int = 256
+    d_model: int = 512
     n_heads: int = 16
     n_layers: int = 8
-    n_hops: int = 8
+    n_hops: int = 6
     n_backbone: int = 2
-    n_modules: int = 16
+    n_modules: int = 32
     topk: int = 2
     capacity: int = 32
     mlp_mult: int = 4
     dropout: float = 0.1
     rope_base: float = 10_000.0
-    identity_bias: float = 0.01
+    identity_bias: float = 0.1
 
     # ---------------- training ----------------
     batch_size: int = 32

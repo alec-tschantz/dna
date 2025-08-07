@@ -30,16 +30,29 @@ def _softmax_topk(logits, k):
     return mask, gate
 
 
-def _dispatch(mask, weight, n_exp, capacity):
-    one_hot = mask.T.astype(weight.dtype)  # [E, T]
-    # TODO
-    rank = jnp.cumsum(one_hot, axis=1) - 1
-    within_cap = rank < capacity
-    slot = jax.nn.one_hot(jnp.clip(rank, 0, capacity - 1), capacity, dtype=weight.dtype)
-    slot *= within_cap[..., None]
-    slot = slot.transpose(0, 2, 1)  # [E, C, T]
-    dispatch = slot * (weight.T * within_cap)[:, None, :]
-    return slot, dispatch  # both [E, C, T]
+def _dispatch(mask: jnp.ndarray, gate: jnp.ndarray, n_exp_total: int, capacity: int):
+    m = mask.T.astype(gate.dtype)  # [E, T]
+    g = jnp.where(m, gate.T, -jnp.inf)
+
+    topg, top_idx = jax.lax.top_k(g, capacity)  # each [E, C]
+
+    E, C = top_idx.shape
+    T = g.shape[1]
+
+    # Build slot indicators
+    slot = jnp.zeros((E, C, T), dtype=g.dtype)
+    slot = slot.at[jnp.arange(E)[:, None], jnp.arange(C)[None, :], top_idx].set(1.0)
+
+    kept = slot.sum(1)  # [E, T]  1 if token kept for expert e
+
+    # Replace −∞ by 0 *before* multiplying
+    g_safe = jnp.where(jnp.isfinite(g), g, 0.0)
+
+    g_kept = g_safe * kept
+    g_kept = g_kept / jnp.clip(g_kept.sum(-1, keepdims=True), 1e-9)
+
+    dispatch = slot * g_kept[:, None, :]  # [E, C, T]
+    return slot, dispatch
 
 
 def _sig(m):
@@ -85,7 +98,6 @@ class CrossRouter(eqx.Module):
     # Regularisation
     dropout: Dropout
     # Learnable temperature for scaling logits
-    tau: jnp.ndarray  # shape (), trainable
 
     # Static hyper‑parameters
     n_h: int = eqx.field(static=True)
@@ -110,7 +122,6 @@ class CrossRouter(eqx.Module):
         self.k = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_k)
         self.memory = 0.02 * jax.random.normal(k_mem, (n_exp, d_model))
         self.dropout = Dropout(dropout_rate)
-        self.tau = jnp.ones(())  # learnable scalar temperature
         self.id_bias = id_bias
         self.topk = k
 
@@ -138,7 +149,7 @@ class CrossRouter(eqx.Module):
         k_mem = k_mem.reshape(-1, self.n_h, self.d_h).transpose(1, 0, 2)
 
         # ---- head‑wise scores ----
-        scale = math.sqrt(self.d_h) * jnp.clip(self.tau, 0.05)
+        scale = math.sqrt(self.d_h)
         scores = jnp.einsum("hqd,hed->hqe", q, k_mem) / scale  # [n_h, T, E]
 
         # ---- aggregate heads (sum keeps variance) ----
@@ -246,30 +257,31 @@ class DNA(eqx.Module):
         # ---------- routers (one per hop) ----------
         router_keys = jax.random.split(k_routers, n_hops)
         total_experts = n_modules + 1  # +1 for identity expert
-        # self.routers = tuple(
-        #     Router(d_model, total_experts, topk, id_bias=identity_bias, key=k)
-        #     for k in router_keys
-        # )
         self.routers = tuple(
-            CrossRouter(
-                d_model,
-                n_heads,
-                total_experts,
-                topk,
-                dropout,
-                id_bias=identity_bias,
-                key=k,
-            )
+            Router(d_model, total_experts, topk, id_bias=identity_bias, key=k)
             for k in router_keys
         )
+        # self.routers = tuple(
+        #     CrossRouter(
+        #         d_model,
+        #         n_heads,
+        #         total_experts,
+        #         topk,
+        #         dropout,
+        #         id_bias=identity_bias,
+        #         key=k,
+        #     )
+        #     for k in router_keys
+        # )
 
     # ---------------------------------------------------------------------
     # Forward pass (Section 2 Alg. 1)
     # ---------------------------------------------------------------------
 
     def _hop(self, h, router: Router, cos, sin, *, key, inference):
-        # mask, weight = router(h)  # [T, E]
-        mask, weight = router(h, cos, sin, key=key, inference=inference)  # [T, E]
+        # TODO: layer norm before?
+        mask, weight = router(h)  # [T, E]
+        # mask, weight = router(h, cos, sin, key=key, inference=inference)  # [T, E]
         n_exp_total = weight.shape[-1]
         # [E, C, T]
         slot, dispatch = _dispatch(mask, weight, n_exp_total, self.capacity)

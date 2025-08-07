@@ -22,35 +22,6 @@ def rotate_half(x):
     return jnp.concatenate((-x2, x1), axis=-1)
 
 
-class Linear(eqx.Module):
-    weight: jnp.ndarray
-    bias: Optional[jnp.ndarray]
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        key: jax.random.PRNGKey,
-        use_bias: bool = True,
-        std: float = 0.02,
-    ):
-        k_w, k_b = jax.random.split(key)
-        w_shape = (in_features, out_features)
-        self.weight = (
-            jax.random.truncated_normal(k_w, lower=-2, upper=2, shape=w_shape) * std
-        )
-        if use_bias:
-            self.bias = jnp.zeros((out_features,))
-        else:
-            self.bias = None
-
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        y = x @ self.weight  #
-        if self.bias is not None:
-            y = y + self.bias
-        return y
-
-
 class Embedding(eqx.Module):
     weight: jnp.ndarray
 
@@ -100,10 +71,10 @@ class Identity(eqx.Module):
 
 class Attention(eqx.Module):
     ln: RMSNorm
-    q: Linear
-    k: Linear
-    v: Linear
-    o: Linear
+    q: eqx.nn.Linear
+    k: eqx.nn.Linear
+    v: eqx.nn.Linear
+    o: eqx.nn.Linear
     dropout: Dropout
     n_h: int = eqx.field(static=True)
     d_h: int = eqx.field(static=True)
@@ -113,10 +84,10 @@ class Attention(eqx.Module):
         self.ln = RMSNorm(d_model)
         self.dropout = Dropout(dropout)
         k_q, k_k, k_v, k_o = jax.random.split(key, 4)
-        self.q = Linear(d_model, d_model, k_q, use_bias=False)
-        self.k = Linear(d_model, d_model, k_k, use_bias=False)
-        self.v = Linear(d_model, d_model, k_v, use_bias=False)
-        self.o = Linear(d_model, d_model, k_o, use_bias=False)
+        self.q = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_q)
+        self.k = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_k)
+        self.v = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_v)
+        self.o = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_o)
 
     def __call__(self, x, cos, sin, *, key, inference: bool):
         k_attn, k_out = jax.random.split(key)
@@ -139,9 +110,9 @@ class Attention(eqx.Module):
 
 class FeedForward(eqx.Module):
     ln: RMSNorm
-    up: Linear
-    gate: Linear
-    down: Linear
+    up: eqx.nn.Linear
+    gate: eqx.nn.Linear
+    down: eqx.nn.Linear
     dropout: Dropout
 
     def __init__(self, d_model: int, mult: int, dropout: float, *, key):
@@ -149,9 +120,9 @@ class FeedForward(eqx.Module):
         self.dropout = Dropout(dropout)
         k_up, k_gate, k_down = jax.random.split(key, 3)
         d_inner = d_model * mult
-        self.up = Linear(d_model, d_inner, k_up, use_bias=False)
-        self.gate = Linear(d_model, d_inner, k_gate, use_bias=False)
-        self.down = Linear(d_inner, d_model, k_down, use_bias=False)
+        self.up = eqx.nn.Linear(d_model, d_inner, use_bias=False, key=k_up)
+        self.gate = eqx.nn.Linear(d_model, d_inner, use_bias=False, key=k_gate)
+        self.down = eqx.nn.Linear(d_inner, d_model, use_bias=False, key=k_down)
 
     def __call__(self, x, *_unused, key, inference: bool):
         k_mid, k_out = jax.random.split(key)

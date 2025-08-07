@@ -13,7 +13,6 @@ from dna.nn import (
     Attention,
     FeedForward,
     Identity,
-    Linear,
     rope_cos_sin,
 )
 
@@ -58,14 +57,14 @@ def _stack(mods):
 
 
 class Router(eqx.Module):
-    proj: Linear
+    proj: eqx.nn.Linear
     id_bias: float = eqx.field(static=True)
     k: int = eqx.field(static=True)
 
     def __init__(self, d_model: int, n_exp: int, k: int, *, id_bias: float, key):
         self.k = k
         self.id_bias = id_bias
-        self.proj = Linear(d_model, n_exp, key=key, use_bias=False)
+        self.proj = eqx.nn.Linear(d_model, n_exp, use_bias=False, key=key)
 
     def __call__(self, h):
         logits = jax.vmap(self.proj)(h)  # [T, E]

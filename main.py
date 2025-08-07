@@ -21,25 +21,25 @@ class Config:
     model_type: str = "dna"
     vocab_size: int = 50_257
     d_model: int = 256
-    n_heads: int = 16
-    n_layers: int = 8
-    n_hops: int = 8
+    n_heads: int = 8
+    n_layers: int = 6
+    n_hops: int = 6
     n_backbone: int = 2
     n_modules: int = 16
-    topk: int = 1
+    topk: int = 2
     capacity: int = 32
     mlp_mult: int = 4
     dropout: float = 0.1
     rope_base: float = 10_000.0
-    identity_bias: float = 0.1
+    identity_bias: float = 0.0
 
     # ---------------- training ----------------
     batch_size: int = 32
     seq_len: int = 256
     steps: int = 40_000
     warmup: int = 1_000
-    lr_init: float = 1e-7
-    lr_peak: float = 1e-6
+    lr_init: float = 1e-9
+    lr_peak: float = 1e-4
     lr_final_mult: float = 0.1
     wd: float = 0.01
     clip: float = 1.0
@@ -47,9 +47,9 @@ class Config:
 
     # ---------------- logging / eval ----------------
     eval_every: int = 1_000
-    log_every: int = 100
+    log_every: int = 10
     eval_samples: int = 1_000
-    example_every: int = 500
+    example_every: int = 250
     n_examples: int = 5
     gen_len: int = 100
 
@@ -148,9 +148,6 @@ def log_metrics(step: int, metrics: Dict[str, float], stats, prefix: str):
                     f"routing/{prefix}/hop{h}_dropped": float(hop["dropped"].mean()),
                     f"routing/{prefix}/hop{h}_util": float((load > 0).mean()),
                     f"routing/{prefix}/hop{h}_entropy": float(entropy),
-                    # f"routing/{prefix}/hop{h}_conf": float(
-                    #     hop["router_probs"].mean(0).max(-1).mean()
-                    # ),
                 }
             )
     wandb.log(log)
@@ -239,8 +236,8 @@ def main():
         optax.adamw(
             learning_rate=lr_schedule,
             b1=0.9,
-            b2=0.95,
-            eps=1e-15,
+            b2=0.999,
+            eps=1e-8,
             weight_decay=cfg.wd,
         ),
     )

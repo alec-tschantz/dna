@@ -27,7 +27,7 @@ class Config:
     n_backbone: int = 2
     n_modules: int = 16
     topk: int = 2
-    capacity: int = 64
+    capacity: int = 32
     mlp_mult: int = 4
     dropout: float = 0.1
     rope_base: float = 10_000.0
@@ -38,7 +38,7 @@ class Config:
     seq_len: int = 256
     steps: int = 20_000
     warmup: int = 2_000
-    lr_peak: float = 2.5e-4
+    lr_peak: float = 1e-4
     wd: float = 0.01
     clip: float = 1.0
     seed: int = 42

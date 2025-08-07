@@ -32,6 +32,7 @@ def _softmax_topk(logits, k):
 
 def _dispatch(mask, weight, n_exp, capacity):
     one_hot = mask.T.astype(weight.dtype)  # [E, T]
+    # TODO
     rank = jnp.cumsum(one_hot, axis=1) - 1
     within_cap = rank < capacity
     slot = jax.nn.one_hot(jnp.clip(rank, 0, capacity - 1), capacity, dtype=weight.dtype)
@@ -76,12 +77,17 @@ class Router(eqx.Module):
 
 
 class CrossRouter(eqx.Module):
-    ln: RMSNorm
+    # Projections
     q: eqx.nn.Linear
     k: eqx.nn.Linear
-    dropout: Dropout
+    # Memory bank
     memory: jnp.ndarray  # [n_exp, d_model]
+    # Regularisation
+    dropout: Dropout
+    # Learnable temperature for scaling logits
+    tau: jnp.ndarray  # shape (), trainable
 
+    # Static hyper‑parameters
     n_h: int = eqx.field(static=True)
     d_h: int = eqx.field(static=True)
     id_bias: float = eqx.field(static=True)
@@ -99,38 +105,48 @@ class CrossRouter(eqx.Module):
         key,
     ) -> None:
         self.n_h, self.d_h = n_heads, d_model // n_heads
-        k_q, k_k, k_mem = jax.random.split(key, 3)
-        self.ln = RMSNorm(d_model)
+        k_q, k_k, k_mem, k_tau = jax.random.split(key, 4)
         self.q = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_q)
         self.k = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_k)
-        self.dropout = Dropout(dropout_rate)
         self.memory = 0.02 * jax.random.normal(k_mem, (n_exp, d_model))
+        self.dropout = Dropout(dropout_rate)
+        self.tau = jnp.ones(())  # learnable scalar temperature
         self.id_bias = id_bias
         self.topk = k
 
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
     def __call__(
         self,
         x: jnp.ndarray,  # [T, d_model]
-        cos: jnp.ndarray,  # [T, d_h]
-        sin: jnp.ndarray,  # [T, d_h]
+        cos: jnp.ndarray,
+        sin: jnp.ndarray,
         *,
         key,
         inference: bool,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        h = self.ln(x)  # [T, d_model]
-        T = h.shape[0]
+        T = x.shape[0]
 
-        q = jax.vmap(self.q)(h).reshape(T, self.n_h, self.d_h).transpose(1, 0, 2)
-        q = q * cos + rotate_half(q) * sin  # [n_h, T, d_h]
+        # ---- queries ----
+        q = jax.vmap(self.q)(x).reshape(T, self.n_h, self.d_h)  # [T, n_h, d_h]
+        q = q.transpose(1, 0, 2)  # [n_h, T, d_h]
 
-        mem_h = self.ln(self.memory)  # [E, d_model]
-        k_mem = jax.vmap(self.k)(mem_h).reshape(-1, self.n_h, self.d_h)
-        k_mem = k_mem.transpose(1, 0, 2)  # [n_h, E, d_h]
+        # ---- keys from memory ----
+        k_mem = jax.vmap(self.k)(self.memory)  # [E, d_model]
+        # [n_h, E, d_h]
+        k_mem = k_mem.reshape(-1, self.n_h, self.d_h).transpose(1, 0, 2)
 
-        scores = jnp.einsum("hqd,hed->hqe", q, k_mem) / math.sqrt(self.d_h)
+        # ---- head‑wise scores ----
+        scale = math.sqrt(self.d_h) * jnp.clip(self.tau, 0.05)
+        scores = jnp.einsum("hqd,hed->hqe", q, k_mem) / scale  # [n_h, T, E]
 
-        logits = scores.mean(axis=0)
-        logits = logits.at[:, -1].add(self.id_bias)  # identity expert bias
+        # ---- aggregate heads (sum keeps variance) ----
+        logits = scores.sum(axis=0)  # [T, E]
+        # logits = logits.at[:, -1].add(self.id_bias)  # identity bias
+
+        # ---- dropout on logits pre‑softmax (regularises routing) ----
+        logits = self.dropout(logits, key=key, inference=inference)
         mask, weight = _softmax_topk(logits, self.topk)  # [T, E] each
         return mask, weight
 
@@ -236,7 +252,13 @@ class DNA(eqx.Module):
         # )
         self.routers = tuple(
             CrossRouter(
-                d_model, n_heads, total_experts, topk, dropout, id_bias=identity_bias, key=k
+                d_model,
+                n_heads,
+                total_experts,
+                topk,
+                dropout,
+                id_bias=identity_bias,
+                key=k,
             )
             for k in router_keys
         )

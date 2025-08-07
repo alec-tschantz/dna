@@ -23,14 +23,14 @@ def _softmax_topk(logits, k):
     soft = jnn.softmax(logits, axis=-1)
     _, top = jax.lax.top_k(logits, k)
     hard = jnn.one_hot(top, logits.shape[-1]).sum(axis=-2)
-    gate = jax.lax.stop_gradient(hard - soft) + soft  # straight‑through estimator
+    gate = jax.lax.stop_gradient(hard - soft) + soft
     mask = hard.astype(bool)
     gate = jnp.where(mask, gate, 0.0)
     gate = gate / jnp.clip(gate.sum(-1, keepdims=True), 1e-9)
     return mask, gate
 
 
-def _dispatch(mask: jnp.ndarray, gate: jnp.ndarray, n_exp_total: int, capacity: int):
+def _dispatch(mask: jnp.ndarray, gate: jnp.ndarray, capacity: int):
     m = mask.T.astype(gate.dtype)  # [E, T]
     g = jnp.where(m, gate.T, -jnp.inf)
 
@@ -38,14 +38,12 @@ def _dispatch(mask: jnp.ndarray, gate: jnp.ndarray, n_exp_total: int, capacity: 
 
     E, C = top_idx.shape
     T = g.shape[1]
-
-    # Build slot indicators
     slot = jnp.zeros((E, C, T), dtype=g.dtype)
     slot = slot.at[jnp.arange(E)[:, None], jnp.arange(C)[None, :], top_idx].set(1.0)
 
     kept = slot.sum(1)  # [E, T]  1 if token kept for expert e
 
-    # Replace −∞ by 0 *before* multiplying
+    # Replace −∞ by 0 before multiplying
     g_safe = jnp.where(jnp.isfinite(g), g, 0.0)
 
     g_kept = g_safe * kept
@@ -87,79 +85,6 @@ class Router(eqx.Module):
         # Paper §2.3: ‘identity expert receives an additive bias β’ (identity_bias)
         logits = logits.at[:, -1].add(self.id_bias)
         return _softmax_topk(logits, self.k)  # mask, weight
-
-
-class CrossRouter(eqx.Module):
-    # Projections
-    q: eqx.nn.Linear
-    k: eqx.nn.Linear
-    # Memory bank
-    memory: jnp.ndarray  # [n_exp, d_model]
-    # Regularisation
-    dropout: Dropout
-    # Learnable temperature for scaling logits
-
-    # Static hyper‑parameters
-    n_h: int = eqx.field(static=True)
-    d_h: int = eqx.field(static=True)
-    id_bias: float = eqx.field(static=True)
-    topk: int = eqx.field(static=True)
-
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        n_exp: int,
-        k: int,
-        dropout_rate: float,
-        *,
-        id_bias: float,
-        key,
-    ) -> None:
-        self.n_h, self.d_h = n_heads, d_model // n_heads
-        k_q, k_k, k_mem, k_tau = jax.random.split(key, 4)
-        self.q = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_q)
-        self.k = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_k)
-        self.memory = 0.02 * jax.random.normal(k_mem, (n_exp, d_model))
-        self.dropout = Dropout(dropout_rate)
-        self.id_bias = id_bias
-        self.topk = k
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
-    def __call__(
-        self,
-        x: jnp.ndarray,  # [T, d_model]
-        cos: jnp.ndarray,
-        sin: jnp.ndarray,
-        *,
-        key,
-        inference: bool,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        T = x.shape[0]
-
-        # ---- queries ----
-        q = jax.vmap(self.q)(x).reshape(T, self.n_h, self.d_h)  # [T, n_h, d_h]
-        q = q.transpose(1, 0, 2)  # [n_h, T, d_h]
-
-        # ---- keys from memory ----
-        k_mem = jax.vmap(self.k)(self.memory)  # [E, d_model]
-        # [n_h, E, d_h]
-        k_mem = k_mem.reshape(-1, self.n_h, self.d_h).transpose(1, 0, 2)
-
-        # ---- head‑wise scores ----
-        scale = math.sqrt(self.d_h)
-        scores = jnp.einsum("hqd,hed->hqe", q, k_mem) / scale  # [n_h, T, E]
-
-        # ---- aggregate heads (sum keeps variance) ----
-        logits = scores.sum(axis=0)  # [T, E]
-        # logits = logits.at[:, -1].add(self.id_bias)  # identity bias
-
-        # ---- dropout on logits pre‑softmax (regularises routing) ----
-        logits = self.dropout(logits, key=key, inference=inference)
-        mask, weight = _softmax_topk(logits, self.topk)  # [T, E] each
-        return mask, weight
 
 
 # -----------------------------------------------------------------------------
@@ -261,18 +186,6 @@ class DNA(eqx.Module):
             Router(d_model, total_experts, topk, id_bias=identity_bias, key=k)
             for k in router_keys
         )
-        # self.routers = tuple(
-        #     CrossRouter(
-        #         d_model,
-        #         n_heads,
-        #         total_experts,
-        #         topk,
-        #         dropout,
-        #         id_bias=identity_bias,
-        #         key=k,
-        #     )
-        #     for k in router_keys
-        # )
 
     # ---------------------------------------------------------------------
     # Forward pass (Section 2 Alg. 1)
@@ -281,10 +194,7 @@ class DNA(eqx.Module):
     def _hop(self, h, router: Router, cos, sin, *, key, inference):
         # TODO: layer norm before?
         mask, weight = router(h)  # [T, E]
-        # mask, weight = router(h, cos, sin, key=key, inference=inference)  # [T, E]
-        n_exp_total = weight.shape[-1]
-        # [E, C, T]
-        slot, dispatch = _dispatch(mask, weight, n_exp_total, self.capacity)
+        slot, dispatch = _dispatch(mask, weight, self.capacity)
 
         # Gather token blocks for all experts
         xin = jnp.einsum("ect,td->ecd", dispatch, h)  # [E, C, d]

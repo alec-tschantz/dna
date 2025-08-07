@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import math
 import time
 from dataclasses import asdict, dataclass
@@ -14,7 +12,7 @@ import wandb
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-from models import Dense, DNA, generate
+from dna import Dense, DNA, generate
 
 
 @dataclass
@@ -106,13 +104,13 @@ def compute_loss(model, batch: Dict[str, Any], key, *, inference: bool = False):
     vmap_model = jax.vmap(lambda x, k: model(x, key=k, inference=inference))
     logits, stats = vmap_model(ids, keys)
 
-    logits_shift, labels_shift = ids[:, :-1], ids[:, 1:]
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits_shift, labels).mean()
-    return loss, (logits_shift, labels, stats)
+    logits_shift, labels_shift = logits[:, :-1], ids[:, 1:]
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits_shift, labels_shift).mean()
+    return loss, (logits_shift, labels_shift, stats)
 
 
 @eqx.filter_jit
-def train_step(model, opt_state, batch, opt, *, key):
+def train_step(model, opt_state, batch, *, key):
     (loss, (logits, labels, stats)), grads = eqx.filter_value_and_grad(
         compute_loss, has_aux=True
     )(model, batch, key)
@@ -150,9 +148,9 @@ def log_metrics(step: int, metrics: Dict[str, float], stats, prefix: str):
                     f"routing/{prefix}/hop{h}_dropped": float(hop["dropped"].mean()),
                     f"routing/{prefix}/hop{h}_util": float((load > 0).mean()),
                     f"routing/{prefix}/hop{h}_entropy": float(entropy),
-                    f"routing/{prefix}/hop{h}_conf": float(
-                        hop["router_probs"].mean(0).max(-1).mean()
-                    ),
+                    # f"routing/{prefix}/hop{h}_conf": float(
+                    #     hop["router_probs"].mean(0).max(-1).mean()
+                    # ),
                 }
             )
     wandb.log(log)
@@ -235,6 +233,7 @@ def main():
     )
     wandb.log({"n_params": n_params, "capacity": cfg.capacity, "step": 0})
 
+    global opt
     opt = optax.chain(
         optax.clip_by_global_norm(cfg.clip),
         optax.adamw(
@@ -254,7 +253,7 @@ def main():
 
         t0 = time.perf_counter()
         model, opt_state, loss, acc, stats, gnorm = train_step(
-            model, opt_state, batch, opt, key=sk
+            model, opt_state, batch, key=sk
         )
         dt_ms = (time.perf_counter() - t0) * 1000
 

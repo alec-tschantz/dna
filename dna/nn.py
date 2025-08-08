@@ -111,13 +111,15 @@ class Attention(eqx.Module):
         scores = jnp.einsum("hqd,hkd->hqk", q, k) / math.sqrt(self.d_h)
 
         causal = jnp.tril(jnp.ones((T, T), dtype=bool))[None]
+        neg = jnp.finfo(scores.dtype).min
         if attention_mask is not None:
-            kmask = attention_mask.astype(bool)[None, None, :]
+            am = attention_mask.astype(bool)
+            qmask = am[None, :, None]
+            kmask = am[None, None, :]
             allowed = causal & kmask
-            neg = jnp.finfo(scores.dtype).min
             scores = jnp.where(allowed, scores, neg)
+            scores = jnp.where(qmask, scores, 0.0)
         else:
-            neg = jnp.finfo(scores.dtype).min
             scores = jnp.where(causal, scores, neg)
 
         probs = jnn.softmax(scores, axis=-1)
@@ -128,7 +130,7 @@ class Attention(eqx.Module):
         out = self.dropout(out, key=k_out, inference=inference)
 
         if attention_mask is not None:
-            qmask = attention_mask.astype(bool)[:, None]  
+            qmask = attention_mask.astype(bool)[:, None]
             out = jnp.where(qmask, out, 0.0)
 
         return x + out

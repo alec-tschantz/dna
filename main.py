@@ -1,11 +1,11 @@
-import math
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import tyro
 import wandb
@@ -47,7 +47,7 @@ class Config:
     seed: int = 42
     eval_every: int = 250
     log_every: int = 10
-    eval_samples: int = 1_000
+    eval_samples: int = 2000
     example_every: int = 250
     n_examples: int = 5
     gen_len: int = 100
@@ -56,7 +56,7 @@ class Config:
 cfg: Config = tyro.cli(Config)
 
 
-def load_tinystories(tok, seq_len: int, split="train"):
+def load_tinystories(tok, seq_len: int, split: str = "train"):
     ds = load_dataset("roneneldan/TinyStories", split=split, streaming=True)
 
     def _proc(batch):
@@ -69,33 +69,48 @@ def load_tinystories(tok, seq_len: int, split="train"):
         )
         input_ids = enc["input_ids"]
         attn_mask = enc["attention_mask"]
-
         eos_id = tok.eos_token_id
-        for row, ids in enumerate(input_ids):
-            if eos_id in ids:
-                eos_pos = list(ids).index(eos_id)
-                attn_mask[row, eos_pos + 1 :] = 0
-
+        for i in range(input_ids.shape[0]):
+            row = input_ids[i]
+            idx = np.where(row == eos_id)[0]
+            if idx.size > 0:
+                eos_pos = int(idx[0])
+                attn_mask[i, eos_pos + 1 :] = 0
         return {"input_ids": input_ids, "attention_mask": attn_mask}
 
-    return ds.map(_proc, batched=True, batch_size=1_024, remove_columns=["text"])
+    return ds.map(_proc, batched=True, batch_size=1024, remove_columns=["text"])
 
 
-def sample_batch(it, bsz: int):
-    batch = [next(it) for _ in range(bsz)]
-    ids = jnp.stack([jnp.array(b["input_ids"], dtype=jnp.int32) for b in batch])
-    amask = jnp.stack([jnp.array(b["attention_mask"], dtype=jnp.int32) for b in batch])
-    return {"input_ids": ids, "attention_mask": amask}
+def _normalize_to_2d(arr):
+    arr = np.asarray(arr)
+    if arr.ndim == 1:
+        return arr[None, :]
+    if arr.ndim == 2:
+        return arr
+    raise ValueError(f"Unexpected array shape {arr.shape}")
+
+
+def sample_batch(stream_it, bsz: int):
+    ids_buf, mask_buf, total = [], [], 0
+    while total < bsz:
+        ex = next(stream_it)
+        ids = _normalize_to_2d(ex["input_ids"])
+        mask = _normalize_to_2d(ex["attention_mask"])
+        ids_buf.append(ids)
+        mask_buf.append(mask)
+        total += ids.shape[0]
+    ids = np.concatenate(ids_buf, axis=0)[:bsz].astype(np.int32)
+    mask = np.concatenate(mask_buf, axis=0)[:bsz].astype(np.int32)
+    return {"input_ids": jnp.array(ids), "attention_mask": jnp.array(mask)}
 
 
 def lr_schedule(step: jnp.ndarray):
-    warmup_ratio = jnp.minimum(step / cfg.warmup, 1.0)
-    lr = cfg.lr_peak * warmup_ratio
+    warm = jnp.minimum(step / cfg.warmup, 1.0)
+    lr = cfg.lr_peak * warm
     decay_steps = jnp.maximum(cfg.steps - cfg.warmup, 1)
     progress = jnp.clip((step - cfg.warmup) / decay_steps, 0.0, 1.0)
-    cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * progress))
-    lr = jnp.where(step >= cfg.warmup, cfg.lr_peak * cosine_decay, lr)
-    return jnp.array(lr, dtype=jnp.float32)
+    cos = 0.5 * (1 + jnp.cos(jnp.pi * progress))
+    return jnp.where(step >= cfg.warmup, cfg.lr_peak * cos, lr).astype(jnp.float32)
 
 
 def compute_loss(
@@ -124,16 +139,13 @@ def compute_loss(
         )
 
     logits, stats = jax.vmap(fwd)(ids, mask, keys)
-
     logits_shift = logits[:, :-1]
     labels_shift = ids[:, 1:]
     mask_shift = mask[:, 1:]
-
     raw_loss = optax.softmax_cross_entropy_with_integer_labels(
         logits_shift, labels_shift
     )
     loss = (raw_loss * mask_shift).sum() / jnp.maximum(mask_shift.sum(), 1)
-
     return loss, (logits_shift, labels_shift, mask_shift, stats)
 
 
@@ -142,16 +154,11 @@ def train_step(model, opt_state, batch, biases_id, *, key):
     (loss, (logits, labels, mask, stats)), grads = eqx.filter_value_and_grad(
         compute_loss, has_aux=True
     )(model, batch, biases_id, key)
-
     updates, opt_state = opt.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
-
-    preds = jnp.argmax(logits, axis=-1)  # (B, T-1)
-    valid = mask > 0  # (B, T-1) bool
-
-    correct = (preds == labels) & valid
-    acc = correct.sum() / jnp.maximum(valid.sum(), 1)
-
+    preds = jnp.argmax(logits, axis=-1)
+    valid = mask > 0
+    acc = ((preds == labels) & valid).sum() / jnp.maximum(valid.sum(), 1)
     gnorm = optax.global_norm(grads)
     return model, opt_state, loss, acc, stats, gnorm
 
@@ -161,13 +168,9 @@ def eval_step(model, batch, biases_id, *, key):
     loss, (logits, labels, mask, _) = compute_loss(
         model, batch, biases_id, key, inference=True
     )
-
-    preds = jnp.argmax(logits, axis=-1)  # (B, T-1)
-    valid = mask > 0  # boolean mask
-
-    correct = (preds == labels) & valid
-    acc = correct.sum() / jnp.maximum(valid.sum(), 1)
-
+    preds = jnp.argmax(logits, axis=-1)
+    valid = mask > 0
+    acc = ((preds == labels) & valid).sum() / jnp.maximum(valid.sum(), 1)
     return loss, acc
 
 
@@ -187,7 +190,6 @@ def update_biases_from_stats_id(
 ) -> jnp.ndarray:
     if lr == 0.0:
         return biases_id
-
     b = biases_id
     for s, hop in enumerate(stats_tuple):
         id_count = jnp.sum(hop["id_topk_count"].astype(jnp.int32)).astype(jnp.float32)
@@ -198,10 +200,8 @@ def update_biases_from_stats_id(
         target = target_skip_frac * float(topk) * cbar
         step = lr * jnp.sign(target - id_count)
         b = b.at[s].add(step)
-
     if clip is not None and clip > 0:
         b = jnp.clip(b, -clip, clip)
-
     return b
 
 
@@ -228,14 +228,15 @@ def log_metrics(
 ):
     log = {f"{prefix}/{k}": v for k, v in metrics.items()}
     log["step"] = step
-
     if stats_tuple and isinstance(stats_tuple[0], dict):
-        rho_means = []
-        id_rates = []
-        ent_means = []
-        load_stds = []
-        utils = []
-        cap_drop_fracs = []
+        rho_means, id_rates, ent_means, load_stds, utils, cap_drop_fracs = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
 
         def _mean_over_batch(x):
             return jnp.mean(x, axis=0)
@@ -251,7 +252,6 @@ def log_metrics(
                 float(jnp.mean(_mean_over_batch(hop["cap_drop_frac_edges"])))
             )
             load_stds.append(load_std)
-
         log.update(
             {
                 f"routing/{prefix}/rho_mean": float(
@@ -272,52 +272,71 @@ def log_metrics(
                 ),
             }
         )
-
     log["bias/id_mean"] = float(jnp.mean(biases_id))
     log["bias/id_min"] = float(jnp.min(biases_id))
     log["bias/id_max"] = float(jnp.max(biases_id))
     log["router/temp"] = float(cfg.router_temp)
     log["router/gumbel_tau"] = float(cfg.gumbel_tau)
     log["router/gumbel"] = float(cfg.gumbel)
-
     wandb.log(log)
 
 
 def generate_examples(
-    model, tok, prompt="One day, ", n=5, gen_len=50, *, key, biases_id
+    model,
+    tok,
+    prompts=None,
+    per_prompt: int = 1,
+    gen_len: int = 100,
+    *,
+    key,
+    biases_id,
 ):
-    prompt_ids = jnp.array(tok.encode(prompt), dtype=jnp.int32)
-    key, *subs = jax.random.split(key, n + 1)
-    subs = jnp.stack(subs)
+    if prompts is None:
+        prompts = [
+            "One day, ",
+            "Once upon a time, ",
+            "In a small town, ",
+            "Long ago, ",
+            "On a sunny morning, ",
+        ]
 
-    @jax.vmap
-    def _sample(k):
-        return generate(
-            model,
-            prompt_ids,
-            gen_len,
-            1.0,
-            key=k,
-            biases=biases_id,
-            gumbel=False,
-            temp=cfg.router_temp,
-            greedy=False,
-            pad_id=tok.pad_token_id,
-        )
+    out_texts = []
+    for p in prompts:
+        prompt_ids = jnp.array(tok.encode(p), dtype=jnp.int32)
+        key, *subs = jax.random.split(key, per_prompt + 1)
+        subs = jnp.stack(subs)
 
-    out = _sample(subs)
-    decoded = []
-    for seq in jax.device_get(out):
-        seq = list(seq)
-        if tok.eos_token_id in seq:
-            seq = seq[: seq.index(tok.eos_token_id) + 1]
-        decoded.append(tok.decode(seq, skip_special_tokens=True))
-    return decoded
+        @jax.vmap
+        def _sample(k):
+            return generate(
+                model=model,
+                prompt_ids=prompt_ids,
+                max_new_tokens=gen_len,
+                temperature=0.8,
+                key=k,
+                biases=biases_id,
+                gumbel=False,
+                gumbel_tau=1.0,
+                router_temp=cfg.router_temp,
+                greedy=False,
+                pad_id=tok.pad_token_id,
+                eos_id=tok.pad_token_id,
+            )
+
+        toks = _sample(subs)
+        for seq in jax.device_get(toks):
+            seq = list(seq)
+            if tok.eos_token_id in seq:
+                seq = seq[: seq.index(tok.eos_token_id) + 1]
+            text = tok.decode(seq, skip_special_tokens=True)
+            out_texts.append(f"[{p}] {text}")
+
+    return out_texts
 
 
 def build_model(key):
     if cfg.model_type == "dense":
-        model = Dense(
+        return Dense(
             vocab=cfg.vocab_size,
             d_model=cfg.d_model,
             n_heads=cfg.n_heads,
@@ -327,44 +346,47 @@ def build_model(key):
             rope_base=cfg.rope_base,
             key=key,
         )
-    else:
-        model = DNA(
-            vocab=cfg.vocab_size,
-            d_model=cfg.d_model,
-            n_heads=cfg.n_heads,
-            n_modules=cfg.n_modules,
-            capacity=cfg.capacity,
-            topk=cfg.topk,
-            n_hops=cfg.n_hops,
-            mlp_mult=cfg.mlp_mult,
-            dropout=cfg.dropout,
-            rope_base=cfg.rope_base,
-            num_backbone=cfg.n_backbone,
-            key=key,
-        )
-    return model
+    return DNA(
+        vocab=cfg.vocab_size,
+        d_model=cfg.d_model,
+        n_heads=cfg.n_heads,
+        n_modules=cfg.n_modules,
+        capacity=cfg.capacity,
+        topk=cfg.topk,
+        n_hops=cfg.n_hops,
+        mlp_mult=cfg.mlp_mult,
+        dropout=cfg.dropout,
+        rope_base=cfg.rope_base,
+        num_backbone=cfg.n_backbone,
+        key=key,
+    )
+
+
+def seq_len_stats(mask: jnp.ndarray):
+    m = mask[:, 1:]
+    lens = jnp.sum(m, axis=1)
+    return (
+        float(jnp.mean(lens)),
+        int(jnp.min(lens)),
+        int(jnp.max(lens)),
+        float(jnp.mean((cfg.seq_len - 1) - lens)),
+    )
 
 
 def main():
-    wandb.init(project=f"dense-moe", name=cfg.model_type, config=asdict(cfg))
-
+    wandb.init(project="dense-moe", name=cfg.model_type, config=asdict(cfg))
     tok = AutoTokenizer.from_pretrained("gpt2")
     tok.pad_token = tok.eos_token
-
     train_it = iter(load_tinystories(tok, cfg.seq_len, "train"))
     val_it = iter(load_tinystories(tok, cfg.seq_len, "validation"))
-
     key = jax.random.PRNGKey(cfg.seed)
     key, mk = jax.random.split(key)
     model = build_model(mk)
-
     biases_id = init_biases_id(cfg.n_hops, cfg.identity_bias_init)
-
     n_params = sum(
         x.size for x in jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
     )
     wandb.log({"n_params": n_params, "capacity": cfg.capacity, "step": 0})
-
     global opt
     opt = optax.chain(
         optax.clip_by_global_norm(cfg.clip),
@@ -377,12 +399,11 @@ def main():
     for step in range(cfg.steps + 1):
         key, sk = jax.random.split(key)
         batch = sample_batch(train_it, cfg.batch_size)
-
         t0 = time.perf_counter()
         model, opt_state, loss, acc, stats, gnorm = train_step(
             model, opt_state, batch, biases_id, key=sk
         )
-        dt_ms = (time.perf_counter() - t0) * 1000
+        dt_ms = (time.perf_counter() - t0) * 1000.0
 
         stats_host = jax.tree_util.tree_map(lambda x: jax.device_get(x), stats)
         biases_id = update_biases_from_stats_id(
@@ -396,17 +417,20 @@ def main():
         )
 
         if step % cfg.log_every == 0:
-            global_param_norm = l2_tree_norm(model)
-            router_param_norm = router_l2_norm(model)
+            lmean, lmin, lmax, pmean = seq_len_stats(batch["attention_mask"])
             metrics = {
                 "loss": float(loss),
                 "acc": float(acc),
                 "lr": float(lr_schedule(jnp.array(step))),
                 "grad_norm": float(gnorm),
                 "step_ms": dt_ms,
-                "tok_s": cfg.batch_size * cfg.seq_len / (dt_ms / 1000 + 1e-9),
-                "w_norm/global": global_param_norm,
-                "w_norm/routers": router_param_norm,
+                "tok_s": cfg.batch_size * cfg.seq_len / (dt_ms / 1000.0 + 1e-9),
+                "w_norm/global": l2_tree_norm(model),
+                "w_norm/routers": router_l2_norm(model),
+                "seq/len_mean": lmean,
+                "seq/len_min": lmin,
+                "seq/len_max": lmax,
+                "seq/pad_mean": pmean,
             }
             log_metrics(step, metrics, stats_host, biases_id, "train")
 
@@ -414,8 +438,17 @@ def main():
             key, ek = jax.random.split(key)
             val_batch = sample_batch(val_it, cfg.eval_samples // cfg.seq_len)
             val_loss, val_acc = eval_step(model, val_batch, biases_id, key=ek)
+            lmean, lmin, lmax, pmean = seq_len_stats(val_batch["attention_mask"])
             wandb.log(
-                {"eval/loss": float(val_loss), "eval/acc": float(val_acc), "step": step}
+                {
+                    "eval/loss": float(val_loss),
+                    "eval/acc": float(val_acc),
+                    "eval/seq/len_mean": lmean,
+                    "eval/seq/len_min": lmin,
+                    "eval/seq/len_max": lmax,
+                    "eval/seq/pad_mean": pmean,
+                    "step": step,
+                }
             )
 
         if step % cfg.example_every == 0 and step > 0:
@@ -423,15 +456,21 @@ def main():
             samples = generate_examples(
                 model,
                 tok,
-                n=cfg.n_examples,
                 gen_len=cfg.gen_len,
                 key=ek,
                 biases_id=biases_id,
             )
-            print(f"\n========== SAMPLES @ step {step} ==========")
-            for i, s in enumerate(samples):
-                print(f"\n--- Example {i} ---\n{s}\n")
+
+            # Log to W&B
             wandb.log({"examples": "\n\n".join(samples), "step": step})
+
+            # Also print to terminal
+            print("\n" + "=" * 40)
+            print(f"Step {step} — Generated Examples")
+            print("=" * 40)
+            for i, s in enumerate(samples, 1):
+                print(f"[{i}] {s}")
+                print("-" * 40)
 
 
 if __name__ == "__main__":

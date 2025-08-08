@@ -26,7 +26,7 @@ class Config:
     n_backbone: int = 2
     n_modules: int = 32
     topk: int = 2
-    capacity: int = 64
+    capacity: int = 32
     mlp_mult: int = 4
     dropout: float = 0.1
     rope_base: float = 10_000.0
@@ -190,6 +190,8 @@ def update_biases_from_stats_id(
 ) -> jnp.ndarray:
     if lr == 0.0:
         return biases_id
+    if not stats_tuple:
+        return biases_id
     b = biases_id
     for s, hop in enumerate(stats_tuple):
         id_count = jnp.sum(hop["id_topk_count"].astype(jnp.int32)).astype(jnp.float32)
@@ -211,12 +213,14 @@ def l2_tree_norm(tree) -> float:
     return float(jnp.sqrt(sq + 1e-12))
 
 
-def router_l2_norm(model: DNA) -> float:
-    leaves = jax.tree_util.tree_leaves(eqx.filter(model.routers, eqx.is_array))
-    if not leaves:
-        return 0.0
-    sq = sum([jnp.sum(jnp.square(x)) for x in leaves])
-    return float(jnp.sqrt(sq + 1e-12))
+def router_l2_norm(model) -> float:
+    if hasattr(model, "routers"):
+        leaves = jax.tree_util.tree_leaves(eqx.filter(model.routers, eqx.is_array))
+        if not leaves:
+            return 0.0
+        sq = sum([jnp.sum(jnp.square(x)) for x in leaves])
+        return float(jnp.sqrt(sq + 1e-12))
+    return 0.0
 
 
 def log_metrics(
@@ -460,9 +464,7 @@ def main():
                 key=ek,
                 biases_id=biases_id,
             )
-
             wandb.log({"examples": "\n\n".join(samples), "step": step})
-
             print("\n" + "=" * 40)
             print(f"Step {step} — Generated Examples")
             print("=" * 40)

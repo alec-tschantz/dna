@@ -461,10 +461,8 @@ def main():
                 biases_id=biases_id,
             )
 
-            # Log to W&B
             wandb.log({"examples": "\n\n".join(samples), "step": step})
 
-            # Also print to terminal
             print("\n" + "=" * 40)
             print(f"Step {step} — Generated Examples")
             print("=" * 40)

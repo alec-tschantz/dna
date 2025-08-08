@@ -27,7 +27,6 @@ def _capacity_select(mask_te: jnp.ndarray, gate_te: jnp.ndarray, capacity: int):
     slot = slot.at[jnp.arange(E)[:, None], jnp.arange(C)[None, :], top_idx].set(1.0)
     slot = slot * m[:, None, :]            # drop selections that weren’t actually routed
     kept = slot.sum(1).astype(bool)        # (E, T) which tokens were kept for each expert
-
     return slot, kept, top_idx
 
 

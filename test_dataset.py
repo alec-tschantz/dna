@@ -7,8 +7,7 @@ from transformers import AutoTokenizer
 
 SEQ_LEN = 256
 BATCH_SIZE = 32
-NUM_SHOW = 3  # how many examples to print from each split
-
+NUM_SHOW = 3 
 
 def load_tinystories(tok: AutoTokenizer, seq_len: int, split: str = "train"):
     """
@@ -28,7 +27,6 @@ def load_tinystories(tok: AutoTokenizer, seq_len: int, split: str = "train"):
         input_ids = enc["input_ids"]          # (B, T) np.int64
         attn_mask = enc["attention_mask"]     # (B, T) np.int64 (1=keep, 0=ignore)
 
-        # ensure mask is 0 AFTER the first EOS token in each row (keep EOS counted)
         eos_id = tok.eos_token_id
         for i in range(input_ids.shape[0]):
             row = input_ids[i]
@@ -39,7 +37,6 @@ def load_tinystories(tok: AutoTokenizer, seq_len: int, split: str = "train"):
 
         return {"input_ids": input_ids, "attention_mask": attn_mask}
 
-    # Map in reasonably large batches; we’ll still robustly batch downstream.
     return ds.map(_proc, batched=True, batch_size=1024, remove_columns=["text"])
 
 
@@ -54,10 +51,6 @@ def _normalize_to_2d(arr) -> np.ndarray:
 
 
 def sample_batch(stream_it: Iterable[Dict[str, Any]], bsz: int) -> Dict[str, np.ndarray]:
-    """
-    Accumulate rows until we have exactly `bsz`. Works whether the stream yields
-    single examples or big batches.
-    """
     ids_buf, mask_buf, total = [], [], 0
     while total < bsz:
         ex = next(stream_it)
@@ -136,7 +129,6 @@ def visualize_example(idx: int, ids: np.ndarray, mask: np.ndarray, tok: AutoToke
     print(f"- mask_prefix_ok: {prefix_ok} | first_zero_idx: {first_zero_idx if first_zero_idx>=0 else 'none'}")
     _print_clipped_ids(ids, mask, width=64)
 
-    # Build marked decode (slow but fine for NUM_SHOW small)
     decoded_marked = []
     for t_id, m in zip(ids.tolist(), mask.tolist()):
         piece = tok.decode([t_id], skip_special_tokens=False)
@@ -145,7 +137,6 @@ def visualize_example(idx: int, ids: np.ndarray, mask: np.ndarray, tok: AutoToke
 
     print("decoded (pads marked):")
     print(decoded_marked)
-    # quick invariant: all masked positions should be pad_id if pad==eos
     if (mask == 0).any():
         masked_ids = ids[mask == 0]
         ok = bool(np.all(masked_ids == pad_id))
@@ -181,7 +172,6 @@ def batch_summary(ids_b: np.ndarray, mask_b: np.ndarray, tok: AutoTokenizer) -> 
     eos_at_end = int(np.sum(first_eoses == (valid_lens - 1)))
     print(f"first_eos: none={no_eos}, at_end={eos_at_end}")
 
-    # mask prefix violations
     prefix_ok = []
     for i in range(ids_b.shape[0]):
         ok, _ = _is_prefix_mask(mask_b[i])
@@ -192,7 +182,6 @@ def batch_summary(ids_b: np.ndarray, mask_b: np.ndarray, tok: AutoTokenizer) -> 
     else:
         print("mask prefix check: all OK")
 
-    # verify policy: zeros start right AFTER first EOS (i.e., include EOS)
     policy_ok = []
     for i in range(mask_b.shape[0]):
         if first_eoses[i] >= 0:

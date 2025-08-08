@@ -135,7 +135,7 @@ def test_generate_shapes_prefix_and_greedy_equivalence():
 
     V = 257
     pad_id = 0
-    eos_id = 0  # by default our code treats eos==pad; tests don't rely on early stop
+    eos_id = 0
 
     prompt_len = 7
     prompt_ids = jax.random.randint(k_prompt, (prompt_len,), 0, V, dtype=jnp.int32)
@@ -147,13 +147,13 @@ def test_generate_shapes_prefix_and_greedy_equivalence():
         model,
         prompt_ids,
         max_new_tokens=max_new,
-        temperature=0.0,     # forces greedy path
+        temperature=0.0,
         key=k_gen,
         biases=None,
         gumbel=False,
         gumbel_tau=1.0,
         router_temp=1.0,
-        greedy=True,         # redundant with temp=0.0, but good to test both
+        greedy=True,
         pad_id=pad_id,
         eos_id=eos_id,
     )
@@ -162,13 +162,11 @@ def test_generate_shapes_prefix_and_greedy_equivalence():
     assert toks.dtype == jnp.int32
     assert jnp.all(toks[:prompt_len] == prompt_ids)
 
-    # The very first generated token should match the model's argmax at the prompt.
     attn_mask = jnp.ones((prompt_len,), dtype=jnp.int32)
     logits, _ = model(prompt_ids, key=k_model, inference=True, attention_mask=attn_mask)
     expected_next = jnp.argmax(logits[-1]).astype(jnp.int32)
     assert int(toks[prompt_len]) == int(expected_next)
 
-    # JIT-compiled generate should match greedy path exactly.
     gen_jit = eqx.filter_jit(
         lambda m, p, k: generate(
             m,

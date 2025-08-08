@@ -1,4 +1,3 @@
-import math
 from typing import Tuple, Optional
 
 import equinox as eqx
@@ -56,7 +55,11 @@ class Dense(eqx.Module):
         temp: float = 1.0,
     ):
         T = ids.shape[0]
-        token_mask = jnp.ones((T,), dtype=bool) if attention_mask is None else attention_mask.astype(bool)
+        token_mask = (
+            jnp.ones((T,), dtype=bool)
+            if attention_mask is None
+            else attention_mask.astype(bool)
+        )
 
         h = jax.vmap(self.embed)(ids)
         key, sub = jax.random.split(key)
@@ -67,13 +70,16 @@ class Dense(eqx.Module):
 
         for attn, mlp in self.layers:
             key, sa, sm = jax.random.split(key, 3)
-            out = attn(h, cos, sin, key=sa, inference=inference, attention_mask=token_mask)
+            out = attn(
+                h, cos, sin, key=sa, inference=inference, attention_mask=token_mask
+            )
             out = jnp.where(token_mask[:, None], out - h, 0.0) + h
             h = out
+
             out = mlp(h, cos, sin, key=sm, inference=inference)
             out = jnp.where(token_mask[:, None], out - h, 0.0) + h
             h = out
 
         h = jax.vmap(self.ln)(h)
         logits = jax.vmap(lambda t: t @ self.embed.weight.T)(h)
-        return logits, {}
+        return logits, ()

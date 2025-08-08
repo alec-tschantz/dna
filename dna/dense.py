@@ -1,11 +1,9 @@
 import math
-from typing import Tuple, Dict, Any
+from typing import Tuple, Optional
 
 import equinox as eqx
 import jax
-from jax import lax
 import jax.numpy as jnp
-import jax.nn as jnn
 
 from dna.nn import Embedding, Dropout, RMSNorm, Attention, FeedForward, rope_cos_sin
 
@@ -45,18 +43,37 @@ class Dense(eqx.Module):
         self.rope_base = rope_base
 
     @eqx.filter_jit
-    def __call__(self, ids, *, key, inference: bool):
+    def __call__(
+        self,
+        ids: jnp.ndarray,
+        *,
+        key,
+        inference: bool,
+        attention_mask: Optional[jnp.ndarray] = None,
+        biases: Optional[jnp.ndarray] = None,
+        gumbel: bool = False,
+        gumbel_tau: float = 1.0,
+        temp: float = 1.0,
+    ):
         T = ids.shape[0]
+        token_mask = jnp.ones((T,), dtype=bool) if attention_mask is None else attention_mask.astype(bool)
+
         h = jax.vmap(self.embed)(ids)
         key, sub = jax.random.split(key)
         h = self.dropout(h, key=sub, inference=inference)
-        cos, sin = rope_cos_sin(
-            T, self.embed.weight.shape[1] // self.n_heads, self.rope_base
-        )
+
+        d_h = self.embed.weight.shape[1] // self.n_heads
+        cos, sin = rope_cos_sin(T, d_h, self.rope_base)
+
         for attn, mlp in self.layers:
             key, sa, sm = jax.random.split(key, 3)
-            h = h + attn(h, cos, sin, key=sa, inference=inference)
-            h = h + mlp(h, cos, sin, key=sm, inference=inference)
+            out = attn(h, cos, sin, key=sa, inference=inference, attention_mask=token_mask)
+            out = jnp.where(token_mask[:, None], out - h, 0.0) + h
+            h = out
+            out = mlp(h, cos, sin, key=sm, inference=inference)
+            out = jnp.where(token_mask[:, None], out - h, 0.0) + h
+            h = out
+
         h = jax.vmap(self.ln)(h)
         logits = jax.vmap(lambda t: t @ self.embed.weight.T)(h)
         return logits, {}

@@ -64,7 +64,7 @@ class Dropout(eqx.Module):
 
 class Identity(eqx.Module):
     def __call__(self, x, *_, **__):
-        return jnp.zeros_like(x)
+        return x
 
 
 class Attention(eqx.Module):
@@ -87,22 +87,50 @@ class Attention(eqx.Module):
         self.v = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_v)
         self.o = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_o)
 
-    def __call__(self, x, cos, sin, *, key, inference: bool):
+    def __call__(
+        self,
+        x,
+        cos,
+        sin,
+        *,
+        key,
+        inference: bool,
+        attention_mask: Optional[jnp.ndarray] = None,
+    ):
         k_attn, k_out = jax.random.split(key)
         h = self.ln(x)
         T = h.shape[0]
+
         q = jax.vmap(self.q)(h).reshape(T, self.n_h, self.d_h).transpose(1, 0, 2)
         k = jax.vmap(self.k)(h).reshape(T, self.n_h, self.d_h).transpose(1, 0, 2)
         v = jax.vmap(self.v)(h).reshape(T, self.n_h, self.d_h).transpose(1, 0, 2)
-        q, k = q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
+
+        q = q * cos + rotate_half(q) * sin
+        k = k * cos + rotate_half(k) * sin
+
         scores = jnp.einsum("hqd,hkd->hqk", q, k) / math.sqrt(self.d_h)
+
         causal = jnp.tril(jnp.ones((T, T), dtype=bool))[None]
-        scores = jnp.where(causal, scores, -1e30)
+        if attention_mask is not None:
+            kmask = attention_mask.astype(bool)[None, None, :]
+            allowed = causal & kmask
+            neg = jnp.finfo(scores.dtype).min
+            scores = jnp.where(allowed, scores, neg)
+        else:
+            neg = jnp.finfo(scores.dtype).min
+            scores = jnp.where(causal, scores, neg)
+
         probs = jnn.softmax(scores, axis=-1)
         probs = self.dropout(probs, key=k_attn, inference=inference)
+
         out = jnp.einsum("hqk,hkd->hqd", probs, v).transpose(1, 0, 2).reshape(T, -1)
         out = jax.vmap(self.o)(out)
         out = self.dropout(out, key=k_out, inference=inference)
+
+        if attention_mask is not None:
+            qmask = attention_mask.astype(bool)[:, None]  
+            out = jnp.where(qmask, out, 0.0)
+
         return x + out
 
 

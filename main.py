@@ -25,13 +25,23 @@ class Config:
     n_layers: int = 8
     n_hops: int = 6
     n_backbone: int = 2
-    n_modules: int = 32
+    n_modules: int = 16
     topk: int = 2
-    capacity: int = 32  # capacity per trainable expert (identity excluded)
+    capacity: int = 64  # per trainable expert (identity excluded)
     mlp_mult: int = 4
     dropout: float = 0.1
     rope_base: float = 10_000.0
-    identity_bias: float = 0.1
+
+    # Router controls
+    router_temp: float = 1.0  # temperature for router softmax
+    gumbel: bool = True  # use Gumbel-Top-k during training
+    gumbel_tau: float = 1.0  # Gumbel noise scale
+
+    # Bias control (trainer-driven, identity-only)
+    identity_bias_init: float = 0.0  # initial identity bias per hop (scalar)
+    bias_lr: float = 0.1  # additive sign-update step size
+    id_target_frac: float = 0.0  # target fraction of routes that are identity
+    bias_clip: float = 6.0  # clamp biases into [-bias_clip, +bias_clip]
 
     # ---------------- training ----------------
     batch_size: int = 32
@@ -99,20 +109,39 @@ def lr_schedule(step: jnp.ndarray):
 # ───────────────────────────────────── Loss & step fns ────────────────────────────────────── #
 
 
-def compute_loss(model, batch: Dict[str, Any], key, *, inference: bool = False):
-    ids = batch["input_ids"]        # [B, T]
-    mask = batch["attention_mask"]  # [B, T] (1=token, 0=pad)
+def compute_loss(
+    model: DNA,
+    batch: Dict[str, Any],
+    biases_id: jnp.ndarray,
+    key,
+    *,
+    inference: bool = False,
+):
+    ids = batch["input_ids"]  # [B, T]
+    mask = batch["attention_mask"]  # [B, T] (1=token, 0=pad). Only for loss mask.
 
     B = ids.shape[0]
     keys = jax.random.split(key, B)
-    # Pass per-seq mask into the model; model expects [T] bool
-    vmap_model = jax.vmap(lambda x, m, k: model(x, m.astype(bool), key=k, inference=inference))
-    logits, stats = vmap_model(ids, mask, keys)
 
-    # Standard next-token loss: shift logits left, labels right
-    logits_shift = logits[:, :-1]   # [B, T-1, V]
-    labels_shift = ids[:, 1:]       # [B, T-1]
-    mask_shift = mask[:, 1:]        # [B, T-1] aligns with labels_shift
+    def fwd(x, k):
+        return model(
+            x,
+            key=k,
+            inference=inference,
+            biases=biases_id,  # [n_hops] identity-only biases
+            gumbel=(cfg.gumbel and not inference),
+            gumbel_tau=cfg.gumbel_tau,
+            temp=cfg.router_temp,
+        )
+
+    vmap_model = jax.vmap(fwd)
+    logits, stats = vmap_model(
+        ids, keys
+    )  # logits [B,T,V]; stats: tuple(hops) dicts with [B,...] arrays
+
+    logits_shift = logits[:, :-1]  # [B, T-1, V]
+    labels_shift = ids[:, 1:]  # [B, T-1]
+    mask_shift = mask[:, 1:]  # [B, T-1]
 
     raw_loss = optax.softmax_cross_entropy_with_integer_labels(
         logits_shift, labels_shift
@@ -123,10 +152,10 @@ def compute_loss(model, batch: Dict[str, Any], key, *, inference: bool = False):
 
 
 @eqx.filter_jit
-def train_step(model, opt_state, batch, *, key):
+def train_step(model, opt_state, batch, biases_id, *, key):
     (loss, (logits, labels, mask, stats)), grads = eqx.filter_value_and_grad(
         compute_loss, has_aux=True
-    )(model, batch, key)
+    )(model, batch, biases_id, key)
 
     updates, opt_state = opt.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
@@ -140,59 +169,172 @@ def train_step(model, opt_state, batch, *, key):
 
 
 @eqx.filter_jit
-def eval_step(model, batch, *, key):
-    loss, (logits, labels, mask, _) = compute_loss(model, batch, key, inference=True)
-
+def eval_step(model, batch, biases_id, *, key):
+    loss, (logits, labels, mask, _) = compute_loss(
+        model, batch, biases_id, key, inference=True
+    )
     preds = jnp.argmax(logits, -1)
     correct = (preds == labels) * mask
     acc = correct.sum() / jnp.maximum(mask.sum(), 1)
-
     return loss, acc
 
 
-# ─────────────────────────────────────── Logging utils ────────────────────────────────────── #
+# ───────────────────────────────────── Bias control ───────────────────────────────────────── #
 
 
-def log_metrics(step: int, metrics: Dict[str, float], stats, prefix: str):
+def init_biases_id(n_hops: int, init_identity_bias: float) -> jnp.ndarray:
+    """Return [n_hops] scalar identity biases (last expert per hop)."""
+    return jnp.full((n_hops,), init_identity_bias, dtype=jnp.float32)
+
+
+def update_biases_from_stats_id(
+    biases_id: jnp.ndarray,
+    stats_tuple,
+    *,
+    topk: int,  # k in the paper
+    target_skip_frac: float,  # r in the paper (desired fraction of routes that go to identity)
+    n_experts_total: int,  # |⋆| in the paper = total experts INCLUDING identity
+    lr: float,  # u in the paper (update step size)
+    clip: float | None = None,
+) -> jnp.ndarray:
+    """
+    Paper-spec identity bias update (Eq. 5 in DNA).
+    We keep this **outside** the gradient path and apply it to the identity bias per hop.
+
+    Required stats per hop (pre-capacity, per batch element):
+      - hop["id_topk_count"]: [B]  number of tokens that had identity in top-k
+      - hop["total_routes"]:  [B]  total number of token→expert routes selected (= k * valid_tokens)
+
+    Update (per hop s):
+        b_s <- b_s + u * sign( r * k * cbar_s - id_count_s )
+      where
+        cbar_s = (sum_i c_i^{(s)}) / n_experts_total
+        sum_i c_i^{(s)} == total_routes_s  (pre-capacity, across ALL experts incl. identity)
+
+    Notes
+    -----
+    * Only identity biases are updated (b_s here).
+    * This mirrors their “bias trick” applied to top-k selection only; the softmax probs are unchanged.
+      (cf. “probabilities via softmax; routing decision made by sampling with hard top-k,” and then
+       “modify the top-k selection via i ∈ top-k(ρ⋆ + b⋆); biases are non-zero only for identity.”) :contentReference[oaicite:1]{index=1}
+    """
+    if lr == 0.0:
+        return biases_id
+
+    b = biases_id
+    for s, hop in enumerate(stats_tuple):
+        # Aggregate across the batch.
+        id_count = jnp.sum(hop["id_topk_count"].astype(jnp.int32)).astype(
+            jnp.float32
+        )  # ∑_{i∈Id} c_i^{(s)}
+        total_routes = jnp.sum(hop["total_routes"].astype(jnp.int32)).astype(
+            jnp.float32
+        )  # ∑_i c_i^{(s)}
+
+        # Average count per expert, including identity(s):
+        cbar = total_routes / jnp.maximum(n_experts_total, 1)
+
+        # Target = r * k * c̄^{(s)}  (Eq. 5)
+        target = target_skip_frac * float(topk) * cbar
+
+        step = lr * jnp.sign(target - id_count)
+        b = b.at[s].add(step)
+
+    if clip is not None and clip > 0:
+        b = jnp.clip(b, -clip, clip)
+
+    return b
+
+
+# ───────────────────────────────────── Weight norms ───────────────────────────────────────── #
+
+
+def l2_tree_norm(tree) -> float:
+    leaves = jax.tree_util.tree_leaves(eqx.filter(tree, eqx.is_array))
+    sq = sum([jnp.sum(jnp.square(x)) for x in leaves]) if leaves else jnp.array(0.0)
+    return float(jnp.sqrt(sq + 1e-12))
+
+
+def router_l2_norm(model: DNA) -> float:
+    # Only the router weights (proj matrices)
+    leaves = jax.tree_util.tree_leaves(eqx.filter(model.routers, eqx.is_array))
+    if not leaves:
+        return 0.0
+    sq = sum([jnp.sum(jnp.square(x)) for x in leaves])
+    return float(jnp.sqrt(sq + 1e-12))
+
+
+# ───────────────────────────────────── Logging utils ────────────────────────────────────── #
+
+
+def log_metrics(
+    step: int,
+    metrics: Dict[str, float],
+    stats_tuple,
+    biases_id: jnp.ndarray,
+    prefix: str,
+):
+    """
+    stats_tuple is a tuple (len = n_hops) of dicts.
+    Each value in a dict is a batched array over B (because we vmapped the model).
+    We aggregate over batch here.
+    """
     log = {f"{prefix}/{k}": v for k, v in metrics.items()}
     log["step"] = step
 
-    if stats and isinstance(stats[0], dict):
-        load_means, load_stds, utils, entropies = [], [], [], []
-        cap_drop_rates = []
+    if stats_tuple and isinstance(stats_tuple[0], dict):
+        rho_means = []
+        id_rates = []
+        ent_means = []
+        load_stds = []
+        utils = []
+        cap_drop_fracs = []
 
-        for hop in stats:
-            load = hop["load"].mean(0)  # per-expert post-capacity load
-            norm_load = load / jnp.clip(load.sum(), 1.0)
+        def _mean_over_batch(x):
+            return jnp.mean(x, axis=0)
 
-            load_means.append(load.mean())
-            load_stds.append(jnp.std(norm_load))
-            utils.append((load > 0).mean())
+        for hop in stats_tuple:
+            load = _mean_over_batch(hop["load"])  # [E]
+            load_std = float(jnp.std(load / jnp.clip(jnp.sum(load), 1.0)))
+            utils.append(float(jnp.mean(load > 0)))
 
-            ent = -(norm_load * jnp.log(norm_load + 1e-9)).sum() / math.log(
-                norm_load.shape[0]
+            rho_means.append(float(jnp.mean(_mean_over_batch(hop["rho_mean"]))))
+            id_rates.append(float(jnp.mean(_mean_over_batch(hop["id_topk_rate"]))))
+            ent_means.append(float(jnp.mean(_mean_over_batch(hop["entropy_mean"]))))
+            cap_drop_fracs.append(
+                float(jnp.mean(_mean_over_batch(hop["cap_drop_frac_edges"])))
             )
-            entropies.append(ent)
 
-            cap_drop_rates.append(float(hop["cap_drop_rate"]))
-
-        load_mean = jnp.mean(jnp.stack(load_means))
-        load_std = jnp.mean(jnp.stack(load_stds))
-        util = jnp.mean(jnp.stack(utils))
-        ent_arr = jnp.stack(entropies)
-        cap_drop = sum(cap_drop_rates) / max(len(cap_drop_rates), 1)
+            load_stds.append(load_std)
 
         log.update(
             {
-                f"routing/{prefix}/load_mean": float(load_mean),
-                f"routing/{prefix}/load_std": float(load_std),
-                f"routing/{prefix}/util": float(util),
-                f"routing/{prefix}/entropy_mean": float(jnp.mean(ent_arr)),
-                f"routing/{prefix}/entropy_min": float(jnp.min(ent_arr)),
-                f"routing/{prefix}/entropy_max": float(jnp.max(ent_arr)),
-                f"routing/{prefix}/cap_drop_rate": float(cap_drop),
+                f"routing/{prefix}/rho_mean": float(
+                    sum(rho_means) / max(len(rho_means), 1)
+                ),
+                f"routing/{prefix}/id_rate": float(
+                    sum(id_rates) / max(len(id_rates), 1)
+                ),
+                f"routing/{prefix}/entropy_mean": float(
+                    sum(ent_means) / max(len(ent_means), 1)
+                ),
+                f"routing/{prefix}/load_std": float(
+                    sum(load_stds) / max(len(load_stds), 1)
+                ),
+                f"routing/{prefix}/util": float(sum(utils) / max(len(utils), 1)),
+                f"routing/{prefix}/cap_drop_frac": float(
+                    sum(cap_drop_fracs) / max(len(cap_drop_fracs), 1)
+                ),
             }
         )
+
+    # Bias + router hyperparams
+    log["bias/id_mean"] = float(jnp.mean(biases_id))
+    log["bias/id_min"] = float(jnp.min(biases_id))
+    log["bias/id_max"] = float(jnp.max(biases_id))
+    log["router/temp"] = float(cfg.router_temp)
+    log["router/gumbel_tau"] = float(cfg.gumbel_tau)
+    log["router/gumbel"] = float(cfg.gumbel)
 
     wandb.log(log)
 
@@ -200,14 +342,25 @@ def log_metrics(step: int, metrics: Dict[str, float], stats, prefix: str):
 # ───────────────────────────────────── Generation util ────────────────────────────────────── #
 
 
-def generate_examples(model, tok, prompt="One day, ", n=5, gen_len=50, *, key):
+def generate_examples(
+    model, tok, prompt="One day, ", n=5, gen_len=50, *, key, biases_id
+):
     prompt_ids = jnp.array(tok.encode(prompt), dtype=jnp.int32)
     key, *subs = jax.random.split(key, n + 1)
     subs = jnp.stack(subs)
 
     @jax.vmap
     def _sample(k):
-        return generate(model, prompt_ids, gen_len, 1.0, key=k)
+        return generate(
+            model,
+            prompt_ids,
+            gen_len,
+            1.0,
+            key=k,
+            biases=biases_id,
+            gumbel=False,
+            temp=cfg.router_temp,
+        )
 
     out = _sample(subs)
     decoded = []
@@ -247,7 +400,6 @@ def build_model(key):
             dropout=cfg.dropout,
             rope_base=cfg.rope_base,
             num_backbone=cfg.n_backbone,
-            identity_bias=cfg.identity_bias,
             key=key,
         )
     return model
@@ -268,6 +420,9 @@ def main():
     key = jax.random.PRNGKey(cfg.seed)
     key, mk = jax.random.split(key)
     model = build_model(mk)
+
+    # Identity bias buffer (trainer-controlled; outside grad). Shape [n_hops]
+    biases_id = init_biases_id(cfg.n_hops, cfg.identity_bias_init)
 
     n_params = sum(
         x.size for x in jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
@@ -292,39 +447,63 @@ def main():
         key, sk = jax.random.split(key)
         batch = sample_batch(train_it, cfg.batch_size)
 
+        # One training step
         t0 = time.perf_counter()
         model, opt_state, loss, acc, stats, gnorm = train_step(
-            model, opt_state, batch, key=sk
+            model, opt_state, batch, biases_id, key=sk
         )
         dt_ms = (time.perf_counter() - t0) * 1000
 
+        # Update identity biases outside JIT/grad, using routing stats
+        stats_host = jax.tree_util.tree_map(lambda x: jax.device_get(x), stats)
+        biases_id = update_biases_from_stats_id(
+            biases_id,
+            stats_host,
+            topk=cfg.topk,
+            target_skip_frac=cfg.id_target_frac,
+            n_experts_total=cfg.n_modules + 1,  # include identity!
+            lr=cfg.bias_lr,
+            clip=cfg.bias_clip,
+        )
+
         if step % cfg.log_every == 0:
-            log_metrics(
-                step,
-                {
-                    "loss": float(loss),
-                    "acc": float(acc),
-                    "lr": float(lr_schedule(jnp.array(step))),
-                    "grad_norm": float(gnorm),
-                    "step_ms": dt_ms,
-                    "tok_s": cfg.batch_size * cfg.seq_len / (dt_ms / 1000 + 1e-9),
-                },
-                stats,
-                "train",
-            )
+            # Weight norms
+            global_param_norm = l2_tree_norm(model)
+            router_param_norm = router_l2_norm(model)
+
+            metrics = {
+                "loss": float(loss),
+                "acc": float(acc),
+                "lr": float(lr_schedule(jnp.array(step))),
+                "grad_norm": float(gnorm),
+                "step_ms": dt_ms,
+                "tok_s": cfg.batch_size * cfg.seq_len / (dt_ms / 1000 + 1e-9),
+                "w_norm/global": global_param_norm,
+                "w_norm/routers": router_param_norm,
+            }
+            log_metrics(step, metrics, stats_host, biases_id, "train")
 
         if step % cfg.eval_every == 0 and step > 0:
             key, ek = jax.random.split(key)
             val_batch = sample_batch(val_it, cfg.eval_samples // cfg.seq_len)
-            val_loss, val_acc = eval_step(model, val_batch, key=ek)
-            log_metrics(
-                step, {"loss": float(val_loss), "acc": float(val_acc)}, [], "eval"
+            val_loss, val_acc = eval_step(model, val_batch, biases_id, key=ek)
+            wandb.log(
+                {
+                    "eval/loss": float(val_loss),
+                    "eval/acc": float(val_acc),
+                    "step": step,
+                }
             )
 
         if step % cfg.example_every == 0 and step > 0:
             key, ek = jax.random.split(key)
             samples = generate_examples(
-                model, tok, n=cfg.n_examples, gen_len=cfg.gen_len, key=ek
+                model,
+                tok,
+                n=cfg.n_examples,
+                gen_len=cfg.gen_len,
+                key=ek,
+                biases_id=biases_id,
             )
             print(f"\n========== SAMPLES @ step {step} ==========")
             for i, s in enumerate(samples):

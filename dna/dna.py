@@ -1,10 +1,20 @@
-import math
-from typing import Tuple, Dict, Any
+# dna/dna.py
+#
+# DNA hop faithful to the paper and MoE best practices:
+# - Router logits + optional identity-only bias (from trainer, outside grad).
+# - Softmax temperature for gates (probs) and optional Gumbel-Top-k sampling
+#   for the discrete selection (top-k on logits + noise).
+# - No STE. Gradients flow through the softmax probs of selected experts.
+# - Capacity packing for JIT-friendly per-expert execution; no post-drop renorm.
+# - Eq. (3)-style residual, consistent with modules that return x + f(x).
+#
+# JIT-safe: no boolean advanced indexing; use jnp.where and lax.top_k.
+
+from typing import Tuple, Dict, Any, Optional
 
 import jax
 import jax.numpy as jnp
 import jax.nn as jnn
-
 import equinox as eqx
 
 from dna.nn import (
@@ -13,14 +23,13 @@ from dna.nn import (
     RMSNorm,
     Attention,
     FeedForward,
-    Identity,
     rope_cos_sin,
-    rotate_half,
 )
 
+# -------------------------- routing helpers -------------------------- #
 
 def _topk_mask(logits: jnp.ndarray, k: int) -> jnp.ndarray:
-    """Return boolean mask of top-k indices per token: [T, E]."""
+    """Boolean mask of top-k indices per row of `logits` (shape [T, E])."""
     _, idx = jax.lax.top_k(logits, k)
     hard = jnn.one_hot(idx, logits.shape[-1]).sum(axis=-2)
     return hard.astype(bool)
@@ -28,93 +37,104 @@ def _topk_mask(logits: jnp.ndarray, k: int) -> jnp.ndarray:
 
 def _capacity_select(mask_te: jnp.ndarray, gate_te: jnp.ndarray, capacity: int):
     """
-    Select up to `capacity` tokens per expert using gate as score.
+    Fixed per-expert capacity across tokens (JIT-friendly packing).
     Inputs:
-      mask_te: [T, E] bool – token chose expert (top-k pre-capacity), excludes identity
-      gate_te: [T, E] float – softmax probs for experts, excludes identity
+      mask_te: [T, E] bool   (non-identity top-k per token)
+      gate_te: [T, E] float  (softmax probs, non-identity slice)
     Returns:
-      slot: [E, C, T] binary selection matrix
-      kept: [E, T] bool  – whether expert e kept token t
+      slot: [E, C, T] binary selection matrix (slots per expert)
+      kept: [E, T] bool (whether expert e kept token t)
     """
-    m = mask_te.T
-    g = jnp.where(m, gate_te.T, -jnp.inf)  # [E, T]
+    m = mask_te.T                         # [E, T]
+    g = jnp.where(m, gate_te.T, -jnp.inf) # [E, T]
 
-    cap = jnp.minimum(capacity, g.shape[1])
-    _, top_idx = jax.lax.top_k(g, cap)  # [E, C]
+    cap = int(min(capacity, g.shape[1]))
+    _, top_idx = jax.lax.top_k(g, cap)    # [E, C]
 
     E, C = top_idx.shape
     T = g.shape[1]
     slot = jnp.zeros((E, C, T), dtype=g.dtype)
     slot = slot.at[jnp.arange(E)[:, None], jnp.arange(C)[None, :], top_idx].set(1.0)
 
-    kept = slot.sum(1).astype(bool)  # [E, T]
+    # Avoid phantom picks by intersecting with original mask
+    slot = slot * m[:, None, :]           # [E, C, T]
+    kept = slot.sum(1).astype(bool)       # [E, T]
     return slot, kept
 
 
-def _sig(m):
-    st = jax.tree_util.tree_structure(eqx.filter(m, eqx.is_array))
-    static = str(eqx.filter(m, lambda x: not eqx.is_array(x)))
-    return type(m).__name__, str(st), static
+def _sig(mod):
+    st = jax.tree_util.tree_structure(eqx.filter(mod, eqx.is_array))
+    static = str(eqx.filter(mod, lambda x: not eqx.is_array(x)))
+    return type(mod).__name__, str(st), static
 
 
 def _stack(mods):
-    arr = [eqx.filter(m, eqx.is_array) for m in mods]
+    params = [eqx.filter(m, eqx.is_array) for m in mods]
     static = eqx.filter(mods[0], lambda x: not eqx.is_array(x))
-    return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, 0), *arr), static
+    return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, 0), *params), static
 
 
-# -----------------------------------------------------------------------------
-#  Router
-# -----------------------------------------------------------------------------
-
+# ------------------------------ Router ------------------------------ #
 
 class Router(eqx.Module):
     proj: eqx.nn.Linear
-    id_bias: float = eqx.field(static=True)
     k: int = eqx.field(static=True)
 
-    def __init__(self, d_model: int, n_exp: int, k: int, *, id_bias: float, key):
+    def __init__(self, d_model: int, n_exp: int, k: int, *, key):
         self.k = k
-        self.id_bias = id_bias
         self.proj = eqx.nn.Linear(d_model, n_exp, use_bias=False, key=key)
 
-    def __call__(self, h: jnp.ndarray, is_valid: jnp.ndarray):
+    def __call__(
+        self,
+        h: jnp.ndarray,
+        bias_row: Optional[jnp.ndarray] = None,
+        *,
+        key: Optional[jax.Array] = None,
+        sample_gumbel: bool = False,
+        gumbel_tau: float = 1.0,
+        temp: float = 1.0,
+    ):
         """
-        h: [T, d], is_valid: [T] bool (True=real token, False=pad)
-        Returns: (mask [T,E], probs [T,E]) over E = n_modules + 1 (last is identity)
+        h: [T, d]
+        bias_row: [E] or [ ] None. Trainer-supplied per-hop bias. We apply ONLY the
+                  identity component (last index) to logits before selection.
+                  We also stop_gradient so it's outside autograd.
+        key: RNG key used only if sample_gumbel=True.
+        sample_gumbel: if True, add Gumbel noise to logits for *top-k decision only*.
+        gumbel_tau: Gumbel noise scale (τ).
+        temp: router softmax temperature (applies to probs only).
+
+        Returns:
+          mask_full: [T, E] bool  (hard top-k, possibly Gumbel-sampled)
+          probs:     [T, E] float (softmax over temperature-scaled clean logits)
+          logits:    [T, E] float (clean logits after identity bias)
         """
-        logits = jax.vmap(self.proj)(h)  # [T, E]
-        T, E = logits.shape
+        logits = jax.vmap(self.proj)(h)                 # [T, E]
+        E = logits.shape[-1]
 
-        # Encourage identity: additive bias on identity column (JIT-safe)
-        id_col_mask = (jnp.arange(E) == (E - 1))[None, :]  # [1,E] True at identity
-        logits = logits + jnp.where(id_col_mask, self.id_bias, 0.0)
+        # Identity-only bias (last column). Ignore non-identity entries if provided.
+        if bias_row is not None:
+            b_id = jax.lax.stop_gradient(bias_row[-1])
+            id_mask = (jnp.arange(E) == (E - 1))[None, :]  # [1,E]
+            logits = logits + b_id * id_mask
 
-        # Make pads route to identity only, w/out boolean indexing
-        pad = (~is_valid)[:, None]        # [T,1]
-        non_id_col_mask = ~id_col_mask    # [1,E]
+        # Probabilities from temperature-scaled CLEAN logits
+        probs = jnn.softmax(logits / jnp.clip(temp, 1e-6, None), axis=-1)
 
-        # Non-identity cols for pads => -inf
-        logits = jnp.where(pad & non_id_col_mask, jnp.full_like(logits, -1e30), logits)
-        # Identity col for pads => +big
-        logits = logits + jnp.where(pad & id_col_mask, 1e30, 0.0)
+        # Discrete decision: optionally add Gumbel noise to selection path
+        if sample_gumbel:
+            assert key is not None, "Router requires key when sample_gumbel=True"
+            u = jax.random.uniform(key, logits.shape, minval=1e-6, maxval=1.0 - 1e-6)
+            gumbel = -jnp.log(-jnp.log(u))
+            logits_for_topk = logits + gumbel_tau * gumbel
+        else:
+            logits_for_topk = logits
 
-        probs = jnn.softmax(logits, axis=-1)  # differentiable; no ST
-
-        # Hard top-k on logits
-        mask = _topk_mask(logits, self.k)     # [T,E] bool
-
-        # For pads force the mask to identity-only (avoid random -inf picks when k>1)
-        id_rows = id_col_mask.astype(bool).repeat(T, axis=0)  # [T,E]
-        mask = jnp.where(pad, id_rows, mask)
-
-        return mask, probs
+        mask_full = _topk_mask(logits_for_topk, self.k)
+        return mask_full, probs, logits
 
 
-# -----------------------------------------------------------------------------
-#  DNA model
-# -----------------------------------------------------------------------------
-
+# ------------------------------- DNA -------------------------------- #
 
 class DNA(eqx.Module):
     embed: Embedding
@@ -126,13 +146,9 @@ class DNA(eqx.Module):
 
     # Static fields
     n_modules: int = eqx.field(static=True)   # trainable experts
-    capacity: int = eqx.field(static=True)    # per-expert capacity
+    capacity: int = eqx.field(static=True)    # per-expert capacity (fixed C for JIT)
     n_heads: int = eqx.field(static=True)
     rope_base: float = eqx.field(static=True)
-
-    # ---------------------------------------------------------------------
-    # Constructor
-    # ---------------------------------------------------------------------
 
     def __init__(
         self,
@@ -147,7 +163,6 @@ class DNA(eqx.Module):
         dropout: float,
         rope_base: float,
         num_backbone: int,
-        identity_bias: float,
         key,
     ):
         self.n_modules = n_modules
@@ -155,13 +170,13 @@ class DNA(eqx.Module):
         self.n_heads = n_heads
         self.rope_base = rope_base
 
-        # ---------- global components ----------
+        # Global components
         k_embed, k_modules, k_routers, k_backbone = jax.random.split(key, 4)
         self.embed = Embedding(vocab, d_model, key=k_embed)
         self.dropout = Dropout(dropout)
         self.ln_out = RMSNorm(d_model)
 
-        # ---------- build trainable experts ----------
+        # Build trainable experts (alternate Attn/FFN)
         module_keys = jax.random.split(k_modules, n_modules)
         experts = []
         for i, k_i in enumerate(module_keys):
@@ -170,13 +185,14 @@ class DNA(eqx.Module):
             else:
                 experts.append(FeedForward(d_model, mlp_mult, dropout, key=k_i))
 
-        # ---------- group by signature ----------
+        # Group identical signatures
         buckets: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for idx, mod in enumerate(experts):
             s = _sig(mod)
             entry = buckets.setdefault(s, {"idx": [], "mods": []})
             entry["idx"].append(idx)
             entry["mods"].append(mod)
+
         grouped = []
         for b in buckets.values():
             params, st = _stack(b["mods"])
@@ -186,53 +202,73 @@ class DNA(eqx.Module):
         grouped.sort(key=lambda d: int(d["idx"][0]))
         self.groups = tuple(grouped)
 
-        # ---------- backbone ----------
+        # Optional dense backbone
         if num_backbone > 0:
             bb_keys = jax.random.split(k_backbone, num_backbone)
-            backbone_tmp = []
+            bb = []
             for i in range(num_backbone):
                 if i % 2 == 0:
-                    backbone_tmp.append(
-                        Attention(d_model, n_heads, dropout, key=bb_keys[i])
-                    )
+                    bb.append(Attention(d_model, n_heads, dropout, key=bb_keys[i]))
                 else:
-                    backbone_tmp.append(
-                        FeedForward(d_model, mlp_mult, dropout, key=bb_keys[i])
-                    )
-            self.backbone = tuple(backbone_tmp)
+                    bb.append(FeedForward(d_model, mlp_mult, dropout, key=bb_keys[i]))
+            self.backbone = tuple(bb)
         else:
             self.backbone = tuple()
 
-        # ---------- routers (one per hop) ----------
+        # Routers (one per hop). Last expert index is identity.
         router_keys = jax.random.split(k_routers, n_hops)
-        total_experts = n_modules + 1  # +1 identity (last column)
+        total_experts = n_modules + 1
         self.routers = tuple(
-            Router(d_model, total_experts, topk, id_bias=identity_bias, key=k)
-            for k in router_keys
+            Router(d_model, total_experts, topk, key=k) for k in router_keys
         )
 
-    # ---------------------------------------------------------------------
-    # Forward pass (identity excluded from capacity; JIT-safe masking)
-    # ---------------------------------------------------------------------
+    # --------------------- one hop --------------------- #
 
-    def _hop(self, h, is_valid, router: Router, cos, sin, *, key, inference):
-        mask_full, probs_full = router(h, is_valid)   # [T,E], [T,E]
-        probs_tr = probs_full[:, :-1]                 # exclude identity
-        mask_tr = mask_full[:, :-1]                   # exclude identity
+    def _hop(
+        self,
+        h,
+        router: Router,
+        cos,
+        sin,
+        *,
+        key,
+        inference,
+        bias_row,
+        sample_gumbel: bool,
+        gumbel_tau: float,
+        temp: float,
+    ):
+        """One hop with optional Gumbel-Top-k for the discrete selection."""
+        k_route, k_exec = jax.random.split(key)
 
-        # Capacity selection per expert (over tokens)
-        slot, kept = _capacity_select(mask_tr, probs_tr, self.capacity)  # [E,C,T], [E,T]
+        # Route (include identity in routing; identity is last column)
+        mask_full, probs_full, logits_full = router(
+            h,
+            bias_row,
+            key=k_route,
+            sample_gumbel=sample_gumbel,
+            gumbel_tau=gumbel_tau,
+            temp=temp,
+        )  # [T,E], [T,E], [T,E]
+
+        probs_tr = probs_full[:, :-1]                   # exclude identity
+        mask_tr = mask_full[:, :-1]                     # exclude identity
+        id_in_topk = mask_full[:, -1]                   # [T]
+
+        # Token budget per expert across tokens
+        slot, kept = _capacity_select(mask_tr, probs_tr, self.capacity)  # [E,C,T],[E,T]
 
         # Gather token blocks for experts
-        xin = jnp.einsum("ect,td->ecd", slot, h)     # [E, C, d]
-        cos_r = jnp.einsum("ect,td->ecd", slot, cos) # [E, C, d_h]
-        sin_r = jnp.einsum("ect,td->ecd", slot, sin) # [E, C, d_h]
+        xin = jnp.einsum("ect,td->ecd", slot, h)         # [E,C,d]
+        cos_r = jnp.einsum("ect,td->ecd", slot, cos)     # [E,C,d_h]
+        sin_r = jnp.einsum("ect,td->ecd", slot, sin)     # [E,C,d_h]
 
-        # Apply trainable experts grouped by signature
+        # Execute trainable experts (modules return x+f(x))
         outs = []
         for g in self.groups:
             n_g = len(g["idx"])
-            sub_keys = jax.random.split(key, n_g)
+            sub_keys = jax.random.split(k_exec, n_g)
+            k_exec = sub_keys[0]  # advance deterministically
             inp = xin[g["idx"]]    # [n_g, C, d]
             c = cos_r[g["idx"]]    # [n_g, C, d_h]
             s = sin_r[g["idx"]]    # [n_g, C, d_h]
@@ -242,59 +278,115 @@ class DNA(eqx.Module):
                 )
             )(g["params"], inp, c, s, sub_keys)
             outs.append(out_g)
-        expert_out = jnp.concatenate(outs, axis=0)  # [E, C, d], E=n_modules
+        expert_out = jnp.concatenate(outs, axis=0)       # [E, C, d] = M_e(h_in)
 
-        # Realized (post-capacity) per-token expert weights: no renorm
-        kept_t = kept.T                              # [T,E]
-        combine_w = jnp.where(kept_t, probs_tr, 0.0) # [T,E] unnormalized
-        rho = combine_w.sum(axis=1, keepdims=True)   # [T,1] realized non-identity mass
+        # Combine (no renorm), identity not dispatched
+        kept_t = kept.T                                   # [T,E]
+        combine_w = jnp.where(kept_t, probs_tr, 0.0)      # [T,E] realized weights
+        rho = combine_w.sum(axis=1, keepdims=True)        # [T,1] realized non-id mass
+        combine = jnp.einsum("ecd,ect,et->td", expert_out, slot, combine_w.T)
 
-        # Scatter back to tokens with combine weights
-        combine = jnp.einsum("ecd,ect,et->td", expert_out, slot, combine_w.T)  # [T,d]
-        h_next = h + combine - rho * h  # preserve identity mass
+        # Eq. (3): h_next = h + Σ_e ρ_e (M_e(h) - h). Since M_e returns x+f(x),
+        # this equals h + Σ_e ρ_e f_e(h).
+        h_next = h + combine - rho * h
 
-        # Stats
-        per_expert_load = kept.sum(axis=1)  # [E]
-        selected_any = (mask_tr.sum(axis=1) > 0)        # [T]
-        kept_any = (kept_t.sum(axis=1) > 0)             # [T]
-        cap_drop_rate = jnp.where(selected_any.any(), (selected_any & (~kept_any)).mean(), 0.0)
+        # ---------------- stats ----------------
+        load = kept.sum(axis=1).astype(jnp.int32)         # [E]
+        importance = probs_tr.sum(axis=0)                 # [E]
+        selected_edges = mask_tr.sum()
+        kept_edges = kept.sum()
+        cap_drop_frac_edges = jnp.where(
+            selected_edges > 0, (selected_edges - kept_edges) / selected_edges, 0.0
+        )
+
+        p_tr = probs_tr
+        p_tr_sum = p_tr.sum(axis=1, keepdims=True) + 1e-9
+        p_tr_norm = p_tr / p_tr_sum
+        ent = -(p_tr_norm * jnp.log(p_tr_norm + 1e-9)).sum(axis=1)
+        ent = ent / jnp.log(p_tr.shape[1] + 1e-9)
+
+        util = (load > 0).mean()
+        load_norm = load / (jnp.sum(load) + 1e-9)
+        load_std = jnp.std(load_norm)
+
+        rho_mean = rho.mean(); rho_min = rho.min(); rho_max = rho.max()
+
+        k = router.k
+        T = h.shape[0]
+        total_routes = jnp.asarray(k * T, jnp.int32)
+        id_topk_count = id_in_topk.sum().astype(jnp.int32)
 
         stats = dict(
-            load=per_expert_load,                # post-capacity loads (no identity)
-            importance=probs_tr.sum(axis=0),     # pre-capacity mass per expert
-            cap_drop_rate=cap_drop_rate,
-            selections=mask_tr.astype(jnp.int32).sum(axis=1),
+            load=load,
+            importance=importance,
+            rho_mean=rho_mean, rho_min=rho_min, rho_max=rho_max,
+            id_topk_rate=id_in_topk.mean(),
+            id_topk_count=id_topk_count,
+            total_routes=total_routes,
+            entropy_mean=ent.mean(),
+            entropy_min=ent.min(),
+            entropy_max=ent.max(),
+            util=util,
+            load_std=load_std,
+            cap_drop_frac_edges=cap_drop_frac_edges,
+            selected_edges=jnp.asarray(selected_edges, jnp.int32),
+            kept_edges=jnp.asarray(kept_edges, jnp.int32),
+            id_logit_mean=jnp.mean(logits_full[:, -1]),
+            nonid_logit_mean=jnp.mean(logits_full[:, :-1]),
         )
         return h_next, stats
 
-    # ------------------------------------------------------------------
-    # __call__ – public API
-    # ------------------------------------------------------------------
+    # --------------------- public API --------------------- #
 
     @eqx.filter_jit
-    def __call__(self, ids, attn_mask: jnp.ndarray = None, *, key, inference: bool):
+    def __call__(
+        self,
+        ids: jnp.ndarray,             # [T]
+        *,
+        key,
+        inference: bool,
+        biases: Optional[jnp.ndarray] = None,      # [n_hops, E_total] or [n_hops]
+        gumbel: bool = False,
+        gumbel_tau: float = 1.0,
+        temp: float = 1.0,
+    ):
+        """
+        Forward pass (no batching; vmap externally).
+        `biases`: if 2D, we read the last column only (identity); if 1D, use scalar per hop.
+        """
         T = ids.shape[0]
-        h = jax.vmap(self.embed)(ids)
+        h = jax.vmap(self.embed)(ids)             # [T, d]
         key, sub = jax.random.split(key)
         h = self.dropout(h, key=sub, inference=inference)
 
-        if attn_mask is None:
-            is_valid = jnp.ones((T,), dtype=bool)
-        else:
-            is_valid = attn_mask.astype(bool)
-
-        cos, sin = rope_cos_sin(
-            T, self.embed.weight.shape[1] // self.n_heads, self.rope_base
-        )
+        d_h = self.embed.weight.shape[1] // self.n_heads
+        cos, sin = rope_cos_sin(T, d_h, self.rope_base)  # [T, d_h]
 
         for mod in self.backbone:
             key, sub = jax.random.split(key)
             h = h + mod(h, cos, sin, key=sub, inference=inference)
 
         stats_all = []
-        for R in self.routers:
+        for hop_idx, R in enumerate(self.routers):
             key, sub = jax.random.split(key)
-            h, st = self._hop(h, is_valid, R, cos, sin, key=sub, inference=inference)
+            bias_row = None
+            if biases is not None:
+                if biases.ndim == 1:
+                    # scalar per hop -> apply to identity column
+                    E_total = self.n_modules + 1
+                    zero = jnp.zeros((E_total,), dtype=jnp.float32)
+                    bias_row = zero.at[-1].set(biases[hop_idx])
+                else:
+                    bias_row = biases[hop_idx]  # [E_total]; router will mask to identity
+            h, st = self._hop(
+                h, R, cos, sin,
+                key=sub,
+                inference=inference,
+                bias_row=bias_row,
+                sample_gumbel=gumbel and (not inference),
+                gumbel_tau=gumbel_tau,
+                temp=temp,
+            )
             stats_all.append(st)
 
         h = jax.vmap(self.ln_out)(h)

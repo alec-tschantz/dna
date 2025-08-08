@@ -103,7 +103,7 @@ class Attention(eqx.Module):
         out = jnp.einsum("hqk,hkd->hqd", probs, v).transpose(1, 0, 2).reshape(T, -1)
         out = jax.vmap(self.o)(out)
         out = self.dropout(out, key=k_out, inference=inference)
-        return out
+        return x + out
 
 
 class FeedForward(eqx.Module):
@@ -129,4 +129,4 @@ class FeedForward(eqx.Module):
         h = self.dropout(h, key=k_mid, inference=inference)
         h = jax.vmap(self.down)(h)
         h = self.dropout(h, key=k_out, inference=inference)
-        return h
+        return x + h

@@ -85,7 +85,7 @@ class TopKRouter(eqx.Module):
             assert (
                 bias_e.ndim == 1 and bias_e.shape[0] == logits_te.shape[-1]
             ), "bias_e must be shape (E,) and match router output size"
-            logits_te = logits_te + bias_e[None, :]
+            logits_te = logits_te + bias_e[None, :] # should be topk added to?
 
         # Soft combination weights from clean logits
         weight_te = jnn.softmax(logits_te, axis=-1)  # (T, E)

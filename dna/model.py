@@ -1,53 +1,63 @@
+
+# model.py
+# -----------------------------------------------------------------------------
+# End-to-end model wiring:
+#   tokens → Embedding → (optional backbone) → repeat n_hops:
+#     Router(h, bias)  # executed outside
+#     ModuleGroup executes ALL routed experts (identity included if you pass it)
+#     Residual: h <- h + combined - rho * h   (rho = sum_e kept_weight[t,e])
+#   → RMSNorm → tied output projection
+#
+# Stats per hop (minimal but telling):
+#   • tokens_per_expert, util_frac, load_cv
+#   • entropy over routing, avg_selected_k
+#   • rho_mean/min/max, capacity_drop_frac
+# -----------------------------------------------------------------------------
 from __future__ import annotations
-from dataclasses import dataclass
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
 import equinox as eqx
 
-from dna.nn import Embedding, Dropout, RMSNorm, rope_cos_sin  # primitives
-from dna.nn import Attention, FeedForward                     # typical modules
+from dna.nn import Embedding, Dropout, RMSNorm, rope_cos_sin
+from dna.nn import Attention, FeedForward
 from .modules import ModuleGroup
 from .router import TopKRouter, RouterOutput
 
 
 # ---- hop stats -------------------------------------------------------------
+def _hop_stats(
+    *,
+    kept_et: jnp.ndarray,         # (E, T) bool
+    probs_te: jnp.ndarray,        # (T, E) float
+    mask_te: jnp.ndarray,         # (T, E) bool
+    rho_t1: jnp.ndarray,          # (T, 1) float
+    logits_te: jnp.ndarray,       # (T, E) float
+    token_mask_t: jnp.ndarray,    # (T,) bool
+    k_routes: int,
+) -> Dict[str, Any]:
+    load_e = kept_et.sum(axis=1).astype(jnp.int32)             # (E,)
+    selected_edges = mask_te.sum()
+    kept_edges = kept_et.sum()
+    cap_drop_frac = jnp.where(
+        selected_edges > 0, (selected_edges - kept_edges) / selected_edges, 0.0
+    )
 
-def _hop_stats(*, kept_et: jnp.ndarray, probs_tr: jnp.ndarray, mask_tr: jnp.ndarray,
-               rho_t1: jnp.ndarray, logits_full: jnp.ndarray,
-               token_mask_t: jnp.ndarray, id_col: Optional[int], k_routes: int) -> Dict[str, Any]:
-    """Small but telling set of per‑hop diagnostics.
-    Shapes:
-        kept_et:  (E, T) bool for non‑identity experts
-        probs_tr: (T, E) float for non‑identity experts
-        mask_tr:  (T, E) bool  for non‑identity experts
-        rho_t1:   (T, 1)  sum of *kept* weights per token
-        logits_full: (T, E_total) float (clean)
-        token_mask_t: (T,) bool indicating valid tokens (pads=False)
-        id_col:   index of identity expert if present, else None
-    """
-    load_e = kept_et.sum(axis=1).astype(jnp.int32)                # (E,)
-    selected_edges = mask_tr.sum()                                 # scalar
-    kept_edges = kept_et.sum()                                     # scalar
-    cap_drop_frac = jnp.where(selected_edges > 0, (selected_edges - kept_edges) / selected_edges, 0.0)
-
-    # Entropy over the *non‑identity* distribution per token, normalized by log E
-    p = probs_tr
+    p = probs_te
     p_sum = p.sum(axis=1, keepdims=True) + 1e-9
     p_norm = p / p_sum
     ent_t = -(p_norm * jnp.log(p_norm + 1e-9)).sum(axis=1)
     ent_t = ent_t / jnp.log(p.shape[1] + 1e-9)
 
-    util_frac = (load_e > 0).mean()                               # fraction of used experts
+    util_frac = (load_e > 0).mean()
     load_cv = jnp.std(load_e.astype(jnp.float32) + 1e-9) / (jnp.mean(load_e.astype(jnp.float32)) + 1e-9)
 
     rho_mean, rho_min, rho_max = rho_t1.mean(), rho_t1.min(), rho_t1.max()
-    avg_selected_k = mask_tr.sum(axis=1).mean()                   # should be close to k_routes
+    avg_selected_k = mask_te.sum(axis=1).mean()
 
-    stats = dict(
+    return dict(
         tokens_per_expert=load_e,
-        kept_per_expert=load_e,             # synonymous here; explicit name for clarity
         util_frac=util_frac,
         load_cv=load_cv,
         entropy_mean=ent_t.mean(),
@@ -60,28 +70,18 @@ def _hop_stats(*, kept_et: jnp.ndarray, probs_tr: jnp.ndarray, mask_tr: jnp.ndar
         capacity_drop_frac=cap_drop_frac,
         selected_edges=jnp.asarray(selected_edges, jnp.int32),
         kept_edges=jnp.asarray(kept_edges, jnp.int32),
-        logits_mean=jnp.mean(logits_full),
+        logits_mean=jnp.mean(logits_te),
     )
-
-    if id_col is not None:
-        id_rate = jnp.where(token_mask_t.any(), logits_full.shape[0] > 0, False)
-        # Actual identity selection rate (using the hard mask from the caller)
-        # The caller passes mask_full to compute this quickly.
-        # We store a placeholder here; it will be overwritten by the caller for accuracy.
-        stats["identity_selected_rate"] = jnp.array(0.0)
-
-    return stats
 
 
 # ---- model -----------------------------------------------------------------
-
 class Model(eqx.Module):
-    """Distributed model composed of:
-      • Token embedding + dropout
-      • Optional dense backbone stack
-      • A `ModuleGroup` executor (experts collection + capacity)
-      • A stack of Routers (n_hops)
-      • Output RMSNorm + tied unembedding
+    """Distributed model:
+      • Embedding + dropout
+      • Optional backbone
+      • ModuleGroup (experts+capacity)
+      • Stack of Routers (n_hops)
+      • RMSNorm + tied output projection
     """
 
     embed: Embedding
@@ -90,7 +90,7 @@ class Model(eqx.Module):
 
     group: ModuleGroup
     routers: Tuple[TopKRouter, ...]
-    backbone: Tuple[eqx.Module, ...]  # optional dense stack
+    backbone: Tuple[eqx.Module, ...]  # optional
 
     n_heads: int = eqx.field(static=True)
     rope_base: float = eqx.field(static=True)
@@ -111,7 +111,7 @@ class Model(eqx.Module):
         self.n_heads = int(n_heads)
         self.rope_base = float(rope_base)
 
-        k_embed, k_drop = jax.random.split(key, 2)
+        k_embed, _ = jax.random.split(key, 2)
         self.embed = Embedding(vocab, d_model, key=k_embed)
         self.dropout = Dropout(dropout_p)
         self.ln_out = RMSNorm(d_model)
@@ -120,11 +120,11 @@ class Model(eqx.Module):
         self.routers = tuple(routers)
         self.backbone = tuple(backbone) if backbone is not None else tuple()
 
-    # -- one hop: modules + residual (router already executed outside) -------
+    # -- one hop: router already executed outside ----------------------------
     def _apply_hop(
         self,
         h_td: jnp.ndarray,                 # (T, d)
-        r_out: RouterOutput,               # routing result over ALL experts
+        r_out: RouterOutput,               # mask/weights/logits over ALL experts
         cos_tdh: jnp.ndarray,              # (T, d_head)
         sin_tdh: jnp.ndarray,              # (T, d_head)
         token_mask_t: jnp.ndarray,         # (T,) bool
@@ -132,55 +132,41 @@ class Model(eqx.Module):
         key,
         inference: bool,
     ) -> Tuple[jnp.ndarray, Dict[str, Any]]:
-        # Split identity (last column) from non‑identity experts
-        mask_full_te = r_out.mask
-        probs_full_te = r_out.weight
-        logits_full_te = r_out.logits
+        # Use ALL experts exactly as routed — identity can be just another module.
+        mask_te = jnp.where(token_mask_t[:, None], r_out.mask, False)   # (T, E)
+        probs_te = jnp.where(token_mask_t[:, None], r_out.weight, 0.0)  # (T, E)
 
-        E_total = probs_full_te.shape[-1]
-        assert E_total >= 1, "Expect at least one expert; conventionally last is identity"
-        id_col = E_total - 1
-
-        mask_tr = jnp.where(token_mask_t[:, None], mask_full_te[:, :id_col], False)  # (T, E_nonid)
-        probs_tr = jnp.where(token_mask_t[:, None], probs_full_te[:, :id_col], 0.0)  # (T, E_nonid)
-        id_selected_t = jnp.where(token_mask_t, mask_full_te[:, id_col], False)      # (T,)
-
-        # Execute non‑identity experts via ModuleGroup
+        # Execute experts via ModuleGroup
         combined_td, aux = self.group(
             h_td,
             cos=cos_tdh,
             sin=sin_tdh,
             attention_mask=token_mask_t,
-            route_mask=mask_tr,
-            route_weight=probs_tr,
+            route_mask=mask_te,
+            route_weight=probs_te,
             key=key,
             inference=inference,
         )
-        kept_et = aux["kept"]                                # (E_nonid, T)
+        kept_et = aux["kept"]                                # (E, T)
 
-        # Residual update: h <- h + combined − rho*h, where rho is *kept* weight mass
-        kept_tE = kept_et.T                                   # (T, E_nonid)
-        kept_weight_tE = jnp.where(kept_tE, probs_tr, 0.0)    # (T, E_nonid)
+        # Residual: subtract only the kept mass
+        kept_tE = kept_et.T                                   # (T, E)
+        kept_weight_tE = jnp.where(kept_tE, probs_te, 0.0)    # (T, E)
         rho_t1 = kept_weight_tE.sum(axis=1, keepdims=True)    # (T, 1)
+
         h_next = h_td + combined_td - rho_t1 * h_td           # (T, d)
         h_next = jnp.where(token_mask_t[:, None], h_next, h_td)
 
-        # Stats (minimal, informative)
+        # Stats
         stats = _hop_stats(
             kept_et=kept_et,
-            probs_tr=probs_tr,
-            mask_tr=mask_tr,
+            probs_te=probs_te,
+            mask_te=mask_te,
             rho_t1=rho_t1,
-            logits_full=logits_full_te,
+            logits_te=r_out.logits,
             token_mask_t=token_mask_t,
-            id_col=id_col,
             k_routes=self.routers[0].k if len(self.routers) else 0,
         )
-        # Fill identity selection rate using the real mask
-        valid_T = token_mask_t.sum().astype(jnp.int32)
-        id_topk_count = jnp.sum(jnp.where(token_mask_t, id_selected_t, False)).astype(jnp.int32)
-        id_rate = jnp.where(valid_T > 0, id_topk_count / valid_T, 0.0)
-        stats["identity_selected_rate"] = id_rate
         return h_next, stats
 
     # -- forward --------------------------------------------------------------
@@ -192,7 +178,7 @@ class Model(eqx.Module):
         key,
         inference: bool,
         attention_mask_t: Optional[jnp.ndarray] = None,  # (T,) bool
-        biases: Optional[jnp.ndarray] = None,             # None | (n_hops, E_total)
+        biases: Optional[jnp.ndarray] = None,             # None | (n_hops, E)
     ) -> Tuple[jnp.ndarray, Tuple[Dict[str, Any], ...]]:
         # Token mask
         T = ids_t.shape[0]
@@ -219,11 +205,11 @@ class Model(eqx.Module):
         for hop_idx, router in enumerate(self.routers):
             key, rkey, mkey = jax.random.split(key, 3)
 
-            # Optional per-hop expert bias [E_total]
+            # Optional per-hop expert bias [E]
             bias_row = None
             if biases is not None:
                 assert biases.ndim == 2 and biases.shape[0] == len(self.routers), \
-                    "biases must be (n_hops, E_total)"
+                    "biases must be (n_hops, E)"
                 bias_row = biases[hop_idx]
 
             r_out = router(h_td, key=rkey, inference=inference, bias_e=bias_row)
@@ -237,7 +223,6 @@ class Model(eqx.Module):
 
 
 # ---- convenience builder ---------------------------------------------------
-
 def build_default_model(
     *,
     vocab: int,
@@ -253,7 +238,9 @@ def build_default_model(
     num_backbone: int,
     key,
 ) -> Model:
-    """Factory: alternating Attention/FFN experts with a matching router stack."""
+    """Factory: alternating Attention/FFN experts with a matching router stack.
+    If you want an identity pathway, just include an Identity module in `experts`.
+    """
     k_mods, k_routers, k_backbone, k_model = jax.random.split(key, 4)
 
     # Build expert set (alternating Attention / FeedForward)
@@ -265,9 +252,8 @@ def build_default_model(
     )
     group = ModuleGroup(experts, capacity=capacity)
 
-    # Routers (non‑identity experts + one identity at the end)
-    total_exp = n_experts + 1
-    routers = tuple(TopKRouter(d_model, total_exp, topk, key=k) for k in jax.random.split(k_routers, n_hops))
+    # Routers produce scores over exactly the experts provided
+    routers = tuple(TopKRouter(d_model, n_experts, topk, key=k) for k in jax.random.split(k_routers, n_hops))
 
     # Optional backbone
     if num_backbone > 0:

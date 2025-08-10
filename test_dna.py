@@ -1,16 +1,36 @@
 #!/usr/bin/env python3
+# -----------------------------------------------------------------------------
+# tests_model_split.py
+# -----------------------------------------------------------------------------
+# Tests for the split implementation:
+#   - Forward pass shapes + hop stats invariants
+#   - JIT parity
+#   - Gradients are finite and non-zero
+#   - Greedy generation matches next-token argmax from forward pass
+#
+# Requires:
+#   dna/
+#     modules.py
+#     router.py
+#     model.py (exports build_default_model, Model)
+#   dna/__init__.py exporting `generate` (same as your previous helper)
+# -----------------------------------------------------------------------------
+
 import math
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 
-from dna.dna import DNA
+# Import from the new split
+from dna.model import build_default_model, Model
 from dna import generate
 
 
-def build_toy_model(key):
-    return DNA(
+# ---------- tiny factory mirroring your previous toy config ----------
+
+def build_toy_model(key) -> Model:
+    return build_default_model(
         vocab=257,
         d_model=64,
         n_heads=8,
@@ -26,6 +46,8 @@ def build_toy_model(key):
     )
 
 
+# ---------- tests ----------
+
 def test_forward_shapes_and_invariants():
     key = jax.random.PRNGKey(0)
     k_model, k_ids = jax.random.split(key)
@@ -38,19 +60,22 @@ def test_forward_shapes_and_invariants():
         [jnp.ones((12,), dtype=jnp.int32), jnp.zeros((4,), dtype=jnp.int32)]
     )
 
-    logits, stats = model(ids, key=k_model, inference=False, attention_mask=amask)
+    # Eager
+    logits, stats = model(ids, key=k_model, inference=False, attention_mask_t=amask)
     assert logits.shape == (T, V)
     assert isinstance(stats, tuple) and len(stats) == 3
 
+    # JIT parity
     fwd = eqx.filter_jit(
-        lambda m, x, k, msk: m(x, key=k, inference=False, attention_mask=msk)
+        lambda m, x, k, msk: m(x, key=k, inference=False, attention_mask_t=msk)
     )
     logits_jit, stats_jit = fwd(model, ids, k_model, amask)
     assert jnp.allclose(logits, logits_jit, atol=1e-5, rtol=1e-5)
 
+    # Hop stats sanity
     for hop in stats_jit:
-        load = hop["load"]
-        importance = hop["importance"]
+        load = hop["load"]                 # (E,)
+        importance = hop["importance"]     # (E,)
         cap = 4
         E = load.shape[0]
 
@@ -94,8 +119,9 @@ def test_grads_flow_and_are_finite():
         [jnp.ones((10,), dtype=jnp.int32), jnp.zeros((2,), dtype=jnp.int32)]
     )
 
-    def loss_fn(m: DNA, x, k, msk):
-        logits, _ = m(x, key=k, inference=False, attention_mask=msk)
+    def loss_fn(m: Model, x, k, msk):
+        # Note: new Model uses attention_mask_t kwarg name.
+        logits, _ = m(x, key=k, inference=False, attention_mask_t=msk)
         labels = jnp.roll(x, shift=-1)
         logits = logits[:-1]
         labels = labels[1:]
@@ -163,7 +189,8 @@ def test_generate_shapes_prefix_and_greedy_equivalence():
     assert jnp.all(toks[:prompt_len] == prompt_ids)
 
     attn_mask = jnp.ones((prompt_len,), dtype=jnp.int32)
-    logits, _ = model(prompt_ids, key=k_model, inference=True, attention_mask=attn_mask)
+    # Note: new Model uses attention_mask_t kwarg name.
+    logits, _ = model(prompt_ids, key=k_model, inference=True, attention_mask_t=attn_mask)
     expected_next = jnp.argmax(logits[-1]).astype(jnp.int32)
     assert int(toks[prompt_len]) == int(expected_next)
 

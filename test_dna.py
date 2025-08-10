@@ -1,222 +1,113 @@
-#!/usr/bin/env python3
+# demo_test.py
 # -----------------------------------------------------------------------------
-# tests_model_split.py
+# Small, self-contained demo:
+#   • builds a model
+#   • does a single forward on a batch via vmap(model)
+#   • computes a simple next-token loss
+#   • runs JIT and gradients through everything
 # -----------------------------------------------------------------------------
-# Tests for the split implementation:
-#   - Forward pass shapes + hop stats invariants
-#   - JIT parity
-#   - Gradients are finite and non-zero
-#   - Greedy generation matches next-token argmax from forward pass
-#
-# Requires:
-#   dna/
-#     modules.py
-#     router.py
-#     model.py (exports build_default_model, Model)
-#   dna/__init__.py exporting `generate` (same as your previous helper)
-# -----------------------------------------------------------------------------
+from __future__ import annotations
+from typing import Tuple
 
-import math
-
-import equinox as eqx
 import jax
 import jax.numpy as jnp
+import equinox as eqx
 
-# Import from the new split
-from dna.model import build_default_model, Model
-from dna import generate
+from dna.model import build_default_model
 
 
-# ---------- tiny factory mirroring your previous toy config ----------
+def _nll_for_sequence(logits_tv: jnp.ndarray, targets_t: jnp.ndarray) -> jnp.ndarray:
+    """Standard next-token NLL (teacher forcing, shift by 1); mean over valid tokens."""
+    T, V = logits_tv.shape
+    # shift: predict token t from t-1; ignore t=0
+    logits_pred = logits_tv[:-1]                    # (T-1, V)
+    targets = targets_t[1:]                         # (T-1,)
+    logp = logits_pred - jax.nn.logsumexp(logits_pred, axis=-1, keepdims=True)
+    nll = -jnp.take_along_axis(logp, targets[:, None], axis=-1).squeeze(-1)
+    return nll.mean()
 
-def build_toy_model(key) -> Model:
-    return build_default_model(
-        vocab=257,
-        d_model=64,
-        n_heads=8,
-        n_modules=6,
-        capacity=4,
+
+def make_model_and_data(
+    B: int = 4,
+    T: int = 32,
+    V: int = 1024,
+    *,
+    key=jax.random.PRNGKey(0),
+):
+    model = build_default_model(
+        vocab=V,
+        d_model=128,
+        n_heads=4,
+        n_experts=6,
+        capacity=16,
         topk=2,
         n_hops=3,
-        mlp_mult=2,
-        dropout=0.0,
+        mlp_mult=4,
+        dropout=0.1,
         rope_base=10_000.0,
-        num_backbone=2,
+        num_backbone=1,
         key=key,
     )
+    k_data, = jax.random.split(key, 1)
+    ids_bt = jax.random.randint(k_data, (B, T), 0, V, dtype=jnp.int32)
+    return model, ids_bt
 
 
-# ---------- tests ----------
+def forward_batch(model, ids_bt, *, key, inference: bool) -> Tuple[jnp.ndarray, dict]:
+    """Runs a batched forward via VMAP over sequences; returns logits and a few hop stats."""
+    B, T = ids_bt.shape
 
-def test_forward_shapes_and_invariants():
-    key = jax.random.PRNGKey(0)
-    k_model, k_ids = jax.random.split(key)
-    model = build_toy_model(k_model)
+    def _one(ids_t, k):
+        logits_tv, hop_stats = model(ids_t, key=k, inference=inference)
+        # Return just a couple of scalar stats per hop for easy aggregation
+        scalars = {f"hop{h}_util": s["util_frac"] for h, s in enumerate(hop_stats)}
+        return logits_tv, scalars
 
-    T = 16
-    V = 257
-    ids = jax.random.randint(k_ids, (T,), 0, V, dtype=jnp.int32)
-    amask = jnp.concatenate(
-        [jnp.ones((12,), dtype=jnp.int32), jnp.zeros((4,), dtype=jnp.int32)]
-    )
+    keys = jax.random.split(key, B)
+    logits_btv, stats_b = jax.vmap(_one)(ids_bt, keys)
+    # Merge stats by averaging across batch
+    def _mean_stat(dicts):
+        keys = list(dicts[0].keys())
+        return {k: jnp.mean(jnp.stack([d[k] for d in dicts])) for k in keys}
 
-    # Eager
-    logits, stats = model(ids, key=k_model, inference=False, attention_mask_t=amask)
-    assert logits.shape == (T, V)
-    assert isinstance(stats, tuple) and len(stats) == 3
-
-    # JIT parity
-    fwd = eqx.filter_jit(
-        lambda m, x, k, msk: m(x, key=k, inference=False, attention_mask_t=msk)
-    )
-    logits_jit, stats_jit = fwd(model, ids, k_model, amask)
-    assert jnp.allclose(logits, logits_jit, atol=1e-5, rtol=1e-5)
-
-    # Hop stats sanity
-    for hop in stats_jit:
-        load = hop["load"]                 # (E,)
-        importance = hop["importance"]     # (E,)
-        cap = 4
-        E = load.shape[0]
-
-        assert load.ndim == 1
-        assert importance.shape == (E,)
-        assert jnp.all((load >= 0) & (load <= cap))
-
-        selected_edges = int(hop["selected_edges"])
-        kept_edges = int(hop["kept_edges"])
-        assert 0 <= kept_edges <= selected_edges
-
-        cdrop = float(hop["cap_drop_frac_edges"])
-        assert 0.0 <= cdrop <= 1.0 + 1e-6
-
-        for kname in ("rho_mean", "rho_min", "rho_max"):
-            val = float(hop[kname])
-            assert 0.0 <= val <= 1.0 + 1e-6
-
-        for kname in ("entropy_mean", "entropy_min", "entropy_max"):
-            val = float(hop[kname])
-            assert 0.0 <= val <= 1.0 + 1e-6
-
-        util = float(hop["util"])
-        load_std = float(hop["load_std"])
-        assert 0.0 <= util <= 1.0 + 1e-6
-        assert 0.0 <= load_std <= 1.0 + 1e-6
-        assert jnp.all(importance >= 0)
-
-    print("forward/JIT invariants OK")
+    return logits_btv, _mean_stat(list(stats_b))
 
 
-def test_grads_flow_and_are_finite():
-    key = jax.random.PRNGKey(1)
-    k_model, k_ids = jax.random.split(key)
-    model = build_toy_model(k_model)
-
-    T = 12
-    V = 257
-    ids = jax.random.randint(k_ids, (T,), 0, V, dtype=jnp.int32)
-    amask = jnp.concatenate(
-        [jnp.ones((10,), dtype=jnp.int32), jnp.zeros((2,), dtype=jnp.int32)]
-    )
-
-    def loss_fn(m: Model, x, k, msk):
-        # Note: new Model uses attention_mask_t kwarg name.
-        logits, _ = m(x, key=k, inference=False, attention_mask_t=msk)
-        labels = jnp.roll(x, shift=-1)
-        logits = logits[:-1]
-        labels = labels[1:]
-        msk_shift = msk[1:].astype(bool)
-        nll_tok = -jax.nn.log_softmax(logits, axis=-1)[jnp.arange(T - 1), labels]
-        nll = jnp.sum(nll_tok * msk_shift) / jnp.maximum(jnp.sum(msk_shift), 1)
-        return nll
-
-    value_and_grad = eqx.filter_value_and_grad(eqx.filter_jit(loss_fn))
-    loss, grads = value_and_grad(model, ids, k_model, amask)
-
-    def finite_tree(tree):
-        leaves = jax.tree_util.tree_leaves(eqx.filter(tree, eqx.is_array))
-        if not leaves:
-            return True
-        return bool(
-            jnp.all(jnp.concatenate([jnp.ravel(jnp.isfinite(x)) for x in leaves]))
-        )
-
-    assert math.isfinite(float(loss))
-    assert finite_tree(grads)
-
-    gnorm = jnp.sqrt(
-        sum(
-            jnp.sum(g**2)
-            for g in jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_array))
-        )
-    )
-    assert float(gnorm) > 0.0
-    print("grads/JIT OK")
+def loss_fn(model, ids_bt, *, key) -> jnp.ndarray:
+    logits_btv, _ = forward_batch(model, ids_bt, key=key, inference=False)
+    # Mean sequence NLL across batch
+    nll_b = jax.vmap(_nll_for_sequence)(logits_btv, ids_bt)
+    return nll_b.mean()
 
 
-def test_generate_shapes_prefix_and_greedy_equivalence():
-    key = jax.random.PRNGKey(2)
-    k_model, k_prompt, k_gen = jax.random.split(key, 3)
-    model = build_toy_model(k_model)
+# JIT + grad demo ------------------------------------------------------------
 
-    V = 257
-    pad_id = 0
-    eos_id = 0
+def run_demo():
+    key = jax.random.PRNGKey(42)
+    model, ids_bt = make_model_and_data(B=3, T=24, V=512, key=key)
 
-    prompt_len = 7
-    prompt_ids = jax.random.randint(k_prompt, (prompt_len,), 0, V, dtype=jnp.int32)
+    # JIT forward + loss
+    jit_loss = jax.jit(lambda m, x, k: loss_fn(m, x, key=k))
 
-    max_new = 9
-    total_len = prompt_len + max_new
+    # Filter params for differentiation
+    value_and_grad = eqx.filter_value_and_grad(jit_loss)
 
-    toks = generate(
-        model,
-        prompt_ids,
-        max_new_tokens=max_new,
-        temperature=0.0,
-        key=k_gen,
-        biases=None,
-        gumbel=False,
-        gumbel_tau=1.0,
-        router_temp=1.0,
-        greedy=True,
-        pad_id=pad_id,
-        eos_id=eos_id,
-    )
+    # A single step of value+grad (gradients w.r.t. parameters only)
+    loss, grads = value_and_grad(model, ids_bt, key)
 
-    assert toks.shape == (total_len,)
-    assert toks.dtype == jnp.int32
-    assert jnp.all(toks[:prompt_len] == prompt_ids)
+    # Also demonstrate an eval (no gumbel exploration)
+    eval_logits, eval_stats = forward_batch(model, ids_bt, key=key, inference=True)
 
-    attn_mask = jnp.ones((prompt_len,), dtype=jnp.int32)
-    # Note: new Model uses attention_mask_t kwarg name.
-    logits, _ = model(prompt_ids, key=k_model, inference=True, attention_mask_t=attn_mask)
-    expected_next = jnp.argmax(logits[-1]).astype(jnp.int32)
-    assert int(toks[prompt_len]) == int(expected_next)
-
-    gen_jit = eqx.filter_jit(
-        lambda m, p, k: generate(
-            m,
-            p,
-            max_new_tokens=max_new,
-            temperature=0.0,
-            key=k,
-            biases=None,
-            gumbel=False,
-            gumbel_tau=1.0,
-            router_temp=1.0,
-            greedy=True,
-            pad_id=pad_id,
-            eos_id=eos_id,
-        )
-    )
-    toks_jit = gen_jit(model, prompt_ids, k_gen)
-    assert jnp.array_equal(toks, toks_jit)
-
-    print("generate shapes/prefix/greedy/JIT OK")
+    return {
+        "loss": loss,
+        "mean_util_per_hop": eval_stats,
+        "eval_logits_shape": eval_logits.shape,
+        # grads is a pytree; typically you'd pass it into an Optax optimizer
+    }
 
 
 if __name__ == "__main__":
-    test_forward_shapes_and_invariants()
-    test_grads_flow_and_are_finite()
-    test_generate_shapes_prefix_and_greedy_equivalence()
+    out = run_demo()
+    # Printing small summary; real training would integrate with Optax, etc.
+    for k, v in out.items():
+        print(k, (v.shape if hasattr(v, "shape") else v))

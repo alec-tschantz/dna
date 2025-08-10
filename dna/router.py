@@ -1,127 +1,105 @@
-# -----------------------------------------------------------------------------
 # router.py
 # -----------------------------------------------------------------------------
-# Abstract router API + a concrete TopKRouter:
-# - Produces *only* routing decisions: (T,E) hard mask and (T,E) soft weights.
-# - No capacity logic here — that is handled by Modules.
-# - Supports temperature and optional Gumbel exploration for training.
-# - Optional "identity bias" convention: last column is identity expert.
+# Minimal, practical router for distributed neural architectures.
+#
+# Responsibilities:
+#   • Project hidden states → expert logits
+#   • Add optional per-hop bias (shape [E])
+#   • Produce a HARD top‑k mask for selection + SOFT weights for combination
+#   • If inference=False  → add Gumbel(0,1) to selection path (exploration)
+#
 # -----------------------------------------------------------------------------
-
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional, Protocol, Tuple
+from typing import Optional
 
-import abc
 import jax
-import jax.numpy as jnp
 import jax.nn as jnn
+import jax.numpy as jnp
 import equinox as eqx
 
 
-# ---------- utilities ----------
+# ---- utility ---------------------------------------------------------------
 
 
-def _topk_mask(logits: jnp.ndarray, k: int) -> jnp.ndarray:
-    """Row-wise hard top-k along last dim."""
-    _, idx = jax.lax.top_k(logits, k)
-    hard = jnn.one_hot(idx, logits.shape[-1]).sum(axis=-2)
+def _topk_mask(row_logits: jnp.ndarray, k: int) -> jnp.ndarray:
+    """Row-wise hard top‑k along last dim.
+    Args:
+        row_logits: (..., E) scores
+        k:          number of experts to select
+    Returns:
+        bool mask with the same trailing shape (..., E)
+    """
+    _, idx = jax.lax.top_k(row_logits, k)
+    hard = jnn.one_hot(idx, row_logits.shape[-1]).sum(axis=-2)
     return hard.astype(bool)
 
 
-# ---------- public output container ----------
+# ---- public output ---------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class RouterOutput:
-    """Routing decisions for a single sequence (token-major)."""
+    """Routing decisions for a single sequence (token-major).
 
-    mask: (
-        jnp.ndarray
-    )  # (T, E) bool   — hard top-k mask over *all* experts (incl. identity if present)
-    weight: (
-        jnp.ndarray
-    )  # (T, E) float  — soft weights (e.g., softmax probs) for combination
-    probs: jnp.ndarray  # (T, E) float  — same as weight (can differ for other routers)
-    logits: (
-        jnp.ndarray
-    )  # (T, E) float  — raw router logits (pre temp/bias/gumbel for analysis)
+    mask:   (T, E) bool   HARD top‑k selection mask
+    weight: (T, E) float  SOFT weights used to combine expert outputs (softmax)
+    logits: (T, E) float  Clean logits (pre‑Gumbel), useful for stats/analysis
+    """
+
+    mask: jnp.ndarray
+    weight: jnp.ndarray
+    logits: jnp.ndarray
 
 
-# ---------- abstract base ----------
+# ---- concrete router -------------------------------------------------------
 
 
-# ---------- base (NOT abstract on __call__) ----------
-class RouterBase(eqx.Module):
-    """Base router interface. Override __call__ in subclasses."""
+class TopKRouter(eqx.Module):
+    """Linear(d_model → E) → [bias] → {softmax, top‑k}.
 
-    def __call__(
-        self,
-        h: jnp.ndarray,  # (T, d)
-        *,
-        key: Optional[jax.Array],
-        temp: float = 1.0,
-        sample_gumbel: bool = False,
-        gumbel_tau: float = 1.0,
-        bias_row: Optional[jnp.ndarray] = None,  # (E,) or (T,E)
-    ) -> RouterOutput:
-        raise NotImplementedError("__call__ must be implemented by Router subclasses")
-
-
-# ---------- concrete: Top-k router with linear projection ----------
-
-
-class TopKRouter(RouterBase):
-    """Linear(d_model→E) → (optional bias/Gumbel) → top-k (hard) + softmax (soft)."""
+    If `inference` is False, we add Gumbel noise *only* to the selection path.
+    The soft weights are always computed from the clean logits.
+    """
 
     proj: eqx.nn.Linear
     k: int = eqx.field(static=True)
 
-    def __init__(self, d_model: int, n_exp: int, k: int, *, key):
-        self.k = k
-        self.proj = eqx.nn.Linear(d_model, n_exp, use_bias=False, key=key)
-
+    def __init__(self, d_model: int, n_experts: int, k: int, *, key):
+        self.k = int(k)
+        self.proj = eqx.nn.Linear(d_model, n_experts, use_bias=False, key=key)
 
     def __call__(
         self,
-        h: jnp.ndarray,
+        h_td: jnp.ndarray,  # (T, d)
         *,
         key: Optional[jax.Array],
-        temp: float = 1.0,
-        sample_gumbel: bool = False,
-        gumbel_tau: float = 1.0,
-        bias_row: Optional[jnp.ndarray] = None,
+        inference: bool,
+        bias_e: Optional[jnp.ndarray] = None,  # (E,)
     ) -> RouterOutput:
-        # --------- raw logits ---------
-        logits_clean = jax.vmap(self.proj)(h)  # (T, E)
-        E = logits_clean.shape[-1]
+        # Project tokens → expert logits (token-major)
+        logits_te = jax.vmap(self.proj)(h_td)  # (T, E)
 
-        # --------- optional identity bias (applies to selection path only) ---------
-        if bias_row is not None:
-            b_last = bias_row[-1] if bias_row.ndim == 2 else bias_row
-            id_mask = (jnp.arange(E) == (E - 1))[None, :]  # (1, E)
-            logits_sel = logits_clean + b_last * id_mask
+        # Optional per-hop expert bias (shape [E])
+        if bias_e is not None:
+            assert (
+                bias_e.ndim == 1 and bias_e.shape[0] == logits_te.shape[-1]
+            ), "bias_e must be shape (E,) and match router output size"
+            logits_te = logits_te + bias_e[None, :]
+
+        # Soft combination weights from clean logits
+        weight_te = jnn.softmax(logits_te, axis=-1)  # (T, E)
+
+        # Hard selection mask: add Gumbel noise only when training
+        if inference:
+            sel_scores = logits_te
         else:
-            logits_sel = logits_clean
+            assert (
+                key is not None
+            ), "Training path requires a PRNG key for Gumbel noise."
+            u = jax.random.uniform(key, logits_te.shape, minval=1e-6, maxval=1.0 - 1e-6)
+            g = -jnp.log(-jnp.log(u))
+            sel_scores = logits_te + g
 
-        # --------- temperatures ---------
-        tau_soft = jnp.clip(temp, 1e-6, None)
-        tau_sel = jnp.clip(gumbel_tau, 1e-6, None)
-
-        # --------- soft weights from *clean* logits (for gradients/combination) ---------
-        probs = jnn.softmax(logits_clean / tau_soft, axis=-1)  # (T, E)
-
-        # --------- selection scores: (logits + gumbel) / tau_sel ---------
-        if sample_gumbel:
-            assert key is not None, "Gumbel sampling requires a PRNG key."
-            u = jax.random.uniform(key, logits_sel.shape, minval=1e-6, maxval=1.0 - 1e-6)
-            g = -jnp.log(-jnp.log(u))  # Gumbel(0,1)
-            logits_for_topk = (logits_sel + g) / tau_sel
-        else:
-            logits_for_topk = logits_sel / tau_sel
-
-        # --------- hard mask ---------
-        mask = _topk_mask(logits_for_topk, self.k)  # (T, E) bool
-
-        # For this router, `weight` equals `probs`; other routers could differ.
-        return RouterOutput(mask=mask, weight=probs, probs=probs, logits=logits_clean)
+        mask_te = _topk_mask(sel_scores, self.k)  # (T, E) bool
+        return RouterOutput(mask=mask_te, weight=weight_te, logits=logits_te)

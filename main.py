@@ -1,4 +1,3 @@
-# main.py
 """Main training script for DNA model."""
 
 from __future__ import annotations
@@ -20,11 +19,10 @@ from transformers import AutoTokenizer
 from dna import Model, Attention, FeedForward, Identity
 from dna.eval import (
     eval_step,
-    evaluate_heatmap,
-    plot_routing_heatmap,
-    print_example_routing,
     generate_examples,
     routing_metrics_from_stats,
+    # new consolidated visual logger
+    log_routing_visuals,
 )
 
 
@@ -36,7 +34,7 @@ class Config:
     vocab_size: int = 50_257
     d_model: int = 512
     n_heads: int = 16
-    n_hops: int = 6
+    n_hops: int = 8
     n_modules: int = 16
     topk: int = 2
     capacity: int = 64
@@ -49,8 +47,8 @@ class Config:
     batch_size: int = 64
     seq_len: int = 256
     steps: int = 20_000
-    warmup: int = 2_000
-    lr_peak: float = 2.5e-4
+    warmup: int = 3_000
+    lr_peak: float = 1e-4
     wd: float = 0.01
     clip: float = 1.0
     seed: int = 42
@@ -291,6 +289,7 @@ def compute_loss(
 
 
 @eqx.filter_jit
+
 def train_step(
     model: Model,
     opt: optax.GradientTransformation,
@@ -454,21 +453,24 @@ def main():
                 n_examples=cfg.n_examples,
             )
 
+        # Routing heatmaps & multi-sample comparisons
         if step % cfg.heatmap_every == 0 and step > 0:
             key, hk = jax.random.split(key)
             heatmap_batch = sample_batch(train_it, min(32, cfg.batch_size))
-            batch_stats, example_stats = evaluate_heatmap(
+            # Consolidated helper logs the figures to W&B and returns stats
+            batch_stats, example_stats = log_routing_visuals(
                 model,
                 heatmap_batch,
                 key=hk,
                 gumbel_tau=cfg.gumbel_tau,
                 router_temp=cfg.router_temp,
                 select_temp=cfg.select_temp,
+                tok=tok,
+                step=step,
+                num_examples=4,
+                max_tokens_grid=128,
             )
 
-            plot_routing_heatmap(batch_stats, step)
-            print_example_routing(example_stats, tok)
-
-
+    
 if __name__ == "__main__":
     main()

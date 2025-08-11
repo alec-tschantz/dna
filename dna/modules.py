@@ -13,7 +13,10 @@ import equinox as eqx
 # RoPE utilities
 # -----------------------------------------------------------------------------
 
-def rope_cos_sin(T: int, dim: int, base: float = 10_000.0) -> Tuple[jnp.ndarray, jnp.ndarray]:
+
+def rope_cos_sin(
+    T: int, dim: int, base: float = 10_000.0
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Return (cos, sin) for Rotary Position Embedding with head-dim = `dim`.
 
     Assumes `dim` is even; caller should ensure this.
@@ -36,6 +39,7 @@ def rotate_half(x: jnp.ndarray) -> jnp.ndarray:
 # -----------------------------------------------------------------------------
 # Core layers
 # -----------------------------------------------------------------------------
+
 
 class Embedding(eqx.Module):
     weight: jnp.ndarray
@@ -78,14 +82,20 @@ class Dropout(eqx.Module):
         return jnp.where(mask, x / keep, 0.0)
 
 
+# -----------------------------------------------------------------------------
+# Modules
+# -----------------------------------------------------------------------------
+
+
 class Module(eqx.Module):
     """Base expert module signature."""
+
     def __call__(self, x: jnp.ndarray, *args, key, inference: bool) -> jnp.ndarray:
         raise NotImplementedError
 
 
 class Identity(Module):
-    """Useful 'expert' that does nothing but maintain the residual path."""
+
     def __call__(self, x: jnp.ndarray, *args, key, inference: bool) -> jnp.ndarray:
         return x
 
@@ -143,7 +153,7 @@ class Attention(Module):
     def __call__(
         self,
         x: jnp.ndarray,
-        cos_sin: Tuple[jnp.ndarray, jnp.ndarray],
+        cos_sin: Tuple[jnp.ndarray, jnp.ndarray], # (T,) bool-like or None
         attention_mask: Optional[jnp.ndarray] = None,  # (T,) bool-like or None
         *args,
         key,
@@ -168,11 +178,10 @@ class Attention(Module):
 
         if attention_mask is not None:
             am = attention_mask.astype(bool)
-            qmask = am[None, :, None]   # (1,T,1)
-            kmask = am[None, None, :]   # (1,1,T)
+            qmask = am[None, :, None]  # (1,T,1)
+            kmask = am[None, None, :]  # (1,1,T)
             allowed = causal & kmask
             scores = jnp.where(allowed, scores, neg)
-            # Also avoid computing softmax for invalid queries
             scores = jnp.where(qmask, scores, neg)
         else:
             scores = jnp.where(causal, scores, neg)

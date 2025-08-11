@@ -262,7 +262,6 @@ class Model(eqx.Module):
         slot = jnp.take_along_axis(slot, order[:, :, None], axis=1)  # (E, C, T)
 
         # ====== Execute experts in grouped batches ======
-        # We MUST scatter outputs back to the ORIGINAL expert index positions.
         E, C, d = xin.shape
         expert_out = jnp.zeros((E, C, d), dtype=xin.dtype)
 

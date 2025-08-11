@@ -45,7 +45,6 @@ class Embedding(eqx.Module):
     weight: jnp.ndarray
 
     def __init__(self, vocab: int, dim: int, *, key):
-        # Truncated normal init for stability; scaled small.
         self.weight = (
             jax.random.truncated_normal(key, lower=-2, upper=2, shape=(vocab, dim))
             * 0.02
@@ -153,8 +152,8 @@ class Attention(Module):
     def __call__(
         self,
         x: jnp.ndarray,
-        cos_sin: Tuple[jnp.ndarray, jnp.ndarray], # (T,) bool-like or None
-        attention_mask: Optional[jnp.ndarray] = None,  # (T,) bool-like or None
+        cos_sin: Tuple[jnp.ndarray, jnp.ndarray], 
+        attention_mask: Optional[jnp.ndarray] = None,  
         *args,
         key,
         inference: bool,

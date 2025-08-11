@@ -1,3 +1,6 @@
+# main.py
+"""Main training script for DNA model."""
+
 from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Tuple
@@ -14,7 +17,15 @@ import wandb
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-from dna import Model, Attention, FeedForward, Identity, sample
+from dna import Model, Attention, FeedForward, Identity
+from dna.eval import (
+    eval_step,
+    evaluate_heatmap,
+    plot_routing_heatmap,
+    print_example_routing,
+    generate_examples,
+    routing_metrics_from_stats,
+)
 
 
 # ============================== Config =================================== #
@@ -28,7 +39,7 @@ class Config:
     n_hops: int = 6
     n_modules: int = 16
     topk: int = 2
-    capacity: int = 128
+    capacity: int = 32
     mlp_mult: int = 4
     dropout: float = 0.1
     rope_base: float = 10_000.0
@@ -49,6 +60,7 @@ class Config:
     example_every: int = 250
     n_examples: int = 5
     gen_len: int = 100
+    heatmap_every: int = 100
 
 
 cfg: Config = tyro.cli(Config)
@@ -58,6 +70,7 @@ cfg: Config = tyro.cli(Config)
 
 
 def load_tinystories(tok, seq_len: int, split: str = "train"):
+    """Load TinyStories dataset."""
     ds = load_dataset("roneneldan/TinyStories", split=split, streaming=True)
 
     def _proc(batch):
@@ -86,6 +99,7 @@ def load_tinystories(tok, seq_len: int, split: str = "train"):
 
 
 def lr_schedule(step: jnp.ndarray) -> jnp.ndarray:
+    """Cosine learning rate schedule with warmup."""
     warm = jnp.minimum(step / cfg.warmup, 1.0)
     lr = cfg.lr_peak * warm
     decay_steps = jnp.maximum(cfg.steps - cfg.warmup, 1)
@@ -95,11 +109,13 @@ def lr_schedule(step: jnp.ndarray) -> jnp.ndarray:
 
 
 def count_params(tree) -> int:
+    """Count parameters in a pytree."""
     leaves = jax.tree_util.tree_leaves(eqx.filter(tree, eqx.is_array))
     return int(sum(x.size for x in leaves))
 
 
 def l2_tree_norm(tree) -> float:
+    """Compute L2 norm of all parameters."""
     leaves = jax.tree_util.tree_leaves(eqx.filter(tree, eqx.is_array))
     if not leaves:
         return 0.0
@@ -108,6 +124,7 @@ def l2_tree_norm(tree) -> float:
 
 
 def router_l2_norm(model: Model) -> float:
+    """Compute L2 norm of router parameters."""
     if hasattr(model, "routers"):
         leaves = jax.tree_util.tree_leaves(eqx.filter(model.routers, eqx.is_array))
         if not leaves:
@@ -129,6 +146,7 @@ def make_modules(
     dropout: float,
     key: jax.Array,
 ) -> Tuple[eqx.Module, ...]:
+    """Create a collection of expert modules."""
     ks = jax.random.split(key, n)
     mods: List[eqx.Module] = []
     for i in range(n):
@@ -150,6 +168,7 @@ def make_backbone(
     dropout: float,
     key: jax.Array,
 ) -> Tuple[eqx.Module, ...]:
+    """Create backbone modules (optional pre-routing layers)."""
     ks = jax.random.split(key, 2)
     attn = Attention(d_model, n_heads, dropout, key=ks[0])
     ff = FeedForward(d_model, mlp_mult, dropout, key=ks[1])
@@ -157,6 +176,7 @@ def make_backbone(
 
 
 def build_model(key: jax.Array) -> Model:
+    """Build the complete DNA model."""
     k_mods, k_bb, k_model = jax.random.split(key, 3)
     mods = make_modules(
         d_model=cfg.d_model,
@@ -192,6 +212,7 @@ def build_model(key: jax.Array) -> Model:
 
 
 def _normalize_to_2d(arr: np.ndarray) -> np.ndarray:
+    """Ensure array is 2D."""
     arr = np.asarray(arr)
     if arr.ndim == 1:
         return arr[None, :]
@@ -201,6 +222,7 @@ def _normalize_to_2d(arr: np.ndarray) -> np.ndarray:
 
 
 def sample_batch(stream_it, bsz: int) -> Dict[str, jnp.ndarray]:
+    """Sample a batch from the data stream."""
     ids_buf, mask_buf, total = [], [], 0
     while total < bsz:
         ex = next(stream_it)
@@ -215,6 +237,7 @@ def sample_batch(stream_it, bsz: int) -> Dict[str, jnp.ndarray]:
 
 
 def batch_seq_stats(mask: jnp.ndarray) -> Tuple[float, int, int, float]:
+    """Compute sequence length statistics for a batch."""
     m = mask[:, 1:]
     lens = jnp.sum(m, axis=1)  # (B,)
     return (
@@ -235,6 +258,7 @@ def compute_loss(
     *,
     inference: bool = False,
 ) -> Tuple[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, Any]]:
+    """Compute cross-entropy loss."""
     ids = batch["input_ids"]  # (B, T)
     mask = batch["attention_mask"]  # (B, T)
     B = ids.shape[0]
@@ -242,29 +266,27 @@ def compute_loss(
 
     def fwd(x, m, k):
         logits, stats = model(
-            x,  # (T,)
+            x,
             key=k,
             inference=inference,
-            attention_mask=m,  # (T,)
+            attention_mask=m,
             gumbel_tau=cfg.gumbel_tau,
             router_temperature=cfg.router_temp,
             select_temperature=cfg.select_temp,
         )
         return logits, stats
 
-    logits, stats = jax.vmap(fwd, in_axes=(0, 0, 0))(ids, mask, keys)  # (B,T,V)
-    logits_shift = logits[:, :-1]  # (B,T-1,V)
-    labels_shift = ids[:, 1:]  # (B,T-1)
-    mask_shift = mask[:, 1:]  # (B,T-1)
+    logits, stats = jax.vmap(fwd, in_axes=(0, 0, 0))(ids, mask, keys)
+    logits_shift = logits[:, :-1]
+    labels_shift = ids[:, 1:]
+    mask_shift = mask[:, 1:]
 
-    raw = optax.softmax_cross_entropy_with_integer_labels(
-        logits_shift, labels_shift
-    )  # (B, T-1)
+    raw = optax.softmax_cross_entropy_with_integer_labels(logits_shift, labels_shift)
     loss = (raw * mask_shift).sum() / jnp.maximum(mask_shift.sum(), 1)
     return loss, (logits_shift, labels_shift, mask_shift, stats)
 
 
-# ============================== Train / Eval steps ======================= #
+# ============================== Training step ============================ #
 
 
 @eqx.filter_jit
@@ -276,6 +298,7 @@ def train_step(
     *,
     key: jax.Array,
 ):
+    """Single training step."""
     (loss, (logits, labels, mask, stats)), grads = eqx.filter_value_and_grad(
         compute_loss, has_aux=True
     )(model, batch, key, inference=False)
@@ -283,154 +306,14 @@ def train_step(
     updates, opt_state = opt.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
 
-    preds = jnp.argmax(logits, axis=-1)  # (B, T-1)
+    preds = jnp.argmax(logits, axis=-1)
     valid = mask > 0
     acc = ((preds == labels) & valid).sum() / jnp.maximum(valid.sum(), 1)
     gnorm = optax.global_norm(grads)
     return model, opt_state, loss, acc, stats, gnorm
 
 
-@eqx.filter_jit
-def eval_step(model: Model, batch: Dict[str, Any], *, key: jax.Array):
-    loss, (logits, labels, mask, _stats) = compute_loss(
-        model, batch, key, inference=True
-    )
-    preds = jnp.argmax(logits, axis=-1)
-    valid = mask > 0
-    acc = ((preds == labels) & valid).sum() / jnp.maximum(valid.sum(), 1)
-    return loss, acc
-
-
-# ============================== Routing metrics ========================== #
-
-
-def _avg_over_batch(x) -> jnp.ndarray:
-    """Average first axis (batch) -> keep remaining dims."""
-    x = jnp.asarray(x)
-    return jnp.mean(x, axis=0)
-
-
-def routing_metrics_from_stats(
-    stats_tuple_batched: Tuple[Dict[str, Any], ...],
-    *,
-    prefix: str,
-) -> Dict[str, float]:
-    hop_logs = []
-
-    for hop in stats_tuple_batched:
-        # Shapes after vmap: load -> (B, E); scalars -> (B,)
-        load = jnp.asarray(hop["load"])  # (B, E)
-        rho_mean = jnp.asarray(hop["rho_mean"])  # (B,)
-        entropy_mean = jnp.asarray(hop["entropy_mean"])  # (B,)
-        cap_drop = jnp.asarray(hop["cap_drop_frac_edges"])  # (B,)
-        eff_topk_mean = jnp.asarray(hop["eff_topk_mean"])  # (B,)
-        eff_topk_min = jnp.asarray(hop["eff_topk_min"])  # (B,)
-        eff_topk_max = jnp.asarray(hop["eff_topk_max"])  # (B,)
-        cap_util_mean = jnp.asarray(hop["cap_util_mean"])  # (B,)
-        cap_util_min = jnp.asarray(hop["cap_util_min"])  # (B,)
-        cap_util_max = jnp.asarray(hop["cap_util_max"])  # (B,)
-
-        # Utilization per batch: fraction of experts with load>0
-        util_b = jnp.mean((load > 0).astype(jnp.float32), axis=1)  # (B,)
-
-        # Load dispersion per batch: std of normalized loads across experts
-        denom = jnp.sum(load, axis=1, keepdims=True) + 1e-9
-        load_norm = load / denom  # (B, E)
-        load_std_b = jnp.std(load_norm, axis=1)  # (B,)
-
-        # Reduce over batch
-        hop_log = dict(
-            rho_mean=float(jnp.mean(rho_mean)),
-            entropy_mean=float(jnp.mean(entropy_mean)),
-            util=float(jnp.mean(util_b)),
-            load_std=float(jnp.mean(load_std_b)),
-            cap_drop_frac=float(jnp.mean(cap_drop)),
-            eff_topk_mean=float(jnp.mean(eff_topk_mean)),
-            eff_topk_min=float(jnp.mean(eff_topk_min)),
-            eff_topk_max=float(jnp.mean(eff_topk_max)),
-            cap_util_mean=float(jnp.mean(cap_util_mean)),
-            cap_util_min=float(jnp.mean(cap_util_min)),
-            cap_util_max=float(jnp.mean(cap_util_max)),
-        )
-        hop_logs.append(hop_log)
-
-    # Average across hops
-    def _mean_key(k: str) -> float:
-        vals = [h[k] for h in hop_logs]
-        return float(sum(vals) / max(len(vals), 1))
-
-    return {
-        f"routing/{prefix}/rho_mean": _mean_key("rho_mean"),
-        f"routing/{prefix}/entropy_mean": _mean_key("entropy_mean"),
-        f"routing/{prefix}/util": _mean_key("util"),
-        f"routing/{prefix}/load_std": _mean_key("load_std"),
-        f"routing/{prefix}/cap_drop_frac": _mean_key("cap_drop_frac"),
-        f"routing/{prefix}/eff_topk_mean": _mean_key("eff_topk_mean"),
-        f"routing/{prefix}/eff_topk_min": _mean_key("eff_topk_min"),
-        f"routing/{prefix}/eff_topk_max": _mean_key("eff_topk_max"),
-        f"routing/{prefix}/cap_util_mean": _mean_key("cap_util_mean"),
-        f"routing/{prefix}/cap_util_min": _mean_key("cap_util_min"),
-        f"routing/{prefix}/cap_util_max": _mean_key("cap_util_max"),
-    }
-
-
-# ============================== Examples (prints) ======================== #
-
-
-def generate_examples(
-    model: Model,
-    tok,
-    *,
-    key: jax.Array,
-    gen_len: int = 100,
-    per_prompt: int = 1,
-    prompts: List[str] | None = None,
-) -> None:
-    if prompts is None:
-        prompts = [
-            "One day, ",
-            "Once upon a time, ",
-            "In a small town, ",
-            "Long ago, ",
-            "On a sunny morning, ",
-        ]
-
-    print("\n" + "=" * 40)
-    print("Generated Examples")
-    print("=" * 40)
-
-    for p in prompts[: cfg.n_examples]:
-        prompt_ids = jnp.array(tok.encode(p), dtype=jnp.int32)  # (T0,)
-        key, *subs = jax.random.split(key, per_prompt + 1)
-        subs = jnp.stack(subs)
-
-        @jax.vmap
-        def _sample(k):
-            return sample(
-                model=model,
-                prompt_ids=prompt_ids,
-                max_new_tokens=gen_len,
-                temperature=0.8,
-                key=k,
-                router_temperature=cfg.router_temp,
-                select_temperature=cfg.select_temp,
-                gumbel_tau=cfg.gumbel_tau,
-                greedy=False,
-                pad_id=tok.pad_token_id,
-                eos_id=tok.pad_token_id,
-            )
-
-        toks = _sample(subs)
-        for seq in jax.device_get(toks):
-            seq = list(seq)
-            if tok.eos_token_id in seq:
-                seq = seq[: seq.index(tok.eos_token_id) + 1]
-            text = tok.decode(seq, skip_special_tokens=True)
-            print(f"[{p}] {text}")
-            print("-" * 40)
-
-
-# ============================== Initial stats print ====================== #
+# ============================== Initial stats ============================ #
 
 
 def print_initial_stats(
@@ -439,6 +322,7 @@ def print_initial_stats(
     *,
     step0_log_to_wandb: bool = True,
 ) -> None:
+    """Print initial model and data statistics."""
     n_params = count_params(model)
     lmean, lmin, lmax, pmean = batch_seq_stats(first_batch["attention_mask"])
     print("\n" + "=" * 40)
@@ -464,25 +348,31 @@ def print_initial_stats(
         )
 
 
-# ============================== Main ==================================== #
+# ============================== Main training loop ======================= #
 
 
 def main():
+    """Main training loop."""
     wandb.init(project="dna", name="dna", config=asdict(cfg))
 
+    # Initialize tokenizer
     tok = AutoTokenizer.from_pretrained("gpt2")
     tok.pad_token = tok.eos_token
 
+    # Setup data iterators
     train_it = iter(load_tinystories(tok, cfg.seq_len, "train"))
     val_it = iter(load_tinystories(tok, cfg.seq_len, "validation"))
 
+    # Build model
     key = jax.random.PRNGKey(cfg.seed)
     key, mk = jax.random.split(key)
     model = build_model(mk)
 
+    # Print initial statistics
     first_batch = sample_batch(train_it, cfg.batch_size)
     print_initial_stats(model, first_batch)
 
+    # Setup optimizer
     opt = optax.chain(
         optax.clip_by_global_norm(cfg.clip),
         optax.adamw(
@@ -495,16 +385,19 @@ def main():
     )
     opt_state = opt.init(eqx.filter(model, eqx.is_array))
 
+    # Training loop
     for step in range(cfg.steps + 1):
         key, sk = jax.random.split(key)
         batch = sample_batch(train_it, cfg.batch_size)
 
+        # Training step
         t0 = time.perf_counter()
         model, opt_state, loss, acc, stats, gnorm = train_step(
             model, opt, opt_state, batch, key=sk
         )
         dt_ms = (time.perf_counter() - t0) * 1000.0
 
+        # Logging
         if step % cfg.log_every == 0:
             stats_host = jax.tree_util.tree_map(jax.device_get, stats)
 
@@ -521,15 +414,20 @@ def main():
             }
 
             route_log = routing_metrics_from_stats(stats_host, prefix="train")
-
             wandb.log({**train_metrics, **route_log})
 
+        # Evaluation
         if step % cfg.eval_every == 0 and step > 0:
             key, ek = jax.random.split(key)
             val_batch = sample_batch(val_it, cfg.eval_samples // cfg.seq_len)
-            val_loss, val_acc = eval_step(model, val_batch, key=ek)
-
-            lmean, lmin, lmax, pmean = batch_seq_stats(val_batch["attention_mask"])
+            val_loss, val_acc = eval_step(
+                model,
+                val_batch,
+                key=ek,
+                gumbel_tau=cfg.gumbel_tau,
+                router_temp=cfg.router_temp,
+                select_temp=cfg.select_temp,
+            )
 
             wandb.log(
                 {
@@ -539,6 +437,7 @@ def main():
                 }
             )
 
+        # Generate examples
         if step % cfg.example_every == 0 and step > 0:
             key, ek = jax.random.split(key)
             generate_examples(
@@ -547,7 +446,30 @@ def main():
                 key=ek,
                 gen_len=cfg.gen_len,
                 per_prompt=1,
+                router_temp=cfg.router_temp,
+                select_temp=cfg.select_temp,
+                gumbel_tau=cfg.gumbel_tau,
+                prompts=None,  # Will use default prompts
+                n_examples=cfg.n_examples,
             )
+
+        if step % cfg.heatmap_every == 0 and step > 0:
+            key, hk = jax.random.split(key)
+            heatmap_batch = sample_batch(train_it, min(32, cfg.batch_size))
+            batch_stats, example_stats = evaluate_heatmap(
+                model,
+                heatmap_batch,
+                key=hk,
+                gumbel_tau=cfg.gumbel_tau,
+                router_temp=cfg.router_temp,
+                select_temp=cfg.select_temp,
+            )
+
+            # Plot and log heatmap
+            plot_routing_heatmap(batch_stats, step)
+
+            # Print example routing
+            print_example_routing(example_stats, tok)
 
 
 if __name__ == "__main__":

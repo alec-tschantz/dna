@@ -206,7 +206,7 @@ class Model(eqx.Module):
         token_mask: Bool[Array, "T"],
         gumbel_tau: float,
         router_temperature: float,
-        select_temperature: Optional[float],
+        select_temperature: Optional[float]
     ) -> Tuple[Float[Array, "T d"], Dict[str, Any]]:
         r"""
         Implements the K-ribbon step with capacity. After routing and execution,
@@ -264,7 +264,7 @@ class Model(eqx.Module):
         active = slot.sum(-1) > 0  # (E, C) bool
 
         # -------- Per-expert causal ordering (sort by original token positions) -----
-        # We need the expert’s internal time axis to be chronological for causal ops.
+        # We need the expert's internal time axis to be chronological for causal ops.
         # pos_for_sort: (E, C) use token index for active rows; T+1 sentinel otherwise.
         # order: (E, C) permutation along C that sorts ascending by position.
         pos_for_sort = jnp.where(active, top_idx, h.shape[0] + 1)  # (E, C)
@@ -328,7 +328,7 @@ class Model(eqx.Module):
             probs=probs_full,
             mask=mask_full,
             rho=rho,
-            token_mask=token_mask,
+            token_mask=token_mask
         )
         return h_next, st
 
@@ -364,6 +364,7 @@ class Model(eqx.Module):
             Temperature for *mixing* probabilities.
         select_temperature : Optional[float], default=None
             Temperature for *selection* logits (top-k). If None, uses `router_temperature`.
+       
 
         Returns
         -------
@@ -409,7 +410,7 @@ class Model(eqx.Module):
                 token_mask=token_mask,
                 gumbel_tau=gumbel_tau,
                 router_temperature=router_temperature,
-                select_temperature=select_temperature,
+                select_temperature=select_temperature
             )
             stats_all.append(st)
 
@@ -479,7 +480,7 @@ class Model(eqx.Module):
         load_norm = load / (jnp.sum(load) + 1e-9)
         load_std = jnp.std(load_norm)
 
-        return dict(
+        stats_dict = dict(
             load=load,
             importance_sum=importance_sum,
             importance_mean=importance_mean,
@@ -500,4 +501,7 @@ class Model(eqx.Module):
             cap_util_mean=cap_util.mean(),
             cap_util_min=cap_util.min(),
             cap_util_max=cap_util.max(),
+            routing_probs=probs,
         )
+                        
+        return stats_dict

@@ -319,8 +319,6 @@ class Model(eqx.Module):
         combine = jnp.einsum("ecd,ect,et->td", expert_out, slot, combine_w.T)  # (T, d)
 
         # -------- Residual update (Eq. 3) and pad freezing -------------------------
-        # TODO: normalise rho & combine w?
-        # h_next = (1 - rho) * h + combine
         h_next = h + combine - rho * h
         h_next = jnp.where(token_mask[:, None], h_next, h)
 

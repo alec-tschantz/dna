@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import time
 
@@ -13,7 +13,6 @@ import tyro
 import wandb
 from datasets import load_dataset
 from transformers import AutoTokenizer
-
 
 from dna import Model, Attention, FeedForward, Identity, sample
 
@@ -29,13 +28,13 @@ class Config:
     n_hops: int = 6
     n_modules: int = 16
     topk: int = 2
-    capacity: int = 64
+    capacity: int = 128
     mlp_mult: int = 4
     dropout: float = 0.1
     rope_base: float = 10_000.0
-    router_temp: float = 1.0
-    select_temp: float | None = None
-    gumbel_tau: float = 1.0
+    router_temp: float = 1.5
+    select_temp: float = 1.75
+    gumbel_tau: float = 1.2
     batch_size: int = 32
     seq_len: int = 256
     steps: int = 20_000
@@ -46,7 +45,7 @@ class Config:
     seed: int = 42
     eval_every: int = 250
     log_every: int = 10
-    eval_samples: int = 2_000
+    eval_samples: int = 5_000
     example_every: int = 250
     n_examples: int = 5
     gen_len: int = 100
@@ -100,6 +99,24 @@ def count_params(tree) -> int:
     return int(sum(x.size for x in leaves))
 
 
+def l2_tree_norm(tree) -> float:
+    leaves = jax.tree_util.tree_leaves(eqx.filter(tree, eqx.is_array))
+    if not leaves:
+        return 0.0
+    sq = sum(jnp.sum(jnp.square(x)) for x in leaves)
+    return float(jnp.sqrt(sq + 1e-12))
+
+
+def router_l2_norm(model: Model) -> float:
+    if hasattr(model, "routers"):
+        leaves = jax.tree_util.tree_leaves(eqx.filter(model.routers, eqx.is_array))
+        if not leaves:
+            return 0.0
+        sq = sum(jnp.sum(jnp.square(x)) for x in leaves)
+        return float(jnp.sqrt(sq + 1e-12))
+    return 0.0
+
+
 # ============================== Model factory ============================ #
 
 
@@ -134,10 +151,9 @@ def make_backbone(
     key: jax.Array,
 ) -> Tuple[eqx.Module, ...]:
     ks = jax.random.split(key, 2)
-    mods: List[eqx.Module] = []
     attn = Attention(d_model, n_heads, dropout, key=ks[0])
     ff = FeedForward(d_model, mlp_mult, dropout, key=ks[1])
-    return tuple([attn, ff])
+    return (attn, ff)
 
 
 def build_model(key: jax.Array) -> Model:
@@ -285,6 +301,79 @@ def eval_step(model: Model, batch: Dict[str, Any], *, key: jax.Array):
     return loss, acc
 
 
+# ============================== Routing metrics ========================== #
+
+
+def _avg_over_batch(x) -> jnp.ndarray:
+    """Average first axis (batch) -> keep remaining dims."""
+    x = jnp.asarray(x)
+    return jnp.mean(x, axis=0)
+
+
+def routing_metrics_from_stats(
+    stats_tuple_batched: Tuple[Dict[str, Any], ...],
+    *,
+    prefix: str,
+) -> Dict[str, float]:
+    hop_logs = []
+
+    for hop in stats_tuple_batched:
+        # Shapes after vmap: load -> (B, E); scalars -> (B,)
+        load = jnp.asarray(hop["load"])  # (B, E)
+        rho_mean = jnp.asarray(hop["rho_mean"])  # (B,)
+        entropy_mean = jnp.asarray(hop["entropy_mean"])  # (B,)
+        cap_drop = jnp.asarray(hop["cap_drop_frac_edges"])  # (B,)
+        eff_topk_mean = jnp.asarray(hop["eff_topk_mean"])  # (B,)
+        eff_topk_min = jnp.asarray(hop["eff_topk_min"])  # (B,)
+        eff_topk_max = jnp.asarray(hop["eff_topk_max"])  # (B,)
+        cap_util_mean = jnp.asarray(hop["cap_util_mean"])  # (B,)
+        cap_util_min = jnp.asarray(hop["cap_util_min"])  # (B,)
+        cap_util_max = jnp.asarray(hop["cap_util_max"])  # (B,)
+
+        # Utilization per batch: fraction of experts with load>0
+        util_b = jnp.mean((load > 0).astype(jnp.float32), axis=1)  # (B,)
+
+        # Load dispersion per batch: std of normalized loads across experts
+        denom = jnp.sum(load, axis=1, keepdims=True) + 1e-9
+        load_norm = load / denom  # (B, E)
+        load_std_b = jnp.std(load_norm, axis=1)  # (B,)
+
+        # Reduce over batch
+        hop_log = dict(
+            rho_mean=float(jnp.mean(rho_mean)),
+            entropy_mean=float(jnp.mean(entropy_mean)),
+            util=float(jnp.mean(util_b)),
+            load_std=float(jnp.mean(load_std_b)),
+            cap_drop_frac=float(jnp.mean(cap_drop)),
+            eff_topk_mean=float(jnp.mean(eff_topk_mean)),
+            eff_topk_min=float(jnp.mean(eff_topk_min)),
+            eff_topk_max=float(jnp.mean(eff_topk_max)),
+            cap_util_mean=float(jnp.mean(cap_util_mean)),
+            cap_util_min=float(jnp.mean(cap_util_min)),
+            cap_util_max=float(jnp.mean(cap_util_max)),
+        )
+        hop_logs.append(hop_log)
+
+    # Average across hops
+    def _mean_key(k: str) -> float:
+        vals = [h[k] for h in hop_logs]
+        return float(sum(vals) / max(len(vals), 1))
+
+    return {
+        f"routing/{prefix}/rho_mean": _mean_key("rho_mean"),
+        f"routing/{prefix}/entropy_mean": _mean_key("entropy_mean"),
+        f"routing/{prefix}/util": _mean_key("util"),
+        f"routing/{prefix}/load_std": _mean_key("load_std"),
+        f"routing/{prefix}/cap_drop_frac": _mean_key("cap_drop_frac"),
+        f"routing/{prefix}/eff_topk_mean": _mean_key("eff_topk_mean"),
+        f"routing/{prefix}/eff_topk_min": _mean_key("eff_topk_min"),
+        f"routing/{prefix}/eff_topk_max": _mean_key("eff_topk_max"),
+        f"routing/{prefix}/cap_util_mean": _mean_key("cap_util_mean"),
+        f"routing/{prefix}/cap_util_min": _mean_key("cap_util_min"),
+        f"routing/{prefix}/cap_util_max": _mean_key("cap_util_max"),
+    }
+
+
 # ============================== Examples (prints) ======================== #
 
 
@@ -356,12 +445,16 @@ def print_initial_stats(
     print("Initial stats")
     print("=" * 40)
     print(f"Params: {n_params:,}")
+    print(f"Capacity: {cfg.capacity}  TopK: {cfg.topk}  Hops: {cfg.n_hops}")
     print(f"Seq len mean/min/max (T-1): {lmean:.1f} / {lmin} / {lmax}")
     print(f"Pad mean (T-1): {pmean:.1f}")
     if step0_log_to_wandb:
         wandb.log(
             {
                 "n_params": n_params,
+                "capacity": cfg.capacity,
+                "topk": cfg.topk,
+                "hops": cfg.n_hops,
                 "seq/len_mean": lmean,
                 "seq/len_min": lmin,
                 "seq/len_max": lmax,
@@ -413,24 +506,31 @@ def main():
         dt_ms = (time.perf_counter() - t0) * 1000.0
 
         if step % cfg.log_every == 0:
-            wandb.log(
-                {
-                    "train/loss": float(loss),
-                    "train/acc": float(acc),
-                    "train/grad_norm": float(gnorm),
-                    "train/lr": float(lr_schedule(jnp.array(step))),
-                    "train/step_ms": dt_ms,
-                    "train/tok_s": cfg.batch_size
-                    * cfg.seq_len
-                    / (dt_ms / 1000.0 + 1e-9),
-                    "step": step,
-                }
-            )
+            stats_host = jax.tree_util.tree_map(jax.device_get, stats)
+
+            train_metrics = {
+                "train/loss": float(loss),
+                "train/acc": float(acc),
+                "train/grad_norm": float(gnorm),
+                "train/lr": float(lr_schedule(jnp.array(step))),
+                "train/step_ms": dt_ms,
+                "train/tok_s": cfg.batch_size * cfg.seq_len / (dt_ms / 1000.0 + 1e-9),
+                "w_norm/global": l2_tree_norm(model),
+                "w_norm/routers": router_l2_norm(model),
+                "step": step,
+            }
+
+            route_log = routing_metrics_from_stats(stats_host, prefix="train")
+
+            wandb.log({**train_metrics, **route_log})
 
         if step % cfg.eval_every == 0 and step > 0:
             key, ek = jax.random.split(key)
             val_batch = sample_batch(val_it, cfg.eval_samples // cfg.seq_len)
             val_loss, val_acc = eval_step(model, val_batch, key=ek)
+
+            lmean, lmin, lmax, pmean = batch_seq_stats(val_batch["attention_mask"])
+
             wandb.log(
                 {
                     "eval/loss": float(val_loss),

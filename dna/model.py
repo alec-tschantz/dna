@@ -206,7 +206,7 @@ class Model(eqx.Module):
         token_mask: Bool[Array, "T"],
         gumbel_tau: float,
         router_temperature: float,
-        select_temperature: Optional[float]
+        select_temperature: Optional[float],
     ) -> Tuple[Float[Array, "T d"], Dict[str, Any]]:
         r"""
         Implements the K-ribbon step with capacity. After routing and execution,
@@ -324,11 +324,7 @@ class Model(eqx.Module):
 
         # -------- Hop-level stats (load, entropy, rho, capacity drops, etc.) -------
         st = self._stats(
-            kept=kept,
-            probs=probs_full,
-            mask=mask_full,
-            rho=rho,
-            token_mask=token_mask
+            kept=kept, probs=probs_full, mask=mask_full, rho=rho, token_mask=token_mask
         )
         return h_next, st
 
@@ -364,7 +360,7 @@ class Model(eqx.Module):
             Temperature for *mixing* probabilities.
         select_temperature : Optional[float], default=None
             Temperature for *selection* logits (top-k). If None, uses `router_temperature`.
-       
+
 
         Returns
         -------
@@ -410,7 +406,7 @@ class Model(eqx.Module):
                 token_mask=token_mask,
                 gumbel_tau=gumbel_tau,
                 router_temperature=router_temperature,
-                select_temperature=select_temperature
+                select_temperature=select_temperature,
             )
             stats_all.append(st)
 
@@ -503,5 +499,5 @@ class Model(eqx.Module):
             cap_util_max=cap_util.max(),
             routing_probs=probs,
         )
-                        
+
         return stats_dict

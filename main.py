@@ -39,14 +39,14 @@ class Config:
     n_hops: int = 6
     n_modules: int = 16
     topk: int = 2
-    capacity: int = 32
+    capacity: int = 64
     mlp_mult: int = 4
     dropout: float = 0.1
     rope_base: float = 10_000.0
-    router_temp: float = 1.5
-    select_temp: float = 1.75
-    gumbel_tau: float = 1.2
-    batch_size: int = 32
+    router_temp: float = 1.0
+    select_temp: float = 1.0
+    gumbel_tau: float = 1.0
+    batch_size: int = 64
     seq_len: int = 256
     steps: int = 20_000
     warmup: int = 2_000
@@ -169,10 +169,11 @@ def make_backbone(
     key: jax.Array,
 ) -> Tuple[eqx.Module, ...]:
     """Create backbone modules (optional pre-routing layers)."""
+    # TODO:
     ks = jax.random.split(key, 2)
     attn = Attention(d_model, n_heads, dropout, key=ks[0])
     ff = FeedForward(d_model, mlp_mult, dropout, key=ks[1])
-    return (attn, ff)
+    return (ff,)
 
 
 def build_model(key: jax.Array) -> Model:
@@ -465,10 +466,7 @@ def main():
                 select_temp=cfg.select_temp,
             )
 
-            # Plot and log heatmap
             plot_routing_heatmap(batch_stats, step)
-
-            # Print example routing
             print_example_routing(example_stats, tok)
 
 

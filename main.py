@@ -150,7 +150,7 @@ def build_model(key: jax.Array) -> Model:
         dropout=cfg.dropout,
         key=k_mods,
     )
-    mods = make_backbone(
+    backbone = make_backbone(
         d_model=cfg.d_model,
         n_heads=cfg.n_heads,
         mlp_mult=cfg.mlp_mult,
@@ -167,7 +167,7 @@ def build_model(key: jax.Array) -> Model:
         n_hops=cfg.n_hops,
         dropout=cfg.dropout,
         rope_base=cfg.rope_base,
-        backbone=None,
+        backbone=backbone,
         key=k_model,
     )
 

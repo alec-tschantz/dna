@@ -217,41 +217,60 @@ class Model(eqx.Module):
         where the sum is over the *kept* experts for each token, with weights
         ``ρ_e`` from the router softmax (after temperature and capacity).
         """
-        # ====== Randomness split for routing vs execution ======
+
+        # -------- Randomness split (independent RNG for routing vs execution) ------
+        # key -> k_route (routing noise, e.g., Gumbel), k_exec (expert dropout, etc.)
         k_route, k_exec = jax.random.split(key)
 
-        # ====== Router: hard top-k + soft probs over ALL experts ======
+        # -------- Routing: hard top-k selection + soft mixing over all experts ------
+        # router(...) returns:
+        #   mask_full: (T, E) bool  hard top-k mask per token
+        #   probs_full: (T, E) float  softmax over experts (mixing weights)
+        #   logits_clean: (T, E) float  pre-noise logits (used for capacity ranking)
         mask_full, probs_full, logits_clean = router(
             h,
             key=k_route,
             inference=inference,
             gumbel_tau=gumbel_tau,
             router_temperature=router_temperature,  # mixing temperature
-            select_temperature=select_temperature,  # selection temperature (optional)
-        )  # shapes: (T,E), (T,E), (T,E)
+            select_temperature=select_temperature,  # selection temperature (opt.)
+        )  # -> (T,E), (T,E), (T,E)
 
-        # Respect token validity (pads do not route or change state)
+        # -------- Respect padding: masked tokens select nothing / mix nothing -------
+        # token_mask: (T,) bool   True=valid, False=pad
+        # Broadcast along expert axis to zero out invalid rows.
         mask_full = jnp.where(token_mask[:, None], mask_full, False)  # (T,E)
         probs_full = jnp.where(token_mask[:, None], probs_full, 0.0)  # (T,E)
 
-        # ====== Capacity assignment per expert (E experts, C slots) ======
-        # IMPORTANT: rank tokens per expert by *logits*, not per-token probabilities.
+        # -------- Capacity assignment per expert (tokens -> expert slots) -----------
+        # Rank tokens for each expert using *clean logits* (not per-token probs).
+        # Returns:
+        #   slot: (E, C, T) one-hot, slot[e,c,t]=1 iff token t assigned to (e,c)
+        #   kept: (E, T) bool, True iff e kept t in some slot
+        #   top_idx: (E, C) int, original token indices per (e,c)
         slot, kept, top_idx = _capacity_select(mask_full, logits_clean, self.capacity)
-        # slot: (E,C,T), kept: (E,T), top_idx: (E,C)
 
-        # ====== Gather inputs for active expert slots (einsum via token one-hots) ======
+        # -------- Gather per-slot inputs (einsum via one-hot slot tensor) -----------
+        # h:   (T, d)      -> xin:  (E, C, d)
+        # cos: (T, d_h)    -> cosr: (E, C, d_h)
+        # sin: (T, d_h)    -> sinr: (E, C, d_h)
         cos, sin = cos_sin
         xin = jnp.einsum("ect,td->ecd", slot, h)  # (E, C, d)
         cosr = jnp.einsum("ect,td->ecd", slot, cos)  # (E, C, d_h)
         sinr = jnp.einsum("ect,td->ecd", slot, sin)  # (E, C, d_h)
 
-        # Active slots mask
+        # -------- Active slot mask (which rows in C dimension are populated) --------
+        # active[e,c] = True if slot[e,c,:] selects any token
         active = slot.sum(-1) > 0  # (E, C) bool
 
-        # ====== Causality: time-order tokens per expert & use causal MHSA ======
+        # -------- Per-expert causal ordering (sort by original token positions) -----
+        # We need the expert’s internal time axis to be chronological for causal ops.
+        # pos_for_sort: (E, C) use token index for active rows; T+1 sentinel otherwise.
+        # order: (E, C) permutation along C that sorts ascending by position.
         pos_for_sort = jnp.where(active, top_idx, h.shape[0] + 1)  # (E, C)
         order = jnp.argsort(pos_for_sort, axis=1, stable=True)  # (E, C)
 
+        # Apply the same permutation to all per-slot tensors.
         def _take(a):
             return jnp.take_along_axis(a, order[:, :, None], axis=1)
 
@@ -259,40 +278,53 @@ class Model(eqx.Module):
         cosr = _take(cosr)  # (E, C, d_h)
         sinr = _take(sinr)  # (E, C, d_h)
         active = jnp.take_along_axis(active, order, axis=1)  # (E, C)
-        slot = jnp.take_along_axis(slot, order[:, :, None], axis=1)  # (E, C, T)
+        slot = jnp.take_along_axis(slot, order[:, :, None], 1)  # (E, C, T)
 
-        # ====== Execute experts in grouped batches ======
+        # -------- Execute experts in grouped batches (same-structure vmapping) ------
+        # xin/cosr/sinr/active are now time-ordered per expert along C.
+        # We vmap across experts in each structural group, then scatter back.
         E, C, d = xin.shape
         expert_out = jnp.zeros((E, C, d), dtype=xin.dtype)
 
         for gi, g in enumerate(self.groups):
+            # sub_keys: (n_g,) RNGs, one per expert instance in this group
             sub_keys = jax.random.split(jax.random.fold_in(k_exec, gi), len(g["idx"]))
+
+            # Slice group views
             inp = xin[g["idx"]]  # (n_g, C, d)
             c = cosr[g["idx"]]  # (n_g, C, d_h)
             s = sinr[g["idx"]]  # (n_g, C, d_h)
             am = active[g["idx"]]  # (n_g, C) bool
 
+            # _run: rebuild module from (params, static) and run it
             def _run(p, x, c1, s1, am1, k1):
                 mod = eqx.combine(p, g["static"])
                 return mod(x, (c1, s1), am1, key=k1, inference=inference)
 
             out_g = jax.vmap(_run)(g["params"], inp, c, s, am, sub_keys)  # (n_g, C, d)
-            # Scatter back into the right expert rows
+
+            # Scatter group outputs back to expert rows
             expert_out = expert_out.at[g["idx"]].set(out_g)
 
-        # ====== Combine back to original token positions (Eq. 3) ======
-        kept_t = kept.T  # (T, E)
+        # -------- Combine expert outputs back to original token positions ----------
+        # kept_t:   (T, E) bool    transpose of kept
+        # combine_w:(T, E) float   router probs masked by capacity-kept edges
+        # rho:      (T, 1) float   total kept mass per token
+        kept_t = kept.T
         combine_w = jnp.where(kept_t, probs_full, 0.0)  # (T, E)
         rho = combine_w.sum(axis=1, keepdims=True)  # (T, 1)
 
-        # Sum over experts and slots; slot[e,c,t] routes the e,c output to token t.
+        # Route (E,C,d) -> (T,d) via slot[e,c,t] and weight by combine_w[t,e]:
+        # combine[t] = Σ_e Σ_c expert_out[e,c] * slot[e,c,t] * combine_w[t,e]
         combine = jnp.einsum("ecd,ect,et->td", expert_out, slot, combine_w.T)  # (T, d)
 
-        # Eq. (3): residual-style update; pads remain unchanged
+        # -------- Residual update (Eq. 3) and pad freezing -------------------------
+        # TODO: normalise rho & combine w?
+        # h_next = (1 - rho) * h + combine
         h_next = h + combine - rho * h
         h_next = jnp.where(token_mask[:, None], h_next, h)
 
-        # ---- Hop-level stats ----
+        # -------- Hop-level stats (load, entropy, rho, capacity drops, etc.) -------
         st = self._stats(
             kept=kept,
             probs=probs_full,

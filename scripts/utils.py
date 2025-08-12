@@ -7,7 +7,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
+from matplotlib.colors import ListedColormap, to_rgba
 import wandb
 
 import numpy as np
@@ -1016,6 +1016,63 @@ def log_routing_visuals(
     return batch_stats, example_stats
 
 
+# -----------------------------------------------------------------------------
+# Token-flow: helpers
+# -----------------------------------------------------------------------------
+
+
+def _type_base_cmap(type_name: str) -> str:
+    name = type_name.lower()
+    if "ttent" in name:  # Attention
+        return "Blues"
+    if "feed" in name or "mlp" in name:
+        return "Oranges"
+    if "ident" in name:
+        return "Greens"
+    return "Purples"  # fallback
+
+
+def _expert_color_table(meta) -> np.ndarray:
+    """Return (E,4) RGBA colors: distinct shades per expert, grouped by type."""
+    type_ids = np.asarray(meta["expert_type_ids"])  # (E,)
+    id_to_type = list(meta["id_to_type"])
+    E = type_ids.shape[0]
+    colors = np.zeros((E, 4), dtype=np.float32)
+
+    for t_id, t_name in enumerate(id_to_type):
+        idxs = np.where(type_ids == t_id)[0]
+        if idxs.size == 0:
+            continue
+        cmap = plt.get_cmap(_type_base_cmap(t_name))
+        shades = [0.7] if idxs.size == 1 else np.linspace(0.35, 0.95, idxs.size)
+        for j, e in enumerate(sorted(idxs.tolist())):
+            rgba = np.array(cmap(float(shades[j])))
+            rgba[3] = 1.0
+            colors[e] = rgba
+    return colors
+
+
+def _token_strings(tok, ids_1d: np.ndarray) -> list[str]:
+    out = []
+    for tid in ids_1d.tolist():
+        try:
+            s = tok.decode([int(tid)], skip_special_tokens=True)
+        except Exception:
+            s = ""
+        s = s.replace(" ", "␣")
+        if len(s) > 8:
+            s = s[:7] + "…"
+        if s == "":
+            s = "·"
+        out.append(s)
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Token-flow: evaluate
+# -----------------------------------------------------------------------------
+
+
 def evaluate_token_flow_single(
     model,
     ids_1t: jnp.ndarray,  # (T,)
@@ -1033,13 +1090,15 @@ def evaluate_token_flow_single(
         **model_kwargs,
     )
     H = len(stats)
-    meta = get_expert_metadata(model)  # must contain 'expert_type_ids', 'id_to_type'
+    meta = get_expert_metadata(model)  # needs 'expert_type_ids', 'id_to_type'
     type_ids = jnp.asarray(meta["expert_type_ids"])  # (E,)
+    E = int(type_ids.shape[0])
+    K = int(min(max(1, topk), E))
 
     topk_idx, topk_prob, topk_type = [], [], []
     for h in range(H):
         p_te = stats[h]["routing_probs"]  # (T, E)
-        idx = jnp.argsort(p_te, axis=-1)[:, -topk:][:, ::-1]  # (T, K) largest→smallest
+        idx = jnp.argsort(p_te, axis=-1)[:, -K:][:, ::-1]  # (T, K)
         prob = jnp.take_along_axis(p_te, idx, axis=-1)  # (T, K)
         typ = jnp.take(type_ids, idx)  # (T, K)
         topk_idx.append(idx)
@@ -1056,29 +1115,31 @@ def evaluate_token_flow_single(
     }
 
 
-def plot_token_flow_single(
+# -----------------------------------------------------------------------------
+# Token-flow: BASIC plot (old look)
+# -----------------------------------------------------------------------------
+def plot_token_flow_single_basic(
     flow: dict,
     tok,
     *,
     step: int,
     max_tokens: int = 96,
-    title: str = "Token Routing Flow (top-2 per hop)",
-    show_probs_as_alpha: bool = False,
+    title: str = "Token Routing Flow (top-K per hop)",
+    show_confidence: bool = False,
+    min_alpha: float = 0.25,
 ):
-    # host copies
-    topk_idx = np.asarray(flow["topk_idx"])  # (H, T, K)
-    topk_type = np.asarray(flow["topk_type"])  # (H, T, K)
-    topk_prob = np.asarray(flow["topk_prob"])  # (H, T, K)
-    mask = np.asarray(flow["mask"]).astype(bool)  # (T,)
+    topk_idx = np.asarray(flow["topk_idx"])  # (H,T,K)
+    topk_type = np.asarray(flow["topk_type"])  # (H,T,K)
+    topk_prob = np.asarray(flow["topk_prob"])  # (H,T,K)
+    mask = np.asarray(flow["mask"]).astype(bool)
     ids = np.asarray(flow["ids"])
     meta = flow["meta"]
 
     H, T, K = topk_idx.shape
-
     valid_pos = np.where(mask)[0]
     if valid_pos.size == 0:
         return
-    Tvis = min(valid_pos.shape[0], max_tokens)
+    Tvis = int(min(valid_pos.shape[0], max_tokens))
     vis_idx = valid_pos[:Tvis]
     ids_vis = ids[vis_idx]
 
@@ -1089,95 +1150,56 @@ def plot_token_flow_single(
     if len(preview) > 120:
         preview = preview[:117] + "..."
 
-    # build grids
-    grid_types = np.zeros((H * K, Tvis), dtype=np.int32)
-    grid_indices = np.zeros_like(grid_types, dtype=np.int32)
-    grid_alpha = np.ones_like(grid_types, dtype=np.float32)
+    id_to_type = list(meta["id_to_type"])
+    num_types = max(1, len(id_to_type))
+    cmap = plt.get_cmap("tab10")
+
+    grid_rgba = np.zeros((H * K, Tvis, 4), dtype=np.float32)
+
+    # Normalize types to [0,1] to index into the colormap
+    denom = float(max(1, num_types - 1))
 
     for h in range(H):
-        for r in range(K):  # r=0 top1, r=1 top2
+        for r in range(K):
             row = h * K + r
-            grid_types[row, :] = topk_type[h, vis_idx, r]
-            grid_indices[row, :] = topk_idx[h, vis_idx, r]
-            grid_alpha[row, :] = np.clip(topk_prob[h, vis_idx, r], 0.05, 1.0)
+            t_ids = topk_type[h, vis_idx, r]  # (Tvis,)
+            probs = np.clip(topk_prob[h, vis_idx, r], 0.0, 1.0)  # (Tvis,)
 
-    # map type ids → colors (A/F/I). Extend if you have more.
-    id_to_type = list(
-        meta["id_to_type"]
-    )  # e.g., ["Attention","FeedForward","Identity"]
-    abbrev = {
-        name: (
-            "A" if "ttent" in name else "F" if "Feed" in name or "MLP" in name else "I"
-        )
-        for name in id_to_type
-    }
-    base = plt.get_cmap("tab10")
-    colors = [base(i % 10) for i in range(len(id_to_type))]
-    cmap_types = ListedColormap(colors)
+            # Base colors from type ids
+            colors = cmap(
+                np.clip(t_ids.astype(np.float32) / denom, 0.0, 1.0)
+            )  # (Tvis,4)
 
-    # figure sizing & density-aware text
+            if show_confidence:
+                colors[:, 3] = min_alpha + (1.0 - min_alpha) * probs
+            else:
+                colors[:, 3] = 1.0  # old look
+
+            grid_rgba[row, :, :] = colors
+
     fig_h = max(5.0, 0.5 * H * K + 2.0)
     fig_w = max(12.0, 0.12 * Tvis + 6.0)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
-    # draw colored type layer
-    im = ax.imshow(
-        grid_types,
-        aspect="auto",
-        cmap=cmap_types,
-        vmin=0,
-        vmax=max(1, len(id_to_type) - 1),
-        interpolation="nearest",
-    )
+    # Single draw — no gray overlay
+    ax.imshow(grid_rgba, aspect="auto", interpolation="nearest")
 
-    # optional probability alpha overlay (light→low prob, opaque→high prob)
-    if show_probs_as_alpha:
-        # gray overlay with alpha = 1 - prob, to de-emphasize low-confidence cells
-        ax.imshow(
-            np.ones_like(grid_alpha), aspect="auto", cmap="gray", alpha=1.0 - grid_alpha
-        )
-
-    # overlay module id text: e.g., A3, F7, I1
-    # shrink font if many tokens
-    show_text = Tvis <= 120
-    if show_text:
-        # choose white text; if you want dynamic contrast you can add luminance check
-        # label from type abbrev + module index
-        for row in range(H * K):
-            for col in range(Tvis):
-                type_name = id_to_type[int(grid_types[row, col])]
-                label = f"{abbrev[type_name]}{int(grid_indices[row, col])}"
-                ax.text(
-                    col,
-                    row,
-                    label,
-                    ha="center",
-                    va="center",
-                    fontsize=7 if Tvis > 80 else 8,
-                    color="white",
-                )
-
-    # axes styling
-    yticks = []
-    ylabels = []
-    for h in range(H):
-        for r in range(K):
-            yticks.append(h * K + r)
-            ylabels.append(f"Hop {h} • r{r+1}")
-    ax.set_yticks(yticks)
+    ylabels = [f"Hop {h} • r{r+1}" for h in range(H) for r in range(K)]
+    ax.set_yticks(np.arange(H * K))
     ax.set_yticklabels(ylabels, fontsize=10)
     ax.set_xticks([])
     ax.set_title(f"{title}\nstep {step} • preview: {preview}", fontsize=13, pad=10)
 
-    # legend for types
+    # Legend by type
     handles = [
-        plt.Rectangle((0, 0), 1, 1, color=cmap_types(i)) for i in range(len(id_to_type))
+        plt.Rectangle((0, 0), 1, 1, color=cmap(i / max(1, num_types - 1)))
+        for i in range(num_types)
     ]
     fig.legend(
         handles,
-        id_to_type,
+        id_to_type if id_to_type else [f"Type {i}" for i in range(num_types)],
         loc="upper center",
-        ncol=min(len(id_to_type), 6),
+        ncol=min(num_types, 6),
         bbox_to_anchor=(0.5, 0.02),
         fontsize=10,
         frameon=True,
@@ -1186,6 +1208,160 @@ def plot_token_flow_single(
     plt.tight_layout(rect=[0, 0.05, 1, 0.95])
     wandb.log({"routing/token_flow_single": wandb.Image(fig), "step": step})
     plt.close(fig)
+
+
+# -----------------------------------------------------------------------------
+# Token-flow: RICH plot (module-shaded, alpha=prob, tokens panel)
+# -----------------------------------------------------------------------------
+
+
+def plot_token_flow_single_rich(
+    flow: dict,
+    tok,
+    *,
+    step: int,
+    max_tokens: int = 96,
+    title: str = "Token Routing Flow (rich)",
+):
+    topk_idx = np.asarray(flow["topk_idx"])  # (H,T,K)
+    topk_type = np.asarray(flow["topk_type"])  # (H,T,K)
+    topk_prob = np.asarray(flow["topk_prob"])  # (H,T,K)
+    mask = np.asarray(flow["mask"]).astype(bool)
+    ids = np.asarray(flow["ids"])
+    meta = flow["meta"]
+
+    H, T, K = topk_idx.shape
+    valid_pos = np.where(mask)[0]
+    if valid_pos.size == 0:
+        return
+    Tvis = int(min(valid_pos.shape[0], max_tokens))
+    vis_idx = valid_pos[:Tvis]
+    ids_vis = ids[vis_idx]
+
+    try:
+        preview = tok.decode(ids_vis.tolist(), skip_special_tokens=True)
+    except Exception:
+        preview = "[decode error]"
+    if len(preview) > 120:
+        preview = preview[:117] + "..."
+
+    expert_rgba = _expert_color_table(meta)  # (E,4)
+
+    grid_rgba = np.zeros((H * K, Tvis, 4), dtype=np.float32)
+    module_labels = np.empty((H * K, Tvis), dtype=object)
+
+    type_names = list(meta["id_to_type"])
+    initials = {
+        t: (
+            "A"
+            if "ttent" in t.lower()
+            else "F" if ("feed" in t.lower() or "mlp" in t.lower()) else "I"
+        )
+        for t in type_names
+    }
+
+    for h in range(H):
+        for r in range(K):
+            row = h * K + r
+            e_ids = topk_idx[h, vis_idx, r]  # (Tvis,)
+            probs = np.clip(topk_prob[h, vis_idx, r], 0.0, 1.0)
+            colors = expert_rgba[e_ids].copy()
+            colors[:, 3] = 0.25 + 0.75 * probs  # alpha by prob
+            grid_rgba[row, :, :] = colors
+
+            t_ids = topk_type[h, vis_idx, r]
+            for c in range(Tvis):
+                tname = type_names[int(t_ids[c])]
+                module_labels[row, c] = f"{initials[tname]}{int(e_ids[c])}"
+
+    # Tokens + shifted targets
+    tok_row = _token_strings(tok, ids_vis)
+    tgt_row = _token_strings(tok, ids[vis_idx[1:]]) if Tvis > 1 else []
+
+    import matplotlib.gridspec as gridspec
+
+    fig_h = max(6.0, 0.5 * H * K + 2.8)
+    fig_w = max(14.0, 0.12 * Tvis + 8.0)
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    gs = gridspec.GridSpec(nrows=2, ncols=1, height_ratios=[1.0, 0.18], hspace=0.15)
+
+    ax = fig.add_subplot(gs[0, 0])
+    ax.imshow(grid_rgba, aspect="auto", interpolation="nearest")
+    if Tvis <= 120:
+        for row in range(H * K):
+            for col in range(Tvis):
+                ax.text(
+                    col,
+                    row,
+                    module_labels[row, col],
+                    ha="center",
+                    va="center",
+                    fontsize=7 if Tvis > 80 else 8,
+                    color="white",
+                )
+
+    ax.set_yticks(np.arange(H * K))
+    ax.set_yticklabels(
+        [f"Hop {h} • r{r+1}" for h in range(H) for r in range(K)], fontsize=10
+    )
+    ax.set_xticks([])
+    ax.set_title(
+        f"{title} (top-{K})\nstep {step} • preview: {preview}", fontsize=13, pad=10
+    )
+
+    # legend by TYPE (single swatch per type)
+    swatches = [
+        plt.Rectangle((0, 0), 1, 1, color=plt.get_cmap(_type_base_cmap(t))(0.75))
+        for t in type_names
+    ]
+    fig.legend(
+        swatches,
+        type_names,
+        loc="upper center",
+        ncol=min(len(type_names), 6),
+        bbox_to_anchor=(0.5, 0.03),
+        fontsize=10,
+        frameon=True,
+    )
+
+    # token panel
+    ax2 = fig.add_subplot(gs[1, 0])
+    ax2.axis("off")
+    ax2.set_xlim(-0.5, Tvis - 0.5)
+    ax2.set_ylim(-0.5, 1.5 if Tvis > 1 else 0.5)
+    for c in range(Tvis):
+        if c % 2 == 1:
+            ax2.add_patch(
+                plt.Rectangle((c - 0.5, -0.5), 1.0, 2.0, color=(0, 0, 0, 0.04))
+            )
+    for c, s in enumerate(tok_row):
+        ax2.text(
+            c,
+            0.5 if Tvis == 1 else 1.0,
+            s,
+            ha="center",
+            va="center",
+            fontsize=9,
+            family="monospace",
+        )
+    if Tvis > 1:
+        for c, s in enumerate(tgt_row, start=1):
+            ax2.text(
+                c, 0.0, s, ha="center", va="center", fontsize=9, family="monospace"
+            )
+        ax2.text(-0.35, 1.0, "x:", ha="right", va="center", fontsize=10, weight="bold")
+        ax2.text(-0.35, 0.0, "y:", ha="right", va="center", fontsize=10, weight="bold")
+    else:
+        ax2.text(-0.35, 0.5, "x:", ha="right", va="center", fontsize=10, weight="bold")
+
+    plt.tight_layout()
+    wandb.log({"routing/token_flow_single_rich": wandb.Image(fig), "step": step})
+    plt.close(fig)
+
+
+# -----------------------------------------------------------------------------
+# Token-flow: driver (calls BOTH plots)
+# -----------------------------------------------------------------------------
 
 
 def log_routing_visuals_single(
@@ -1197,17 +1373,26 @@ def log_routing_visuals_single(
     step: int,
     model_kwargs: dict,
     token_max: int = 96,
+    topk: int = 2,
 ):
-    # choose the first valid example (or any strategy you like)
     ids_1t = batch["input_ids"][0]
     mask_1t = batch["attention_mask"][0]
+
     flow = evaluate_token_flow_single(
         model,
         ids_1t,
         mask_1t,
         key=key,
         model_kwargs=model_kwargs,
-        topk=2,
+        topk=topk,
     )
-    plot_token_flow_single(flow, tok, step=step, max_tokens=token_max)
+
+    # old/basic plot
+    plot_token_flow_single_basic(
+        flow, tok, step=step, max_tokens=token_max, title="Token Routing Flow (basic)"
+    )
+    # rich plot
+    plot_token_flow_single_rich(
+        flow, tok, step=step, max_tokens=token_max, title="Token Routing Flow (rich)"
+    )
     return flow

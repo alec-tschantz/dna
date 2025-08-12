@@ -43,7 +43,7 @@ class Config:
     router_temp: float = 1.0
     select_temp: float = 1.0
     gumbel_tau: float = 1.0
-    batch_size: int = 64
+    batch_size: int = 32
     seq_len: int = 256
     steps: int = 20_000
     warmup: int = 2_000
@@ -51,9 +51,9 @@ class Config:
     wd: float = 0.01
     clip: float = 1.0
     seed: int = 42
-    eval_every: int = 250
+    eval_every: int = 100
     log_every: int = 10
-    eval_samples: int = 5_000
+    eval_samples: int = 16_384
     example_every: int = 250
     n_examples: int = 5
     gen_len: int = 200

@@ -28,11 +28,6 @@ def sample(
 ) -> Int[Array, "T"]:
     """Autoregressive sampler.
 
-    Notes
-    -----
-    - Full forward pass at each step with a causal attention mask.
-    - `inference=True` disables dropout and Gumbel in routers.
-    - By default, selection temp follows router temp unless overridden.
     """
     if eos_id is None:
         eos_id = int(pad_id)
@@ -57,7 +52,7 @@ def sample(
         logits, _stats = model(
             toks,
             key=subkey,
-            inference=True,  # deterministic generation
+            inference=True,  
             attention_mask=attn_mask,
             gumbel_tau=gumbel_tau,  # ignored at inference=True
             router_temperature=router_temperature,

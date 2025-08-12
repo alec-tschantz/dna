@@ -152,8 +152,8 @@ class Attention(Module):
     def __call__(
         self,
         x: jnp.ndarray,
-        cos_sin: Tuple[jnp.ndarray, jnp.ndarray], 
-        attention_mask: Optional[jnp.ndarray] = None,  
+        cos_sin: Tuple[jnp.ndarray, jnp.ndarray],
+        attention_mask: Optional[jnp.ndarray] = None,
         *args,
         key,
         inference: bool,

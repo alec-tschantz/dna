@@ -75,39 +75,40 @@ def _capacity_select(
         Shape (T, E) bool — hard top-k selection mask per token over experts.
     score_te : jnp.ndarray
         Shape (T, E) float — per-expert selection score per token.
-        Uses clean logits (not probabilities) for consistent ranking.
     capacity : int
-        Maximum tokens each expert can process.
+        Maximum tokens each expert can process (C), guaranteed > 0.
 
     Returns
     -------
     slot : jnp.ndarray
-        Shape (E, C, T) one-hot encoding of token-to-slot assignments.
+        Shape (E, C, T) float {0,1} — one-hot assignment of token→slot for each expert.
     kept : jnp.ndarray
-        Shape (E, T) bool — whether token t was kept by expert e.
+        Shape (E, T) bool — whether token t was kept by expert e after capacity.
     top_idx : jnp.ndarray
         Shape (E, C) int32 — original token indices per slot.
     """
-    # Transpose to expert-major for per-expert ranking
-    m = mask_te.T  # (E, T) bool
-    g = jnp.where(m, score_te.T, -jnp.inf)  # (E, T) float
+    # ===== Expert-major view to do per-expert top-k with capacity
+    # m: (E, T) bool — which token→expert edges exist pre-capacity
+    # g: (E, T) float — scores (masked to -inf so they never top-k)
+    m = mask_te.T
+    g = jnp.where(m, score_te.T, -jnp.inf)
 
-    cap = int(min(capacity, g.shape[1]))  # C ≤ T
+    E, T = g.shape
+    C = int(min(capacity, T))  # clamp just in case capacity > T
 
-    # Select top-C tokens per expert by score
-    _, top_idx = jax.lax.top_k(g, cap)  # (E, C)
-    E, C = top_idx.shape
-    T = g.shape[1]
+    # ===== Top-C selection per expert
+    # top_idx: (E, C) — token indices in original sequence
+    _, top_idx = jax.lax.top_k(g, C)
 
-    # Build one-hot slot assignment tensor
+    # ===== Build one-hot slot tensor: (E, C, T)
     slot = jnp.zeros((E, C, T), dtype=g.dtype)
     slot = slot.at[jnp.arange(E)[:, None], jnp.arange(C)[None, :], top_idx].set(1.0)
 
-    # Mask out indices that weren't actually selected (handles ties/NaNs)
+    # ===== Strictly zero any positions that weren't in the pre-capacity mask
     slot = slot * m[:, None, :].astype(slot.dtype)
 
-    # Track which tokens were kept by each expert
-    kept = (slot.sum(1) > 0).astype(bool)  # (E, T)
+    # ===== kept[e, t] ≡ any(slot[e, :, t] == 1)
+    kept = (slot.sum(axis=1) > 0).astype(bool)  # (E, T)
 
     return slot, kept, top_idx
 

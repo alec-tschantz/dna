@@ -31,7 +31,7 @@ from utils import (
 @dataclass
 class Config:
     vocab_size: int = 50_257
-    d_model: int = 256
+    d_model: int = 512
     n_heads: int = 16
     n_hops: int = 8
     n_modules: int = 16
@@ -120,13 +120,13 @@ def make_modules(
     keys = jax.random.split(key, n_modules)
     modules: List[eqx.Module] = []
     for i in range(n_modules):
-        t = i % 2
+        t = i % 3
         if t == 0:
             modules.append(Attention(d_model, n_heads, dropout, key=keys[i]))
         elif t == 1:
             modules.append(FeedForward(d_model, mlp_mult, dropout, key=keys[i]))
-        # else:
-        #     modules.append(Identity())
+        else:
+            modules.append(Identity())
     return tuple(modules)
 
 

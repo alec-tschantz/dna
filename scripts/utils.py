@@ -193,70 +193,6 @@ def print_initial_stats(
 
 
 # ============================================================================
-# Expert Metadata Extraction
-# ============================================================================
-
-
-def get_expert_metadata(model: Model) -> Dict[str, Any]:
-    """Extract expert metadata from model groups.
-
-    Parameters
-    ----------
-    model : Model
-        DNA model instance.
-
-    Returns
-    -------
-    metadata : Dict[str, Any]
-        Expert labels, types, and mappings.
-    """
-    assert hasattr(model, "groups") and len(model.groups) > 0, "Model must have groups"
-
-    # Determine total number of experts
-    E = 0
-    for g in model.groups:
-        E = max(E, int(jnp.max(g["idx"]) + 1))
-
-    # Initialize metadata lists
-    expert_labels: List[Optional[str]] = [None] * E
-    expert_types: List[Optional[str]] = [None] * E
-
-    # Build labels from group information
-    type_counters: Dict[str, int] = {}
-    for g in model.groups:
-        tname = type(g["static"]).__name__
-        cnt = type_counters.get(tname, 0)
-        idxs = list(map(int, jax.device_get(g["idx"]).tolist()))
-
-        for i, e_idx in enumerate(idxs):
-            expert_labels[e_idx] = f"{tname}_{cnt + i}"
-            expert_types[e_idx] = tname
-
-        type_counters[tname] = cnt + len(idxs)
-
-    # Fill any missing entries
-    for i in range(E):
-        if expert_labels[i] is None:
-            expert_labels[i] = f"Expert_{i}"
-        if expert_types[i] is None:
-            expert_types[i] = "Unknown"
-
-    # Create type mappings
-    unique_types = sorted(set(expert_types))
-    type_to_id = {t: i for i, t in enumerate(unique_types)}
-    expert_type_ids = jnp.array([type_to_id[t] for t in expert_types], dtype=jnp.int32)
-
-    return dict(
-        n_experts=E,
-        expert_labels=expert_labels,
-        expert_types=expert_types,
-        expert_type_ids=expert_type_ids,
-        type_to_id=type_to_id,
-        id_to_type=unique_types,
-    )
-
-
-# ============================================================================
 # Text Generation
 # ============================================================================
 
@@ -342,6 +278,70 @@ def generate_examples(
             print(f"\nPrompt: {p}")
             print(f"Completion: {text}")
             print("-" * 40)
+
+
+# ============================================================================
+# Expert Metadata Extraction
+# ============================================================================
+
+
+def get_expert_metadata(model: Model) -> Dict[str, Any]:
+    """Extract expert metadata from model groups.
+
+    Parameters
+    ----------
+    model : Model
+        DNA model instance.
+
+    Returns
+    -------
+    metadata : Dict[str, Any]
+        Expert labels, types, and mappings.
+    """
+    assert hasattr(model, "groups") and len(model.groups) > 0, "Model must have groups"
+
+    # Determine total number of experts
+    E = 0
+    for g in model.groups:
+        E = max(E, int(jnp.max(g["idx"]) + 1))
+
+    # Initialize metadata lists
+    expert_labels: List[Optional[str]] = [None] * E
+    expert_types: List[Optional[str]] = [None] * E
+
+    # Build labels from group information
+    type_counters: Dict[str, int] = {}
+    for g in model.groups:
+        tname = type(g["static"]).__name__
+        cnt = type_counters.get(tname, 0)
+        idxs = list(map(int, jax.device_get(g["idx"]).tolist()))
+
+        for i, e_idx in enumerate(idxs):
+            expert_labels[e_idx] = f"{tname}_{cnt + i}"
+            expert_types[e_idx] = tname
+
+        type_counters[tname] = cnt + len(idxs)
+
+    # Fill any missing entries
+    for i in range(E):
+        if expert_labels[i] is None:
+            expert_labels[i] = f"Expert_{i}"
+        if expert_types[i] is None:
+            expert_types[i] = "Unknown"
+
+    # Create type mappings
+    unique_types = sorted(set(expert_types))
+    type_to_id = {t: i for i, t in enumerate(unique_types)}
+    expert_type_ids = jnp.array([type_to_id[t] for t in expert_types], dtype=jnp.int32)
+
+    return dict(
+        n_experts=E,
+        expert_labels=expert_labels,
+        expert_types=expert_types,
+        expert_type_ids=expert_type_ids,
+        type_to_id=type_to_id,
+        id_to_type=unique_types,
+    )
 
 
 # ============================================================================

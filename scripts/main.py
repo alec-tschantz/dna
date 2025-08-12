@@ -24,13 +24,14 @@ from utils import (
     generate_examples,
     routing_metrics_from_stats,
     log_routing_visuals,
+    log_routing_visuals_single,
 )
 
 
 @dataclass
 class Config:
     vocab_size: int = 50_257
-    d_model: int = 512
+    d_model: int = 256
     n_heads: int = 16
     n_hops: int = 8
     n_modules: int = 16
@@ -42,10 +43,10 @@ class Config:
     router_temp: float = 1.0
     select_temp: float = 1.0
     gumbel_tau: float = 1.0
-    batch_size: int = 32
+    batch_size: int = 64
     seq_len: int = 256
     steps: int = 20_000
-    warmup: int = 3_000
+    warmup: int = 2_000
     lr_peak: float = 1e-4
     wd: float = 0.01
     clip: float = 1.0
@@ -55,7 +56,7 @@ class Config:
     eval_samples: int = 5_000
     example_every: int = 250
     n_examples: int = 5
-    gen_len: int = 100
+    gen_len: int = 200
     heatmap_every: int = 100
 
 
@@ -395,6 +396,16 @@ def main():
                 step=step,
                 num_examples=4,
                 max_tokens_grid=128,
+            )
+
+            _flow = log_routing_visuals_single(
+                model,
+                vis_batch,
+                key=vis_key,
+                tok=tok,
+                step=step,
+                model_kwargs=model_kwargs,
+                token_max=96,
             )
 
     print("\n" + "=" * 60)

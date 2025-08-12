@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 import wandb
 
+import numpy as np
+
 from dna import Model, sample
 
 
@@ -1013,3 +1015,200 @@ def log_routing_visuals(
         )
 
     return batch_stats, example_stats
+
+
+def evaluate_token_flow_single(
+    model,
+    ids_1t: jnp.ndarray,  # (T,)
+    mask_1t: jnp.ndarray,  # (T,)
+    *,
+    key: jax.Array,
+    model_kwargs: dict,  # fixed-key dict; values may be (1,) arrays
+    topk: int = 2,
+):
+    logits, stats = model(
+        ids_1t,
+        key=key,
+        inference=True,
+        attention_mask=mask_1t,
+        **model_kwargs,
+    )
+    H = len(stats)
+    meta = get_expert_metadata(model)  # must contain 'expert_type_ids', 'id_to_type'
+    type_ids = jnp.asarray(meta["expert_type_ids"])  # (E,)
+
+    topk_idx, topk_prob, topk_type = [], [], []
+    for h in range(H):
+        p_te = stats[h]["routing_probs"]  # (T, E)
+        idx = jnp.argsort(p_te, axis=-1)[:, -topk:][:, ::-1]  # (T, K) largest→smallest
+        prob = jnp.take_along_axis(p_te, idx, axis=-1)  # (T, K)
+        typ = jnp.take(type_ids, idx)  # (T, K)
+        topk_idx.append(idx)
+        topk_prob.append(prob)
+        topk_type.append(typ)
+
+    return {
+        "topk_idx": jnp.stack(topk_idx, axis=0),  # (H, T, K)
+        "topk_prob": jnp.stack(topk_prob, axis=0),  # (H, T, K)
+        "topk_type": jnp.stack(topk_type, axis=0),  # (H, T, K)
+        "mask": mask_1t,
+        "ids": ids_1t,
+        "meta": meta,
+    }
+
+
+def plot_token_flow_single(
+    flow: dict,
+    tok,
+    *,
+    step: int,
+    max_tokens: int = 96,
+    title: str = "Token Routing Flow (top-2 per hop)",
+    show_probs_as_alpha: bool = False,
+):
+    # host copies
+    topk_idx = np.asarray(flow["topk_idx"])  # (H, T, K)
+    topk_type = np.asarray(flow["topk_type"])  # (H, T, K)
+    topk_prob = np.asarray(flow["topk_prob"])  # (H, T, K)
+    mask = np.asarray(flow["mask"]).astype(bool)  # (T,)
+    ids = np.asarray(flow["ids"])
+    meta = flow["meta"]
+
+    H, T, K = topk_idx.shape
+
+    valid_pos = np.where(mask)[0]
+    if valid_pos.size == 0:
+        return
+    Tvis = min(valid_pos.shape[0], max_tokens)
+    vis_idx = valid_pos[:Tvis]
+    ids_vis = ids[vis_idx]
+
+    try:
+        preview = tok.decode(ids_vis.tolist(), skip_special_tokens=True)
+    except Exception:
+        preview = "[decode error]"
+    if len(preview) > 120:
+        preview = preview[:117] + "..."
+
+    # build grids
+    grid_types = np.zeros((H * K, Tvis), dtype=np.int32)
+    grid_indices = np.zeros_like(grid_types, dtype=np.int32)
+    grid_alpha = np.ones_like(grid_types, dtype=np.float32)
+
+    for h in range(H):
+        for r in range(K):  # r=0 top1, r=1 top2
+            row = h * K + r
+            grid_types[row, :] = topk_type[h, vis_idx, r]
+            grid_indices[row, :] = topk_idx[h, vis_idx, r]
+            grid_alpha[row, :] = np.clip(topk_prob[h, vis_idx, r], 0.05, 1.0)
+
+    # map type ids → colors (A/F/I). Extend if you have more.
+    id_to_type = list(
+        meta["id_to_type"]
+    )  # e.g., ["Attention","FeedForward","Identity"]
+    abbrev = {
+        name: (
+            "A" if "ttent" in name else "F" if "Feed" in name or "MLP" in name else "I"
+        )
+        for name in id_to_type
+    }
+    base = plt.get_cmap("tab10")
+    colors = [base(i % 10) for i in range(len(id_to_type))]
+    cmap_types = ListedColormap(colors)
+
+    # figure sizing & density-aware text
+    fig_h = max(5.0, 0.5 * H * K + 2.0)
+    fig_w = max(12.0, 0.12 * Tvis + 6.0)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    # draw colored type layer
+    im = ax.imshow(
+        grid_types,
+        aspect="auto",
+        cmap=cmap_types,
+        vmin=0,
+        vmax=max(1, len(id_to_type) - 1),
+        interpolation="nearest",
+    )
+
+    # optional probability alpha overlay (light→low prob, opaque→high prob)
+    if show_probs_as_alpha:
+        # gray overlay with alpha = 1 - prob, to de-emphasize low-confidence cells
+        ax.imshow(
+            np.ones_like(grid_alpha), aspect="auto", cmap="gray", alpha=1.0 - grid_alpha
+        )
+
+    # overlay module id text: e.g., A3, F7, I1
+    # shrink font if many tokens
+    show_text = Tvis <= 120
+    if show_text:
+        # choose white text; if you want dynamic contrast you can add luminance check
+        # label from type abbrev + module index
+        for row in range(H * K):
+            for col in range(Tvis):
+                type_name = id_to_type[int(grid_types[row, col])]
+                label = f"{abbrev[type_name]}{int(grid_indices[row, col])}"
+                ax.text(
+                    col,
+                    row,
+                    label,
+                    ha="center",
+                    va="center",
+                    fontsize=7 if Tvis > 80 else 8,
+                    color="white",
+                )
+
+    # axes styling
+    yticks = []
+    ylabels = []
+    for h in range(H):
+        for r in range(K):
+            yticks.append(h * K + r)
+            ylabels.append(f"Hop {h} • r{r+1}")
+    ax.set_yticks(yticks)
+    ax.set_yticklabels(ylabels, fontsize=10)
+    ax.set_xticks([])
+    ax.set_title(f"{title}\nstep {step} • preview: {preview}", fontsize=13, pad=10)
+
+    # legend for types
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, color=cmap_types(i)) for i in range(len(id_to_type))
+    ]
+    fig.legend(
+        handles,
+        id_to_type,
+        loc="upper center",
+        ncol=min(len(id_to_type), 6),
+        bbox_to_anchor=(0.5, 0.02),
+        fontsize=10,
+        frameon=True,
+    )
+
+    plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+    wandb.log({"routing/token_flow_single": wandb.Image(fig), "step": step})
+    plt.close(fig)
+
+
+def log_routing_visuals_single(
+    model,
+    batch,
+    *,
+    key,
+    tok,
+    step: int,
+    model_kwargs: dict,
+    token_max: int = 96,
+):
+    # choose the first valid example (or any strategy you like)
+    ids_1t = batch["input_ids"][0]
+    mask_1t = batch["attention_mask"][0]
+    flow = evaluate_token_flow_single(
+        model,
+        ids_1t,
+        mask_1t,
+        key=key,
+        model_kwargs=model_kwargs,
+        topk=2,
+    )
+    plot_token_flow_single(flow, tok, step=step, max_tokens=token_max)
+    return flow

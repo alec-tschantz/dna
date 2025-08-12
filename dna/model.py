@@ -17,12 +17,12 @@ from dna.routing import Router
 
 def _sig(mod: eqx.Module) -> Tuple[str, str, str]:
     """Return a structural signature for batched expert execution.
-    
+
     Creates a unique signature based on:
     - Module type name
     - Array leaf structure
     - Array shapes and dtypes
-    
+
     Modules with identical signatures can be vmapped together efficiently.
     """
     # Get array leaves and their properties
@@ -31,7 +31,7 @@ def _sig(mod: eqx.Module) -> Tuple[str, str, str]:
         lambda x: (tuple(x.shape), str(x.dtype)), arrs
     )
     arr_struct = jax.tree_util.tree_structure(arrs)
-    
+
     return (
         type(mod).__name__,
         str(arr_struct),
@@ -41,7 +41,7 @@ def _sig(mod: eqx.Module) -> Tuple[str, str, str]:
 
 def _stack(mods: List[eqx.Module]):
     """Stack parameters of structure-identical modules along a new leading axis.
-    
+
     Returns
     -------
     params : PyTree
@@ -65,10 +65,10 @@ def _capacity_select(
     capacity: int,
 ):
     """Capacity-constrained assignment for tokens → expert slots.
-    
+
     Implements top-k selection per expert with capacity constraints.
     Each expert can only process up to 'capacity' tokens.
-    
+
     Parameters
     ----------
     mask_te : jnp.ndarray
@@ -78,7 +78,7 @@ def _capacity_select(
         Uses clean logits (not probabilities) for consistent ranking.
     capacity : int
         Maximum tokens each expert can process.
-    
+
     Returns
     -------
     slot : jnp.ndarray
@@ -91,24 +91,24 @@ def _capacity_select(
     # Transpose to expert-major for per-expert ranking
     m = mask_te.T  # (E, T) bool
     g = jnp.where(m, score_te.T, -jnp.inf)  # (E, T) float
-    
+
     cap = int(min(capacity, g.shape[1]))  # C ≤ T
-    
+
     # Select top-C tokens per expert by score
     _, top_idx = jax.lax.top_k(g, cap)  # (E, C)
     E, C = top_idx.shape
     T = g.shape[1]
-    
+
     # Build one-hot slot assignment tensor
     slot = jnp.zeros((E, C, T), dtype=g.dtype)
     slot = slot.at[jnp.arange(E)[:, None], jnp.arange(C)[None, :], top_idx].set(1.0)
-    
+
     # Mask out indices that weren't actually selected (handles ties/NaNs)
     slot = slot * m[:, None, :].astype(slot.dtype)
-    
+
     # Track which tokens were kept by each expert
     kept = (slot.sum(1) > 0).astype(bool)  # (E, T)
-    
+
     return slot, kept, top_idx
 
 
@@ -119,27 +119,27 @@ def _capacity_select(
 
 class Model(eqx.Module):
     """DNA model with routing-based expert execution.
-    
+
     Processes sequences through multiple routing hops, where each hop
     assigns tokens to experts based on learned routing weights.
     Expert outputs are combined using router probabilities.
     """
-    
+
     # Core components
     embed: Embedding
     dropout: Dropout
     ln_out: RMSNorm
     routers: Tuple[Router, ...]
-    
+
     # Expert execution planning
     backbone: Tuple[eqx.Module, ...]
     groups: Tuple[Dict[str, Any], ...]
-    
+
     # Configuration (static)
     capacity: int = eqx.field(static=True)
     n_heads: int = eqx.field(static=True)
     rope_base: float = eqx.field(static=True)
-    
+
     def __init__(
         self,
         *,
@@ -156,7 +156,7 @@ class Model(eqx.Module):
         key,
     ):
         """Initialize DNA model.
-        
+
         Parameters
         ----------
         modules : Tuple[eqx.Module, ...]
@@ -186,15 +186,15 @@ class Model(eqx.Module):
         self.capacity = int(capacity)
         self.n_heads = int(n_heads)
         self.rope_base = float(rope_base)
-        
+
         # Split keys
         k_embed, k_routers = jax.random.split(key, 2)
-        
+
         # Initialize token processing components
         self.embed = Embedding(vocab, d_model, key=k_embed)
         self.dropout = Dropout(dropout)
         self.ln_out = RMSNorm(d_model)
-        
+
         # Group experts by structural signature for efficient batching
         buckets: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         for idx, mod in enumerate(modules):
@@ -202,32 +202,33 @@ class Model(eqx.Module):
             entry = buckets.setdefault(sig, {"idx": [], "mods": []})
             entry["idx"].append(idx)
             entry["mods"].append(mod)
-        
+
         # Stack parameters for vmapped execution
         grouped = []
         for bucket in buckets.values():
             params, static = _stack(bucket["mods"])
-            grouped.append(dict(
-                idx=jnp.array(bucket["idx"], jnp.int32),
-                params=params,
-                static=static
-            ))
-        
+            grouped.append(
+                dict(
+                    idx=jnp.array(bucket["idx"], jnp.int32),
+                    params=params,
+                    static=static,
+                )
+            )
+
         # Sort groups by first index for stable ordering
         grouped.sort(key=lambda d: int(d["idx"][0]))
         self.groups = tuple(grouped)
-        
+
         # Store optional backbone
         self.backbone = tuple(backbone) if backbone is not None else tuple()
-        
+
         # Initialize routers
         total_experts = len(modules)
         router_keys = jax.random.split(k_routers, n_hops)
         self.routers = tuple(
-            Router(d_model, total_experts, topk, key=k)
-            for k in router_keys
+            Router(d_model, total_experts, topk, key=k) for k in router_keys
         )
-    
+
     def _hop(
         self,
         h: Float[Array, "T d"],
@@ -239,10 +240,10 @@ class Model(eqx.Module):
         token_mask: Bool[Array, "T"],
         gumbel_tau: float,
         router_temperature: float,
-        select_temperature: Optional[float]
+        select_temperature: Optional[float],
     ) -> Tuple[Float[Array, "T d"], Dict[str, Any]]:
         """Execute one routing hop.
-        
+
         Implements the K-ribbon step with capacity constraints.
         Output combination follows Eq. (3):
             h_{s+1} = h_s + Σ_e ρ_e ( M_e(h_s^e) - h_s )
@@ -250,7 +251,7 @@ class Model(eqx.Module):
         """
         # Split keys for routing and execution
         k_route, k_exec = jax.random.split(key)
-        
+
         # Perform routing to get hard selection and soft mixing weights
         mask_full, probs_full, logits_clean = router(
             h,
@@ -260,84 +261,80 @@ class Model(eqx.Module):
             router_temperature=router_temperature,
             select_temperature=select_temperature,
         )  # (T,E), (T,E), (T,E)
-        
+
         # Mask out padding tokens
         mask_full = jnp.where(token_mask[:, None], mask_full, False)  # (T,E)
         probs_full = jnp.where(token_mask[:, None], probs_full, 0.0)  # (T,E)
-        
+
         # Apply capacity constraints
         slot, kept, top_idx = _capacity_select(mask_full, logits_clean, self.capacity)
-        
+
         # Gather inputs for each expert slot
         cos, sin = cos_sin
-        xin = jnp.einsum("ect,td->ecd", slot, h)      # (E, C, d)
-        cosr = jnp.einsum("ect,td->ecd", slot, cos)   # (E, C, d_h)
-        sinr = jnp.einsum("ect,td->ecd", slot, sin)   # (E, C, d_h)
-        
+        xin = jnp.einsum("ect,td->ecd", slot, h)  # (E, C, d)
+        cosr = jnp.einsum("ect,td->ecd", slot, cos)  # (E, C, d_h)
+        sinr = jnp.einsum("ect,td->ecd", slot, sin)  # (E, C, d_h)
+
         # Determine which slots are active
         active = slot.sum(-1) > 0  # (E, C) bool
-        
+
         # Sort slots by original token position for causal ordering
         pos_for_sort = jnp.where(active, top_idx, h.shape[0] + 1)  # (E, C)
         order = jnp.argsort(pos_for_sort, axis=1, stable=True)  # (E, C)
-        
+
         # Apply sorting permutation
         def _take(a):
             return jnp.take_along_axis(a, order[:, :, None], axis=1)
-        
-        xin = _take(xin)      # (E, C, d)
-        cosr = _take(cosr)    # (E, C, d_h)
-        sinr = _take(sinr)    # (E, C, d_h)
-        active = jnp.take_along_axis(active, order, axis=1)         # (E, C)
-        slot = jnp.take_along_axis(slot, order[:, :, None], 1)      # (E, C, T)
-        
+
+        xin = _take(xin)  # (E, C, d)
+        cosr = _take(cosr)  # (E, C, d_h)
+        sinr = _take(sinr)  # (E, C, d_h)
+        active = jnp.take_along_axis(active, order, axis=1)  # (E, C)
+        slot = jnp.take_along_axis(slot, order[:, :, None], 1)  # (E, C, T)
+
         # Execute experts in batched groups
         E, C, d = xin.shape
         expert_out = jnp.zeros((E, C, d), dtype=xin.dtype)
-        
+
         for gi, g in enumerate(self.groups):
             # Generate keys for this group
             sub_keys = jax.random.split(jax.random.fold_in(k_exec, gi), len(g["idx"]))
-            
+
             # Extract group inputs
-            inp = xin[g["idx"]]     # (n_g, C, d)
-            c = cosr[g["idx"]]      # (n_g, C, d_h)
-            s = sinr[g["idx"]]      # (n_g, C, d_h)
-            am = active[g["idx"]]   # (n_g, C)
-            
+            inp = xin[g["idx"]]  # (n_g, C, d)
+            c = cosr[g["idx"]]  # (n_g, C, d_h)
+            s = sinr[g["idx"]]  # (n_g, C, d_h)
+            am = active[g["idx"]]  # (n_g, C)
+
             # Run experts via vmap
             def _run(p, x, c1, s1, am1, k1):
                 mod = eqx.combine(p, g["static"])
                 return mod(x, (c1, s1), am1, key=k1, inference=inference)
-            
+
             out_g = jax.vmap(_run)(g["params"], inp, c, s, am, sub_keys)  # (n_g, C, d)
-            
+
             # Scatter outputs back
             expert_out = expert_out.at[g["idx"]].set(out_g)
-        
+
         # Combine expert outputs weighted by router probabilities
         kept_t = kept.T  # (T, E)
         combine_w = jnp.where(kept_t, probs_full, 0.0)  # (T, E)
-        rho = combine_w.sum(axis=1, keepdims=True)      # (T, 1)
-        
+        rho = combine_w.sum(axis=1, keepdims=True)  # (T, 1)
+
         # Route outputs back to tokens
         combine = jnp.einsum("ecd,ect,et->td", expert_out, slot, combine_w.T)  # (T, d)
-        
+
         # Apply residual update (Eq. 3) and preserve padding
         h_next = h + combine - rho * h
         h_next = jnp.where(token_mask[:, None], h_next, h)
-        
+
         # Collect raw statistics (no aggregation here)
         stats = self._stats(
-            kept=kept,
-            probs=probs_full,
-            mask=mask_full,
-            rho=rho,
-            token_mask=token_mask
+            kept=kept, probs=probs_full, mask=mask_full, rho=rho, token_mask=token_mask
         )
-        
+
         return h_next, stats
-    
+
     @eqx.filter_jit
     def __call__(
         self,
@@ -351,7 +348,7 @@ class Model(eqx.Module):
         select_temperature: Optional[float] = None,
     ) -> Tuple[Float[Array, "T V"], Tuple[Dict[str, Any], ...]]:
         """Forward pass through DNA model.
-        
+
         Parameters
         ----------
         ids : Int[Array, "T"]
@@ -368,7 +365,7 @@ class Model(eqx.Module):
             Temperature for mixing probabilities.
         select_temperature : Optional[float]
             Temperature for selection logits (defaults to router_temperature).
-        
+
         Returns
         -------
         logits : Float[Array, "T V"]
@@ -383,22 +380,22 @@ class Model(eqx.Module):
             if attention_mask is None
             else attention_mask.astype(bool)
         )
-        
+
         # Embed tokens and apply dropout
         h: Float[Array, "T d"] = jax.vmap(self.embed)(ids)  # (T, d)
         key, sub = jax.random.split(key)
         h = self.dropout(h, key=sub, inference=inference)
-        
+
         # Prepare RoPE positional encodings
         d_h = self.embed.weight.shape[1] // self.n_heads
         cos_sin = rope_cos_sin(T, d_h, self.rope_base)  # each (T, d_h)
-        
+
         # Process through optional backbone layers
         for mod in self.backbone:
             key, sub = jax.random.split(key)
             out = mod(h, cos_sin, token_mask, key=sub, inference=inference)
             h = jnp.where(token_mask[:, None], out, h)
-        
+
         # Execute routing hops
         stats_all: List[Dict[str, Any]] = []
         for router in self.routers:
@@ -412,16 +409,16 @@ class Model(eqx.Module):
                 token_mask=token_mask,
                 gumbel_tau=gumbel_tau,
                 router_temperature=router_temperature,
-                select_temperature=select_temperature
+                select_temperature=select_temperature,
             )
             stats_all.append(st)
-        
+
         # Final layer norm and unembedding (tied weights)
         h = jax.vmap(self.ln_out)(h)  # (T, d)
         logits: Float[Array, "T V"] = jax.vmap(lambda t: t @ self.embed.weight.T)(h)
-        
+
         return logits, tuple(stats_all)
-    
+
     def _stats(
         self,
         *,
@@ -432,38 +429,38 @@ class Model(eqx.Module):
         token_mask: Bool[Array, "T"],
     ) -> Dict[str, Any]:
         """Collect raw routing statistics.
-        
+
         Returns raw arrays without aggregation - statistics will be
         computed later during logging for maximum flexibility.
         """
         # Load per expert (number of tokens assigned)
         load = kept.sum(axis=1).astype(jnp.int32)  # (E,)
-        
+
         # Importance (sum of routing probabilities per expert)
         importance = probs.sum(axis=0)  # (E,)
-        
+
         # Entropy per token (normalized by log E)
         p = probs
         p_sum = p.sum(axis=1, keepdims=True) + 1e-9
         p_norm = p / p_sum
         entropy = -(p_norm * jnp.log(p_norm + 1e-9)).sum(axis=1)  # (T,)
         entropy = entropy / jnp.log(p.shape[1] + 1e-9)  # Normalize
-        
+
         # Edge statistics
         selected_edges = mask.astype(jnp.int32).sum()  # scalar
-        kept_edges = kept.astype(jnp.int32).sum()      # scalar
-        
+        kept_edges = kept.astype(jnp.int32).sum()  # scalar
+
         # Effective top-k per token
         eff_topk = mask.astype(jnp.int32).sum(axis=1)  # (T,)
-        
+
         return dict(
-            load=load,                    # (E,) int32
-            importance=importance,         # (E,) float
-            rho=rho[:, 0],                # (T,) float
-            entropy=entropy,              # (T,) float
+            load=load,  # (E,) int32
+            importance=importance,  # (E,) float
+            rho=rho[:, 0],  # (T,) float
+            entropy=entropy,  # (T,) float
             selected_edges=selected_edges,  # scalar int32
-            kept_edges=kept_edges,          # scalar int32
-            eff_topk=eff_topk,            # (T,) int32
-            routing_probs=probs,          # (T, E) float
-            token_mask=token_mask,        # (T,) bool
+            kept_edges=kept_edges,  # scalar int32
+            eff_topk=eff_topk,  # (T,) int32
+            routing_probs=probs,  # (T, E) float
+            token_mask=token_mask,  # (T,) bool
         )

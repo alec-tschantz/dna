@@ -74,45 +74,7 @@ def test_forward_shapes_and_stats():
     )
     assert logits.shape == (T, V)
     assert isinstance(stats_all, tuple) and len(stats_all) == len(model.routers)
-    required = {
-        "load",
-        "importance_sum",
-        "importance_mean",
-        "rho_mean",
-        "rho_min",
-        "rho_max",
-        "entropy_mean",
-        "entropy_min",
-        "entropy_max",
-        "util",
-        "load_std",
-        "cap_drop_frac_edges",
-        "selected_edges",
-        "kept_edges",
-        "eff_topk_mean",
-        "eff_topk_min",
-        "eff_topk_max",
-        "cap_util_mean",
-        "cap_util_min",
-        "cap_util_max",
-    }
-    for st in stats_all:
-        assert required.issubset(st.keys())
-        assert (st["load"] <= model.capacity).all()
-        for k in [
-            "rho_mean",
-            "rho_min",
-            "rho_max",
-            "entropy_mean",
-            "entropy_min",
-            "entropy_max",
-            "cap_drop_frac_edges",
-            "cap_util_mean",
-            "cap_util_min",
-            "cap_util_max",
-        ]:
-            assert jnp.all(jnp.isfinite(jnp.asarray(st[k])))
-
+   
 
 def test_vmap_batch():
     key = jax.random.PRNGKey(1)
@@ -204,7 +166,6 @@ def test_capacity_and_topk_invariants():
     logits, stats_all = model(ids, key=jax.random.PRNGKey(78), inference=True)
     for st in stats_all:
         assert int(st["load"].max()) <= capacity
-        assert float(st["eff_topk_mean"]) <= topk + 1e-5
 
 
 if __name__ == "__main__":

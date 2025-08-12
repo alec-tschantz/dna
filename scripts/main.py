@@ -43,7 +43,7 @@ class Config:
     router_temp: float = 1.0
     select_temp: float = 1.0
     gumbel_tau: float = 1.0
-    batch_size: int = 32
+    batch_size: int = 64
     seq_len: int = 256
     steps: int = 20_000
     warmup: int = 2_000

@@ -46,8 +46,8 @@ class Config:
     batch_size: int = 64
     seq_len: int = 256
     steps: int = 20_000
-    warmup: int = 3_000
-    lr_peak: float = 0.00005
+    warmup: int = 2_000
+    lr_peak: float = 0.0001
     wd: float = 0.01
     clip: float = 1.0
     seed: int = 42

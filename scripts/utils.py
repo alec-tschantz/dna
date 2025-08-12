@@ -14,6 +14,93 @@ import numpy as np
 
 from dna import Model, sample
 
+# ============================================================================
+# Text Generation
+# ============================================================================
+
+
+def generate_examples(
+    model: Model,
+    tok,
+    *,
+    key: jax.Array,
+    gen_len: int = 100,
+    per_prompt: int = 1,
+    router_temp: float = 1.5,
+    select_temp: float = 1.75,
+    gumbel_tau: float = 1.2,
+    prompts: Optional[List[str]] = None,
+    n_examples: int = 5,
+) -> None:
+    """Generate and display example text completions.
+
+    Parameters
+    ----------
+    model : Model
+        DNA model for generation.
+    tok : Tokenizer
+        Tokenizer instance.
+    key : jax.Array
+        Random key.
+    gen_len : int
+        Number of tokens to generate.
+    per_prompt : int
+        Completions per prompt.
+    router_temp : float
+        Router temperature.
+    select_temp : float
+        Selection temperature.
+    gumbel_tau : float
+        Gumbel tau (unused in inference).
+    prompts : Optional[List[str]]
+        Custom prompts (uses defaults if None).
+    n_examples : int
+        Number of prompts to use.
+    """
+    if prompts is None:
+        prompts = [
+            "Once upon a time, ",
+            "The little robot ",
+            "In the magical forest, ",
+            "One sunny morning, ",
+            "The brave knight ",
+        ]
+
+    print("\n" + "=" * 60)
+    print("Generated Examples")
+    print("=" * 60)
+
+    for p in prompts[:n_examples]:
+        prompt_ids = jnp.array(tok.encode(p), dtype=jnp.int32)
+        key, *subs = jax.random.split(key, per_prompt + 1)
+        subs = jnp.stack(subs)
+
+        @jax.vmap
+        def _sample(k):
+            return sample(
+                model=model,
+                prompt_ids=prompt_ids,
+                max_new_tokens=gen_len,
+                temperature=0.8,
+                key=k,
+                router_temperature=router_temp,
+                select_temperature=select_temp,
+                gumbel_tau=gumbel_tau,
+                greedy=False,
+                pad_id=tok.pad_token_id,
+                eos_id=tok.pad_token_id,
+            )
+
+        toks = _sample(subs)
+        for seq in jax.device_get(toks):
+            seq = list(seq)
+            if tok.eos_token_id in seq:
+                seq = seq[: seq.index(tok.eos_token_id) + 1]
+            text = tok.decode(seq, skip_special_tokens=True)
+            print(f"\nPrompt: {p}")
+            print(f"Completion: {text}")
+            print("-" * 40)
+
 
 # ============================================================================
 # Helper Functions
@@ -190,94 +277,6 @@ def print_initial_stats(
             "step": 0,
         }
     )
-
-
-# ============================================================================
-# Text Generation
-# ============================================================================
-
-
-def generate_examples(
-    model: Model,
-    tok,
-    *,
-    key: jax.Array,
-    gen_len: int = 100,
-    per_prompt: int = 1,
-    router_temp: float = 1.5,
-    select_temp: float = 1.75,
-    gumbel_tau: float = 1.2,
-    prompts: Optional[List[str]] = None,
-    n_examples: int = 5,
-) -> None:
-    """Generate and display example text completions.
-
-    Parameters
-    ----------
-    model : Model
-        DNA model for generation.
-    tok : Tokenizer
-        Tokenizer instance.
-    key : jax.Array
-        Random key.
-    gen_len : int
-        Number of tokens to generate.
-    per_prompt : int
-        Completions per prompt.
-    router_temp : float
-        Router temperature.
-    select_temp : float
-        Selection temperature.
-    gumbel_tau : float
-        Gumbel tau (unused in inference).
-    prompts : Optional[List[str]]
-        Custom prompts (uses defaults if None).
-    n_examples : int
-        Number of prompts to use.
-    """
-    if prompts is None:
-        prompts = [
-            "Once upon a time, ",
-            "The little robot ",
-            "In the magical forest, ",
-            "One sunny morning, ",
-            "The brave knight ",
-        ]
-
-    print("\n" + "=" * 60)
-    print("Generated Examples")
-    print("=" * 60)
-
-    for p in prompts[:n_examples]:
-        prompt_ids = jnp.array(tok.encode(p), dtype=jnp.int32)
-        key, *subs = jax.random.split(key, per_prompt + 1)
-        subs = jnp.stack(subs)
-
-        @jax.vmap
-        def _sample(k):
-            return sample(
-                model=model,
-                prompt_ids=prompt_ids,
-                max_new_tokens=gen_len,
-                temperature=0.8,
-                key=k,
-                router_temperature=router_temp,
-                select_temperature=select_temp,
-                gumbel_tau=gumbel_tau,
-                greedy=False,
-                pad_id=tok.pad_token_id,
-                eos_id=tok.pad_token_id,
-            )
-
-        toks = _sample(subs)
-        for seq in jax.device_get(toks):
-            seq = list(seq)
-            if tok.eos_token_id in seq:
-                seq = seq[: seq.index(tok.eos_token_id) + 1]
-            text = tok.decode(seq, skip_special_tokens=True)
-            print(f"\nPrompt: {p}")
-            print(f"Completion: {text}")
-            print("-" * 40)
 
 
 # ============================================================================

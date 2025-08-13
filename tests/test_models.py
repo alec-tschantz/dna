@@ -10,7 +10,7 @@ from jaxtyping import Int, Float, Array, Bool
 
 from dna.model import Model
 from dna.modules import Attention, FeedForward, Identity
-from dna.sample import sample
+from dna.generate import sample
 
 
 def make_small_dna(

@@ -2,7 +2,7 @@ set -euo pipefail
 
 
 python scripts/main.py \
-  --model_type "dense" \
+  --model_type "dna" \
   --dataset_name "roneneldan/TinyStories" \
   --dataset_config "default" \
   --batch_size 8 \

@@ -170,6 +170,19 @@ def run_eval_suite(
         max_tokens_grid=96,
     )
 
+    _ = log_routing_sankey_if_available(
+        model,
+        vis_batch,
+        key=vis_key,
+        gumbel_tau=0.0,
+        router_temp=float(eval_kwargs["router_temp"][0]),
+        select_temp=float(eval_kwargs["select_temp"][0]),
+        step=step,
+        top_paths_per_hop=18,
+        min_frac=0.01,
+        by_type=False,
+    )
+
     key, gen_key = jax.random.split(key)
     prompts = [
         "Once upon a time, ",
@@ -691,3 +704,226 @@ def log_routing_visuals_if_available(
             example_stats, batch_stats, tok, step=step, max_tokens=max_tokens_grid
         )
     return batch_stats, example_stats
+
+
+# --- Sankey: token paths across hops -----------------------------------------
+
+
+def _rgba_to_plotly(rgba: np.ndarray, alpha: float = 0.8) -> str:
+    r, g, b, a = (np.clip(rgba, 0.0, 1.0) * 255.0).astype(int)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def _collect_top1_indices_all(
+    model,
+    batch: Dict[str, Any],
+    *,
+    key: jax.Array,
+    gumbel_tau: float,
+    router_temp: float,
+    select_temp: float,
+):
+    """Return (top1[H,B,T], mask[B,T], meta). If no routing, returns (None, None, None)."""
+    if not has_routing(model):
+        return None, None, None
+
+    ids = jnp.asarray(batch["input_ids"])
+    mask = jnp.asarray(batch["attention_mask"]).astype(bool)  # (B,T)
+    B, T = ids.shape
+    keys = jax.random.split(key, B)
+
+    stats = _forward_batched_for_stats(
+        model,
+        ids,
+        mask.astype(jnp.float32),
+        keys,
+        gumbel_tau=gumbel_tau,
+        router_temp=router_temp,
+        select_temp=select_temp,
+    )
+    if not isinstance(stats, (tuple, list)) or len(stats) == 0:
+        return None, None, None
+
+    top1_idx = []
+    for hop in stats:
+        p = jnp.asarray(hop["routing_probs"])  # (B,T,E)
+        idx = jnp.argmax(p, axis=-1)  # (B,T)
+        top1_idx.append(idx)
+    top1 = jnp.stack(top1_idx, axis=0)  # (H,B,T)
+
+    meta = _expert_meta(model)
+    if meta is None:
+        return None, None, None
+
+    return jax.device_get(top1), jax.device_get(mask), meta
+
+
+def log_routing_sankey_if_available(
+    model,
+    batch: Dict[str, Any],
+    *,
+    key: jax.Array,
+    gumbel_tau: float,
+    router_temp: float,
+    select_temp: float,
+    step: int,
+    top_paths_per_hop: int = 18,
+    min_frac: float = 0.01,
+    by_type: bool = False,
+):
+    """Log a Plotly Sankey of token flows across routing hops.
+
+    - Nodes: experts at each hop (only those participating in top flows).
+    - Links: width = #tokens flowing hop h -> hop h+1.
+    - Colors: node + link color keyed by expert type.
+
+    If Plotly is unavailable, logs a compact transition heatmap instead.
+    """
+    try:
+        import plotly.graph_objects as go
+
+        have_plotly = True
+    except Exception:
+        have_plotly = False
+
+    top1, mask_bt, meta = _collect_top1_indices_all(
+        model,
+        batch,
+        key=key,
+        gumbel_tau=gumbel_tau,
+        router_temp=router_temp,
+        select_temp=select_temp,
+    )
+    if top1 is None:
+        return None
+
+    H, B, T = top1.shape
+    E = int(meta["expert_type_ids"].shape[0])
+    type_names = list(meta["id_to_type"])
+    type_ids = np.asarray(meta["expert_type_ids"])
+    labels_all = list(meta["expert_labels"])
+    expert_rgba = _expert_color_table(meta)
+
+    # ---------- build flows per adjacent hop pair ----------
+    flows = []  # list of (E,E) arrays
+    mask_flat = mask_bt.reshape(-1)  # (B*T,)
+    for h in range(H - 1):
+        a = top1[h].reshape(-1)[mask_flat]  # (N_valid,)
+        b = top1[h + 1].reshape(-1)[mask_flat]  # (N_valid,)
+        pair = (a * E + b).astype(np.int64)
+        counts = np.bincount(pair, minlength=E * E).reshape(E, E)
+        flows.append(counts)
+
+    # ---------- choose top flows and build nodes ----------
+    initials = {
+        t: (
+            "A"
+            if "ttent" in t.lower()
+            else "F" if ("feed" in t.lower() or "mlp" in t.lower()) else "I"
+        )
+        for t in type_names
+    }
+
+    # Node indexing: map (hop, expert) -> node_id for selected nodes only
+    node_id = {}
+    node_labels, node_colors = [], []
+
+    def _ensure_node(h, e):
+        key_ = (h, int(e))
+        if key_ in node_id:
+            return node_id[key_]
+        lbl_base = labels_all[int(e)]
+        if lbl_base is None:
+            # fall back: prefix with type initial + idx
+            tname = type_names[int(type_ids[int(e)])]
+            lbl_base = f"{initials[tname]}{int(e)}"
+        lbl = f"H{h} • {lbl_base}"
+        node_id[key_] = len(node_labels)
+        node_labels.append(lbl)
+        node_colors.append(_rgba_to_plotly(expert_rgba[int(e)], alpha=0.85))
+        return node_id[key_]
+
+    # Collect links respecting top-k per hop and min flow fraction
+    link_src, link_tgt, link_val, link_col = [], [], [], []
+
+    for h, mat in enumerate(flows):
+        total = float(mat.sum())
+        if total <= 0:
+            continue
+        flat = mat.flatten()
+        k = min(top_paths_per_hop, flat.size)
+        # keep any edges above threshold + top-k
+        thr = max(int(min_frac * total), 1)
+        idx_thr = np.where(flat >= thr)[0]
+        idx_top = np.argpartition(flat, -k)[-k:]
+        keep = np.unique(np.concatenate([idx_thr, idx_top]))
+        keep = keep[np.argsort(-flat[keep])]
+
+        for idx in keep:
+            v = int(flat[idx])
+            if v <= 0:
+                continue
+            e0 = idx // E
+            e1 = idx % E
+            s = _ensure_node(h, e0)
+            t = _ensure_node(h + 1, e1)
+            link_src.append(s)
+            link_tgt.append(t)
+            link_val.append(v)
+            link_col.append(_rgba_to_plotly(expert_rgba[int(e0)], alpha=0.35))
+
+    if len(link_val) == 0:
+        return None
+
+    # ---------- log to W&B (Plotly preferred, else fallback heatmap) ----------
+    if have_plotly:
+        fig = go.Figure(
+            data=[
+                go.Sankey(
+                    arrangement="snap",
+                    valueformat=".0f",
+                    node=dict(
+                        pad=12,
+                        thickness=16,
+                        line=dict(color="rgba(0,0,0,0.25)", width=0.5),
+                        label=node_labels,
+                        color=node_colors,
+                    ),
+                    link=dict(
+                        source=link_src,
+                        target=link_tgt,
+                        value=link_val,
+                        color=link_col,
+                    ),
+                )
+            ]
+        )
+        fig.update_layout(
+            title=f"Routing Token Paths (top flows) • step {step}",
+            font=dict(size=12),
+            height=520,
+            margin=dict(l=10, r=10, t=50, b=10),
+        )
+        wandb.log({"routing/sankey": fig, "step": step})
+        return fig
+    else:
+        # Fallback: show hop-wise transition heatmaps
+        import matplotlib.pyplot as plt
+
+        ncols = min(3, max(1, len(flows)))
+        nrows = int(np.ceil(len(flows) / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
+        axes = np.atleast_1d(axes).ravel()
+        for i, mat in enumerate(flows):
+            ax = axes[i]
+            im = ax.imshow(mat, aspect="auto", cmap="magma")
+            ax.set_title(f"Hop {i} → {i+1} transitions")
+            ax.set_xlabel("Expert @ hop+1")
+            ax.set_ylabel("Expert @ hop")
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        for j in range(len(flows), len(axes)):
+            axes[j].axis("off")
+        plt.tight_layout()
+        wandb.log({"routing/transition_heatmap": wandb.Image(fig), "step": step})
+        plt.close(fig)
+        return None

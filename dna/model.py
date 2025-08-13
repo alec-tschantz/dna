@@ -292,7 +292,8 @@ class Model(eqx.Module):
         # Route outputs back to tokens
         combine = jnp.einsum("ecd,ect,et->td", expert_out, slot, combine_w.T)  # (T, d)
 
-        # Apply residual update (Eq. 3) and preserve padding
+        # Apply residual update (Eq. 3) and preserve padding 
+        # TODO: scale rho?       
         h_next = h + combine - rho * h
         h_next = jnp.where(token_mask[:, None], h_next, h)
 

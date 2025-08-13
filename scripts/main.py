@@ -31,7 +31,7 @@ class Config:
     d_model: int = 512
     n_heads: int = 16
     n_hops: int = 8
-    n_modules: int = 8
+    n_modules: int = 9
     topk: int = 2
     capacity: int = 256
     mlp_mult: int = 4
@@ -76,13 +76,16 @@ def make_modules(
     dropout: float,
     key: jax.Array,
 ) -> Tuple[eqx.Module, ...]:
-    half = n_modules // 2
+    n_att = n_modules // 3
+    n_ff = n_modules // 3
+    n_id = n_modules // 3
     keys = list(jax.random.split(key, n_modules))
-    keys_att = keys[:half]
-    keys_ff = keys[half :]
+    keys_att = keys[:n_att]
+    keys_ff = keys[n_att : n_att + n_ff]
     attn = [Attention(d_model, n_heads, dropout, key=k) for k in keys_att]
     ffn = [FeedForward(d_model, mlp_mult, dropout, key=k) for k in keys_ff]
-    return tuple(attn + ffn)
+    ident = [Identity() for _ in range(n_id)]
+    return tuple(attn + ffn + ident)
 
 
 def make_backbone(

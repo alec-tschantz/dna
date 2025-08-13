@@ -67,14 +67,14 @@ def test_forward_shapes_and_stats():
         ids,
         key=k_call,
         inference=True,
-        attention_mask=attn_mask,
+        mask=attn_mask,
         gumbel_tau=1.0,
-        router_temperature=1.0,
-        select_temperature=None,
+        router_temp=1.0,
+        select_temp=None,
     )
     assert logits.shape == (T, V)
     assert isinstance(stats_all, tuple) and len(stats_all) == len(model.routers)
-   
+
 
 def test_vmap_batch():
     key = jax.random.PRNGKey(1)
@@ -82,9 +82,7 @@ def test_vmap_batch():
     model = make_small_dna(vocab=V, key=key)
 
     def run(ids, k):
-        logits, _ = model(
-            ids, key=k, inference=True, attention_mask=jnp.ones((T,), bool)
-        )
+        logits, _ = model(ids, key=k, inference=True, mask=jnp.ones((T,), bool))
         return logits
 
     k_ids = jax.random.split(key, B)
@@ -102,7 +100,7 @@ def test_jit_wrapper_matches_eager():
     am = jnp.ones((T,), dtype=bool)
 
     def f(m, ids, k):
-        logits, _ = m(ids, key=k, inference=True, attention_mask=am)
+        logits, _ = m(ids, key=k, inference=True, mask=am)
         return logits
 
     f_jit = eqx.filter_jit(f)
@@ -124,8 +122,8 @@ def test_generate_loop():
         key=jax.random.PRNGKey(44),
         temperature=0.0,
         greedy=True,
-        router_temperature=1.0,
-        select_temperature=None,
+        router_temp=1.0,
+        select_temp=None,
         gumbel_tau=1.0,
         pad_id=0,
         eos_id=None,
@@ -144,7 +142,7 @@ def test_grads_finite():
     am = jnp.ones((T,), dtype=bool)
 
     def loss_fn(m: Model, k):
-        logits, _ = m(ids, key=k, inference=False, attention_mask=am)
+        logits, _ = m(ids, key=k, inference=False, mask=am)
         logp = logits - jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
         nll = -jnp.take_along_axis(logp, targets[:, None], axis=-1).squeeze(-1)
         return nll.mean()

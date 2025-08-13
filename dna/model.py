@@ -156,33 +156,6 @@ class Model(eqx.Module):
         backbone: Optional[Tuple[eqx.Module, ...]] = None,
         key,
     ):
-        """Initialize DNA model.
-
-        Parameters
-        ----------
-        modules : Tuple[eqx.Module, ...]
-            Pool of expert modules to route between.
-        vocab : int
-            Vocabulary size.
-        d_model : int
-            Model dimension.
-        n_heads : int
-            Number of attention heads.
-        capacity : int
-            Max tokens per expert per hop.
-        topk : int
-            Number of experts selected per token.
-        n_hops : int
-            Number of routing hops.
-        dropout : float
-            Dropout rate.
-        rope_base : float
-            RoPE base frequency.
-        backbone : Optional[Tuple[eqx.Module, ...]]
-            Optional pre-routing layers.
-        key : PRNGKey
-            Random key for initialization.
-        """
         # Store configuration
         self.capacity = int(capacity)
         self.n_heads = int(n_heads)
@@ -240,35 +213,29 @@ class Model(eqx.Module):
         inference: bool,
         token_mask: Bool[Array, "T"],
         gumbel_tau: float,
-        router_temperature: float,
-        select_temperature: Optional[float],
+        router_temp: float,
+        select_temp: Optional[float],
     ) -> Tuple[Float[Array, "T d"], Dict[str, Any]]:
-        """Execute one routing hop.
-
-        Implements the K-ribbon step with capacity constraints.
-        Output combination follows Eq. (3):
-            h_{s+1} = h_s + Σ_e ρ_e ( M_e(h_s^e) - h_s )
-        where the sum is over kept experts with weights ρ_e.
-        """
+        """Execute one routing hop."""
         # Split keys for routing and execution
         k_route, k_exec = jax.random.split(key)
 
         # Perform routing to get hard selection and soft mixing weights
-        mask_full, probs_full, logits_clean = router(
+        mask_full, probs_full, logits_clean, logits_sel = router(
             h,
             key=k_route,
             inference=inference,
             gumbel_tau=gumbel_tau,
-            router_temperature=router_temperature,
-            select_temperature=select_temperature,
-        )  # (T,E), (T,E), (T,E)
+            router_temp=router_temp,
+            select_temp=select_temp,
+        )  # shapes: (T,E), (T,E), (T,E), (T,E)
 
         # Mask out padding tokens
         mask_full = jnp.where(token_mask[:, None], mask_full, False)  # (T,E)
         probs_full = jnp.where(token_mask[:, None], probs_full, 0.0)  # (T,E)
 
         # Apply capacity constraints
-        slot, kept, top_idx = _capacity_select(mask_full, logits_clean, self.capacity)
+        slot, kept, top_idx = _capacity_select(mask_full, logits_sel, self.capacity)
 
         # Gather inputs for each expert slot
         cos, sin = cos_sin
@@ -343,10 +310,10 @@ class Model(eqx.Module):
         *,
         key,
         inference: bool,
-        attention_mask: Optional[Bool[Array, "T"]] = None,
+        mask: Optional[Bool[Array, "T"]] = None,
         gumbel_tau: float = 1.0,
-        router_temperature: float = 1.0,
-        select_temperature: Optional[float] = None,
+        router_temp: float = 1.0,
+        select_temp: Optional[float] = None,
     ) -> Tuple[Float[Array, "T V"], Tuple[Dict[str, Any], ...]]:
         """Forward pass through DNA model.
 
@@ -358,14 +325,14 @@ class Model(eqx.Module):
             Random key for dropout/routing.
         inference : bool
             If True, disables dropout and routing exploration.
-        attention_mask : Optional[Bool[Array, "T"]]
+        mask : Optional[Bool[Array, "T"]]
             Valid token mask (True=valid, False=padding).
         gumbel_tau : float
             Gumbel noise scale for training-time exploration.
-        router_temperature : float
+        router_temp : float
             Temperature for mixing probabilities.
-        select_temperature : Optional[float]
-            Temperature for selection logits (defaults to router_temperature).
+        select_temp : Optional[float]
+            Temperature for selection logits (defaults to router_temp).
 
         Returns
         -------
@@ -377,9 +344,7 @@ class Model(eqx.Module):
         # Setup token mask
         T = ids.shape[0]
         token_mask: Bool[Array, "T"] = (
-            jnp.ones((T,), dtype=bool)
-            if attention_mask is None
-            else attention_mask.astype(bool)
+            jnp.ones((T,), dtype=bool) if mask is None else mask.astype(bool)
         )
 
         # Embed tokens and apply dropout
@@ -409,8 +374,8 @@ class Model(eqx.Module):
                 inference=inference,
                 token_mask=token_mask,
                 gumbel_tau=gumbel_tau,
-                router_temperature=router_temperature,
-                select_temperature=select_temperature,
+                router_temp=router_temp,
+                select_temp=select_temp,
             )
             stats_all.append(st)
 
@@ -429,39 +394,40 @@ class Model(eqx.Module):
         rho: Float[Array, "T 1"],
         token_mask: Bool[Array, "T"],
     ) -> Dict[str, Any]:
-        """Collect raw routing statistics.
+        """Collect raw per-hop routing statistics for later aggregation."""
+        # load[e] = number of tokens kept by expert e (E,)
+        load = kept.sum(axis=1).astype(jnp.int32)
 
-        Returns raw arrays without aggregation - statistics will be
-        computed later during logging for maximum flexibility.
-        """
-        # Load per expert (number of tokens assigned)
-        load = kept.sum(axis=1).astype(jnp.int32)  # (E,)
+        # importance[e] = sum of routing probs to expert e across tokens (E,)
+        importance = probs.sum(axis=0)
 
-        # Importance (sum of routing probabilities per expert)
-        importance = probs.sum(axis=0)  # (E,)
-
-        # Entropy per token (normalized by log E)
+        # entropy[t] = entropy of per-token routing probs (normalized) (T,)
         p = probs
         p_sum = p.sum(axis=1, keepdims=True) + 1e-9
         p_norm = p / p_sum
-        entropy = -(p_norm * jnp.log(p_norm + 1e-9)).sum(axis=1)  # (T,)
-        entropy = entropy / jnp.log(p.shape[1] + 1e-9)  # Normalize
+        entropy = -(p_norm * jnp.log(p_norm + 1e-9)).sum(axis=1)
+        entropy = entropy / jnp.log(p.shape[1] + 1e-9)
 
-        # Edge statistics
-        selected_edges = mask.astype(jnp.int32).sum()  # scalar
-        kept_edges = kept.astype(jnp.int32).sum()  # scalar
+        # selected_edges = total hard edges before capacity (scalar)
+        selected_edges = mask.astype(jnp.int32).sum()
 
-        # Effective top-k per token
-        eff_topk = mask.astype(jnp.int32).sum(axis=1)  # (T,)
+        # kept_edges = total hard edges after capacity (scalar)
+        kept_edges = kept.astype(jnp.int32).sum()
 
+        # eff_topk[t] = number of selected experts for token t before capacity (T,)
+        eff_topk = mask.astype(jnp.int32).sum(axis=1)
+
+        # rho[t] = total mixing weight kept for token t after capacity (T,)
+        # routing_probs = per-token full distribution over experts (T,E)
+        # token_mask[t] = valid token flag (T,)
         return dict(
-            load=load,  # (E,) int32
-            importance=importance,  # (E,) float
-            rho=rho[:, 0],  # (T,) float
-            entropy=entropy,  # (T,) float
-            selected_edges=selected_edges,  # scalar int32
-            kept_edges=kept_edges,  # scalar int32
-            eff_topk=eff_topk,  # (T,) int32
-            routing_probs=probs,  # (T, E) float
-            token_mask=token_mask,  # (T,) bool
+            load=load,  # (E,) int32 — tokens kept per expert
+            importance=importance,  # (E,) float — sum of probs per expert
+            rho=rho[:, 0],  # (T,) float — total kept mixing weight
+            entropy=entropy,  # (T,) float — normalized routing entropy
+            selected_edges=selected_edges,  # () int32 — edges pre-capacity
+            kept_edges=kept_edges,  # () int32 — edges post-capacity
+            eff_topk=eff_topk,  # (T,) int32 — selected experts per token (pre-cap)
+            routing_probs=probs,  # (T,E) float — softmax over experts
+            token_mask=token_mask,  # (T,) bool — valid tokens
         )

@@ -32,7 +32,7 @@ class Config:
     n_heads: int = 16
     n_hops: int = 8
     n_modules: int = 8
-    topk: int = 1
+    topk: int = 2
     capacity: int = 256
     mlp_mult: int = 4
     dropout: float = 0.1

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 from typing import Any, Dict, List, Tuple, Optional
+import textwrap
 
 import equinox as eqx
 import jax
@@ -71,35 +72,54 @@ def log_train_step(
     acc,
     gnorm,
     step_time_ms: float,
-    stats,  # vmapped tuple over hops with batched arrays, or () for Dense
+    stats,
     model_kwargs: Dict[str, jax.Array],
 ):
-    base = {
+    # ---- core training metrics under train/* ----
+    train_logs = {
         "train/loss": float(loss),
         "train/acc": float(acc),
         "train/grad_norm": float(gnorm),
         "train/lr": float(schedule_fn(step)),
-        "train/step_ms": step_time_ms,
         "train/tok_per_sec": cfg.batch_size
         * cfg.seq_len
         / max(step_time_ms / 1000.0, 1e-9),
-        "weights/global_norm": l2_tree_norm(model),
-        "weights/router_norm": router_l2_norm(model),
-        "temps/router": float(model_kwargs.get("router_temp", jnp.array([0.0]))[0]),
-        "temps/select": float(model_kwargs.get("select_temp", jnp.array([0.0]))[0]),
-        "temps/gumbel": float(model_kwargs.get("gumbel_tau", jnp.array([0.0]))[0]),
+        "train/weights_global_norm": l2_tree_norm(model),
         "step": step,
     }
-    to_log = dict(base)
+
+    # ---- routing metrics under router/* (only if model has routers) ----
     if has_routing(model) and isinstance(stats, (tuple, list)) and len(stats) > 0:
         stats_host = jax.tree_util.tree_map(jax.device_get, stats)
-        to_log.update(
+
+        # router norms + temps
+        router_logs = {
+            "router/norm": router_l2_norm(model),
+            "router/temps/router": float(
+                model_kwargs.get("router_temp", jnp.array([0.0]))[0]
+            ),
+            "router/temps/select": float(
+                model_kwargs.get("select_temp", jnp.array([0.0]))[0]
+            ),
+            "router/temps/gumbel": float(
+                model_kwargs.get("gumbel_tau", jnp.array([0.0]))[0]
+            ),
+            "step": step,
+        }
+
+        # aggregated routing stats
+        router_logs.update(
             routing_metrics_from_stats(
-                stats_host, prefix="train", capacity=getattr(cfg, "capacity", None)
+                stats_host,
+                prefix="router/train",
+                capacity=getattr(cfg, "capacity", None),
             )
         )
-        to_log.update(_extra_routing_metrics(stats_host, prefix="train"))
-    wandb.log(to_log)
+        router_logs.update(_extra_routing_metrics(stats_host, prefix="router/train"))
+
+        wandb.log({**train_logs, **router_logs})
+    else:
+        wandb.log(train_logs)
 
 
 def run_eval_suite(
@@ -176,17 +196,24 @@ def run_eval_suite(
     print("Generated Examples")
     print("=" * 60)
     rows = []
+
     for r in results:
         p = r["prompt"]
         for comp in r["completions"]:
             text = comp["text"]
             preview = text.replace("\n", "\\n")
+
             print(f"\nPrompt: {p}")
             print(
-                f"Completion [{comp['length']} tokens]{' (eos)' if comp['stopped_eos'] else ''}:"
+                f"Completion [{comp['length']} tokens]"
+                f"{' (eos)' if comp['stopped_eos'] else ''}:"
             )
-            print(preview)
+
+            for line in textwrap.wrap(preview, width=100, break_long_words=False):
+                print(line)
+
             print("-" * 40)
+
             rows.append(
                 {
                     "step": step,
@@ -197,13 +224,6 @@ def run_eval_suite(
                     "stopped_eos": comp["stopped_eos"],
                 }
             )
-
-    if rows:
-        # Log to W&B as a table for easy browsing
-        table = wandb.Table(columns=list(rows[0].keys()))
-        for row in rows:
-            table.add_data(*[row[k] for k in table.columns])
-        wandb.log({"eval/generations": table, "step": step})
 
     return key
 

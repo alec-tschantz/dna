@@ -39,13 +39,15 @@ class Dense(eqx.Module):
         self.embed = Embedding(vocab, d_model, key=k_emb)
         self.dropout = Dropout(dropout)
 
-        keys = jax.random.split(k_layers, n_layers * 2)
+        n_pairs = int(n_layers // 2)
+        keys = jax.random.split(k_layers, max(0, n_pairs) * 2)
+
         self.layers = tuple(
             (
                 Attention(d_model, n_heads, dropout, key=keys[2 * i]),
                 FeedForward(d_model, mlp_mult, dropout, key=keys[2 * i + 1]),
             )
-            for i in range(n_layers)
+            for i in range(n_pairs)
         )
 
         self.ln_out = RMSNorm(d_model)

@@ -26,19 +26,18 @@ from metrics import (
 @dataclass
 class Config:
     # architecture
-    model_type: str = "dna"  # "dna" or "dense"
+    model_type: str = "dna"
     vocab_size: int = 50_257
     d_model: int = 512
     n_heads: int = 16
-    n_hops: int = 6  # For Dense: interpreted as n_layers
-    n_modules: int = 16  # DNA only
-    topk: int = 2  # DNA only
-    capacity: int = 64  # DNA only
+    n_hops: int = 8
+    n_modules: int = 8
+    topk: int = 1
+    capacity: int = 256
     mlp_mult: int = 4
     dropout: float = 0.1
     rope_base: float = 10_000.0
 
-    # routing temps (DNA uses; Dense ignores)
     router_temp: float = 1.0
     select_temp: float = 1.0
     gumbel_tau: float = 1.0
@@ -60,7 +59,7 @@ class Config:
     # logging/eval
     eval_every: int = 100
     log_every: int = 10
-    eval_samples: int = 16_384
+    eval_samples: int = 2048
     n_examples: int = 5
     gen_len: int = 200
 
@@ -77,16 +76,13 @@ def make_modules(
     dropout: float,
     key: jax.Array,
 ) -> Tuple[eqx.Module, ...]:
-    n_att = (n_modules + 2) // 3
-    n_ff = (n_modules + 1) // 3
-    n_id = n_modules - n_att - n_ff
+    half = n_modules // 2
     keys = list(jax.random.split(key, n_modules))
-    keys_att = keys[:n_att]
-    keys_ff = keys[n_att : n_att + n_ff]
+    keys_att = keys[:half]
+    keys_ff = keys[half :]
     attn = [Attention(d_model, n_heads, dropout, key=k) for k in keys_att]
     ffn = [FeedForward(d_model, mlp_mult, dropout, key=k) for k in keys_ff]
-    ident = [Identity() for _ in range(n_id)]
-    return tuple(attn + ffn + ident)
+    return tuple(attn + ffn)
 
 
 def make_backbone(
@@ -239,7 +235,7 @@ def main():
     if cfg.model_type.lower() == "dna":
         run_name += f"-k{cfg.topk}-c{cfg.capacity}"
 
-    wandb.init(project="dna-model", name=run_name, config=asdict(cfg))
+    wandb.init(project="dna-model-v2", name=run_name, config=asdict(cfg))
 
     tok = AutoTokenizer.from_pretrained("gpt2")
     tok.pad_token = tok.eos_token
@@ -289,7 +285,7 @@ def main():
     opt = optax.chain(
         optax.clip_by_global_norm(cfg.clip),
         optax.adamw(
-            learning_rate=schedule_fn, b1=0.9, b2=0.95, eps=1e-8, weight_decay=cfg.wd
+            learning_rate=schedule_fn, b1=0.9, b2=0.95, eps=1e-15, weight_decay=cfg.wd
         ),
     )
     opt_state = opt.init(eqx.filter(model, eqx.is_array))

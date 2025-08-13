@@ -8,11 +8,6 @@ import equinox as eqx
 from typing import Optional, List, Dict, Any
 
 
-# ============================================================================
-# Autoregressive generation (full-context per step; causal masking)
-# ============================================================================
-
-
 def sample(
     model: eqx.Module,
     prompt_ids: Int[Array, "T0"],
@@ -38,7 +33,6 @@ def sample(
     tokens: Int[Array, "T"] = jnp.full((total_len,), pad_id, dtype=jnp.int32)
     tokens = tokens.at[:prompt_len].set(prompt_ids)
 
-    # ---- Greedy override if temperature <= 0 ----
     force_greedy = greedy or (temperature <= 0.0)
 
     def step(carry, _):
@@ -53,7 +47,7 @@ def sample(
             key=subkey,
             inference=True,
             mask=attn_mask,
-            gumbel_tau=gumbel_tau,  # ignored at inference=True
+            gumbel_tau=gumbel_tau,  
             router_temp=router_temp,
             select_temp=select_temp,
         )
@@ -76,7 +70,6 @@ def sample(
             operand=subkey,
         )
 
-        # After EOS, keep writing PAD
         next_tok = jax.lax.select(done, jnp.asarray(pad_id, jnp.int32), next_tok)
 
         toks = toks.at[cur].set(next_tok)

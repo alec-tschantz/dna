@@ -901,8 +901,5 @@ def log_routing_sankey_if_available(
     wandb.log({"routing/transition_heatmap": wandb.Image(fig_hm), "step": step})
     plt.close(fig_hm)
 
-    print(
-        f"[Routing Sankey] step={step} | hops={H} | experts={E} | nodes={len(node_labels)} | "
-        f"links={len(link_val)} | link_mass={total_links} | coverage={coverage:.2f}"
-    )
+ 
     return fig_sankey

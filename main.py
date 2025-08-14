@@ -32,7 +32,7 @@ class Config:
     n_heads: int = 16
     n_hops: int = 6
     n_modules: int = 16
-    topk: int = 1  
+    topk: int = 2  
     capacity: int = 64
     mlp_mult: int = 4
     dropout: float = 0.1
@@ -57,7 +57,7 @@ class Config:
     seed: int = 0
 
     # logging/eval
-    wandb_project: str = "dna-model-v2"
+    wandb_project: str = "dna-slurm"
     eval_every: int = 200
     log_every: int = 10
     eval_samples: int = 2048
@@ -77,16 +77,16 @@ def make_modules(
     dropout: float,
     key: jax.Array,
 ) -> Tuple[eqx.Module, ...]:
-    n_att = n_modules // 2
-    n_ff = n_modules // 2
-    # n_id = n_modules // 3
+    n_att = n_modules // 3
+    n_ff = n_modules // 3
+    n_id = n_modules // 3
     keys = list(jax.random.split(key, n_modules))
     keys_att = keys[:n_att]
-    keys_ff = keys[n_att:]
+    keys_ff = keys[n_att: n_att + n_ff]
     attn = [Attention(d_model, n_heads, dropout, key=k) for k in keys_att]
     ffn = [FeedForward(d_model, mlp_mult, dropout, key=k) for k in keys_ff]
-    # ident = [Identity() for _ in range(n_id)]
-    return tuple(attn + ffn)
+    ident = [Identity() for _ in range(n_id)]
+    return tuple(attn + ffn + ident)
 
 
 def make_backbone(
@@ -294,7 +294,7 @@ def main():
     opt = optax.chain(
         optax.clip_by_global_norm(cfg.clip),
         optax.adamw(
-            learning_rate=schedule_fn, b1=0.9, b2=0.95, eps=1e-15, weight_decay=cfg.wd
+            learning_rate=schedule_fn, b1=0.9, b2=0.95, eps=1e-8, weight_decay=cfg.wd
         ),
     )
     opt_state = opt.init(eqx.filter(model, eqx.is_array))

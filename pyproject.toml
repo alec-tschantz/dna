@@ -23,6 +23,7 @@ dependencies = [
   "datasets",
   "transformers",
   "numpy",
+  "plotly",
 ]
 
 [tool.setuptools.packages.find]

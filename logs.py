@@ -4,7 +4,7 @@
 from __future__ import annotations
 from typing import Any, Dict, List, Tuple, Optional
 import textwrap
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 from datetime import datetime
 import json
@@ -14,8 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.patches import FancyBboxPatch, Patch
+from matplotlib.patches import FancyBboxPatch
 import wandb
 
 from dna import generate
@@ -35,6 +34,7 @@ def log_checkpoint(
     opt_state,
     lr_value: float,
 ):
+    """Save model/optimizer + minimal JSON meta."""
     ckpt_dir = Path(cfg.ckpt_dir) / run_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -74,13 +74,13 @@ def log_initial_stats(
     first_batch: Dict[str, Any],
     *,
     cfg: Any = None,
-    seq_len: int,
+    seq_len: int = 0,
     capacity: Optional[int] = None,
     topk: Optional[int] = None,
     n_hops: Optional[int] = None,
     model_type: str = "dna",
 ) -> None:
-    """Log initial model and data statistics."""
+    """Log initial model + data stats. (API unchanged)"""
     n_params = count_params(model)
     lmean, lmin, lmax, pmean = batch_seq_stats(
         jnp.asarray(first_batch["attention_mask"]), seq_len
@@ -125,8 +125,7 @@ def log_train_step(
     stats,
     model_kwargs: Dict[str, jax.Array],
 ):
-    """Log training step metrics."""
-    # Core training metrics
+    """Log training metrics + router metrics. (API unchanged)"""
     train_logs = {
         "train/loss": float(loss),
         "train/acc": float(acc),
@@ -139,10 +138,8 @@ def log_train_step(
         "step": step,
     }
 
-    # Routing metrics (only if model has routers)
     if has_routing(model) and isinstance(stats, (tuple, list)) and len(stats) > 0:
         stats_host = jax.tree_util.tree_map(jax.device_get, stats)
-
         router_logs = {
             "router/norm": router_l2_norm(model),
             "router/temps/router": float(
@@ -156,7 +153,6 @@ def log_train_step(
             ),
             "step": step,
         }
-
         router_logs.update(
             routing_metrics_from_stats(
                 stats_host,
@@ -165,7 +161,6 @@ def log_train_step(
             )
         )
         router_logs.update(_extra_routing_metrics(stats_host, prefix="router/train"))
-
         wandb.log({**train_logs, **router_logs})
     else:
         wandb.log(train_logs)
@@ -183,10 +178,11 @@ def run_eval_suite(
     model_kwargs_train: Dict[str, jax.Array],
     sample_batch_fn,
 ):
-    """Run comprehensive evaluation suite including routing analysis."""
-    import numpy as np
-
-    # Evaluation loss/accuracy
+    """
+    Eval: loss/acc + routing visuals + Path Diversity + Token↔Path Specialization + generate.
+    (API unchanged; returns updated key)
+    """
+    # ---- core eval ----
     key, eval_key = jax.random.split(key)
     eval_batch = sample_batch_fn(val_stream, cfg.eval_samples // cfg.seq_len)
     eval_kwargs = {
@@ -200,14 +196,13 @@ def run_eval_suite(
             dtype=jnp.float32,
         ),
     }
-
     val_loss, val_acc = eval_step_fn(
         model, eval_batch, key=eval_key, model_kwargs=eval_kwargs
     )
     wandb.log({"eval/loss": float(val_loss), "eval/acc": float(val_acc), "step": step})
     print(f"  [Eval] Loss: {float(val_loss):.4f} | Acc: {float(val_acc):.4f}")
 
-    # Routing visualizations
+    # ---- routing visuals ----
     key, vis_key = jax.random.split(key)
     vis_batch = sample_batch_fn(val_stream, min(16, cfg.batch_size))
 
@@ -237,31 +232,23 @@ def run_eval_suite(
         by_type=False,
     )
 
-    # Path analysis
-    key, path_key = jax.random.split(key)
-    path_analysis = analyze_routing_paths(
+    # ---- Path Diversity ----
+    key, div_key = jax.random.split(key)
+    div = analyze_path_diversity(
         model,
         vis_batch,
-        tok,
-        key=path_key,
+        key=div_key,
         gumbel_tau=0.0,
         router_temp=float(eval_kwargs["router_temp"][0]),
         select_temp=float(eval_kwargs["select_temp"][0]),
-        top_k_paths=15,
-        samples_per_path=8,
+        top_paths=14,
     )
+    if div is not None:
+        plot_path_diversity_dashboard(div, step)
 
-    if path_analysis is not None:
-        plot_path_analysis(path_analysis, step)
-        if path_analysis["top_paths"]:
-            print(
-                f"  [Path Analysis] Unique paths: {path_analysis['unique_paths']}, "
-                f"Top path frequency: {path_analysis['top_paths'][0][1]/path_analysis['total_tokens']*100:.1f}%"
-            )
-
-    # Module specialization analysis
+    # ---- Token↔Path Specialization ----
     key, spec_key = jax.random.split(key)
-    specialization_data = analyze_module_specialization(
+    spec = analyze_token_path_specialization(
         model,
         vis_batch,
         tok,
@@ -269,24 +256,14 @@ def run_eval_suite(
         gumbel_tau=0.0,
         router_temp=float(eval_kwargs["router_temp"][0]),
         select_temp=float(eval_kwargs["select_temp"][0]),
-        n_batches=1,
+        max_paths=10,
+        min_token_count=6,
     )
+    if spec is not None:
+        plot_token_path_specialization(spec, step)
+        log_token_path_sankey(spec, step)  # optional, Plotly
 
-    if specialization_data is not None:
-        plot_module_specialization(specialization_data, step)
-
-        # Print summary statistics
-        module_stats = specialization_data["module_stats"]
-        diversities = [m.get("token_diversity", 0.0) for m in module_stats.values()]
-        if diversities:
-            avg_diversity = np.mean(diversities)
-            most_used = max(module_stats.items(), key=lambda x: x[1]["total_usage"])
-            print(
-                f"  [Module Spec] Avg token diversity: {avg_diversity:.3f}, "
-                f"Most used: Module {most_used[0]} ({most_used[1]['type']})"
-            )
-
-    # Text generation
+    # ---- generation ----
     key, gen_key = jax.random.split(key)
     prompts = [
         "Once upon a time, ",
@@ -295,7 +272,6 @@ def run_eval_suite(
         "One sunny morning, ",
         "The brave knight ",
     ]
-
     results = generate(
         model,
         tok,
@@ -312,22 +288,16 @@ def run_eval_suite(
     print("\n" + "=" * 60)
     print("Generated Examples")
     print("=" * 60)
-
     for r in results:
         p = r["prompt"]
         for comp in r["completions"]:
-            text = comp["text"]
-            preview = text.replace("\n", "\\n")
-
+            text = comp["text"].replace("\n", "\\n")
             print(f"\nPrompt: {p}")
             print(
-                f"Completion [{comp['length']} tokens]"
-                f"{' (eos)' if comp['stopped_eos'] else ''}:"
+                f"Completion [{comp['length']} tokens]{' (eos)' if comp['stopped_eos'] else ''}:"
             )
-
-            for line in textwrap.wrap(preview, width=100, break_long_words=False):
+            for line in textwrap.wrap(text, width=100, break_long_words=False):
                 print(line)
-
             print("-" * 40)
 
     return key
@@ -339,13 +309,11 @@ def run_eval_suite(
 
 
 def count_params(tree) -> int:
-    """Count total parameters in a model."""
     leaves = jax.tree_util.tree_leaves(eqx.filter(tree, eqx.is_array))
     return int(sum(x.size for x in leaves))
 
 
 def l2_tree_norm(tree) -> float:
-    """Compute L2 norm of all parameters."""
     leaves = jax.tree_util.tree_leaves(eqx.filter(tree, eqx.is_array))
     if not leaves:
         return 0.0
@@ -354,7 +322,6 @@ def l2_tree_norm(tree) -> float:
 
 
 def batch_seq_stats(mask: jnp.ndarray, seq_len: int) -> Tuple[float, int, int, float]:
-    """Compute sequence length statistics from attention mask."""
     lens = jnp.sum(mask, axis=1)
     return (
         float(jnp.mean(lens)),
@@ -365,12 +332,10 @@ def batch_seq_stats(mask: jnp.ndarray, seq_len: int) -> Tuple[float, int, int, f
 
 
 def has_routing(model) -> bool:
-    """Check if model has routing capabilities."""
     return hasattr(model, "routers") and getattr(model, "routers") is not None
 
 
 def router_l2_norm(model) -> float:
-    """Compute L2 norm of router parameters."""
     if has_routing(model):
         leaves = jax.tree_util.tree_leaves(eqx.filter(model.routers, eqx.is_array))
         if not leaves:
@@ -386,7 +351,7 @@ def router_l2_norm(model) -> float:
 
 
 def _extra_routing_metrics(stats_host, prefix: str) -> Dict[str, float]:
-    """Compute additional routing metrics from stats."""
+    """Extra routing metrics."""
     if not isinstance(stats_host, (tuple, list)) or len(stats_host) == 0:
         return {}
 
@@ -427,7 +392,7 @@ def _extra_routing_metrics(stats_host, prefix: str) -> Dict[str, float]:
 def routing_metrics_from_stats(
     stats_host, *, prefix: str, capacity: Optional[int] = None
 ) -> Dict[str, float]:
-    """Compute routing metrics from hop statistics."""
+    """Aggregate per-hop stats into scalar logs."""
     if not isinstance(stats_host, (tuple, list)) or len(stats_host) == 0:
         return {}
 
@@ -495,7 +460,7 @@ def routing_metrics_from_stats(
 
 
 def _expert_meta(model) -> Optional[Dict[str, Any]]:
-    """Extract expert metadata from model."""
+    """Collect labels/types for each expert from model.groups."""
     if not has_routing(model) or not hasattr(model, "groups") or len(model.groups) == 0:
         return None
 
@@ -511,11 +476,9 @@ def _expert_meta(model) -> Optional[Dict[str, Any]]:
         tname = type(g["static"]).__name__
         cnt = counters.get(tname, 0)
         idxs = list(map(int, jax.device_get(g["idx"]).tolist()))
-
         for i, e_idx in enumerate(idxs):
             labels[e_idx] = f"{tname}_{cnt + i}"
             types[e_idx] = tname
-
         counters[tname] = cnt + len(idxs)
 
     for i in range(E):
@@ -548,7 +511,7 @@ def _forward_batched_for_stats(
     router_temp: float,
     select_temp: float,
 ):
-    """Forward pass to collect routing statistics."""
+    """Run model across batch to collect per-hop routing stats."""
 
     def fwd(x, m, k):
         _, stats = model(
@@ -566,7 +529,6 @@ def _forward_batched_for_stats(
 
 
 def _type_base_cmap(type_name: str) -> str:
-    """Get colormap for module type."""
     t = type_name.lower()
     if "ttent" in t:
         return "Blues"
@@ -578,7 +540,7 @@ def _type_base_cmap(type_name: str) -> str:
 
 
 def _expert_color_table(meta) -> np.ndarray:
-    """Create color table for experts based on their types."""
+    """RGBA per expert, grouped by type with graded shades."""
     type_ids = np.asarray(meta["expert_type_ids"])
     id_to_type = list(meta["id_to_type"])
     E = type_ids.shape[0]
@@ -588,15 +550,12 @@ def _expert_color_table(meta) -> np.ndarray:
         idxs = np.where(type_ids == t_id)[0]
         if idxs.size == 0:
             continue
-
         cmap = plt.get_cmap(_type_base_cmap(t_name))
         shades = [0.75] if idxs.size == 1 else np.linspace(0.35, 0.95, idxs.size)
-
         for j, e in enumerate(sorted(idxs.tolist())):
             rgba = np.array(cmap(float(shades[j])))
             rgba[3] = 1.0
             colors[e] = rgba
-
     return colors
 
 
@@ -615,7 +574,7 @@ def evaluate_for_visuals(
     select_temp: float,
     num_examples: int = 2,
 ):
-    """Evaluate model and collect visualization data."""
+    """Collect batch + per-example routing info for visuals."""
     if not has_routing(model):
         return None, None
 
@@ -633,7 +592,6 @@ def evaluate_for_visuals(
         router_temp=router_temp,
         select_temp=select_temp,
     )
-
     if not isinstance(stats, (tuple, list)) or len(stats) == 0:
         return None, None
 
@@ -644,7 +602,7 @@ def evaluate_for_visuals(
     n_hops = len(stats)
     E = meta["n_experts"]
 
-    # Collect importance matrix
+    # Average importance per hop over batch
     importance_matrix = []
     for hop_stats in stats:
         imp_be = hop_stats["importance"]
@@ -655,7 +613,7 @@ def evaluate_for_visuals(
         importance_matrix.append(avg)
     importance_matrix = jnp.stack(importance_matrix, axis=0)
 
-    # Sample examples for detailed visualization
+    # sample a few sequences for token-flow visual
     S = int(min(num_examples, B))
     sel_idx = jax.random.choice(
         jax.random.fold_in(key, 123), B, shape=(S,), replace=False
@@ -706,7 +664,7 @@ def evaluate_for_visuals(
 
 
 def plot_heatmap(batch_stats: Dict[str, Any], step: int) -> None:
-    """Plot expert importance heatmap."""
+    """Expert importance heatmap (hop × expert)."""
     if batch_stats is None:
         return
 
@@ -727,7 +685,7 @@ def plot_heatmap(batch_stats: Dict[str, Any], step: int) -> None:
     ax.set_yticks(range(imp.shape[1]))
     ax.set_yticklabels(labels)
 
-    plt.tight_layout()
+    # plt.tight_layout()
     wandb.log({"routing/heatmap": wandb.Image(fig), "step": step})
     plt.close(fig)
 
@@ -741,18 +699,19 @@ def plot_token_flow_rich(
     max_tokens: int = 96,
     title: str = "Token Routing Flow (top-1)",
 ):
-    """Plot token routing flow visualization."""
+    """Per-token top-1 expert per hop, colored by expert (with opacity by confidence)."""
     if example_stats is None or batch_stats is None:
         return
 
     H, S, T = np.asarray(example_stats["top1_expert"]).shape
     ids = np.asarray(example_stats["ids"])
     mask = np.asarray(example_stats["mask"]).astype(bool)
-
-    valid_pos = np.where(mask[0])[0] if S > 0 else np.array([], int)
-    if valid_pos.size == 0:
+    if S == 0:
         return
 
+    valid_pos = np.where(mask[0])[0]
+    if valid_pos.size == 0:
+        return
     Tvis = int(min(valid_pos.size, max_tokens))
     vis_idx = valid_pos[:Tvis]
     ids_vis = ids[0, vis_idx]
@@ -761,7 +720,6 @@ def plot_token_flow_rich(
         preview = tok.decode(ids_vis.tolist(), skip_special_tokens=True)
     except Exception:
         preview = "[decode error]"
-
     if len(preview) > 120:
         preview = preview[:117] + "..."
 
@@ -770,7 +728,6 @@ def plot_token_flow_rich(
     top1_prob = np.asarray(example_stats["top1_prob"])
     top1_type = np.asarray(example_stats["top1_type_id"])
     type_names = list(batch_stats["id_to_type"])
-
     initials = {
         t: (
             "A"
@@ -798,7 +755,6 @@ def plot_token_flow_rich(
     fig_h = max(5.5, 0.5 * H + 2.5)
     fig_w = max(14.0, 0.12 * Tvis + 8.0)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-
     ax.imshow(grid, aspect="auto", interpolation="nearest")
 
     if Tvis <= 120:
@@ -819,7 +775,7 @@ def plot_token_flow_rich(
     ax.set_xticks([])
     ax.set_title(f"{title} • step {step}\npreview: {preview}", pad=10)
 
-    plt.tight_layout()
+    # plt.tight_layout()
     wandb.log({"routing/token_flow_rich": wandb.Image(fig), "step": step})
     plt.close(fig)
 
@@ -837,7 +793,7 @@ def log_routing_visuals_if_available(
     num_examples: int = 1,
     max_tokens_grid: int = 96,
 ):
-    """Log routing visualizations if model has routing."""
+    """Run + log heatmap and token-flow if routing is present."""
     if not has_routing(model):
         return None, None
 
@@ -861,7 +817,7 @@ def log_routing_visuals_if_available(
 
 
 # =============================================================================
-# Advanced routing analysis functions
+# Advanced routing analysis: Sankey + transitions
 # =============================================================================
 
 
@@ -874,7 +830,7 @@ def _collect_top1_indices_all(
     router_temp: float,
     select_temp: float,
 ):
-    """Collect top-1 routing decisions for all tokens."""
+    """Get top-1 expert per token per hop for an entire batch."""
     if not has_routing(model):
         return None, None, None
 
@@ -892,7 +848,6 @@ def _collect_top1_indices_all(
         router_temp=router_temp,
         select_temp=select_temp,
     )
-
     if not isinstance(stats, (tuple, list)) or len(stats) == 0:
         return None, None, None
 
@@ -901,7 +856,6 @@ def _collect_top1_indices_all(
         p = jnp.asarray(hop["routing_probs"])
         idx = jnp.argmax(p, axis=-1)
         top1_idx.append(idx)
-
     top1 = jnp.stack(top1_idx, axis=0)
 
     meta = _expert_meta(model)
@@ -912,8 +866,7 @@ def _collect_top1_indices_all(
 
 
 def _rgba_to_plotly(rgba: np.ndarray, alpha: float = 0.8) -> str:
-    """Convert RGBA array to plotly color string."""
-    r, g, b, a = (np.clip(rgba, 0.0, 1.0) * 255.0).astype(int)
+    r, g, b, _ = (np.clip(rgba, 0.0, 1.0) * 255.0).astype(int)
     return f"rgba({r},{g},{b},{alpha})"
 
 
@@ -930,7 +883,7 @@ def log_routing_sankey_if_available(
     min_frac: float = 0.01,
     by_type: bool = False,
 ):
-    """Create Sankey diagram of token routing paths."""
+    """Interactive Sankey of token routing transitions + transition heatmaps."""
     try:
         import plotly.graph_objects as go
     except ImportError:
@@ -944,7 +897,6 @@ def log_routing_sankey_if_available(
         router_temp=router_temp,
         select_temp=select_temp,
     )
-
     if top1 is None:
         return None
 
@@ -955,10 +907,9 @@ def log_routing_sankey_if_available(
     labels_all = list(meta["expert_labels"])
     expert_rgba = _expert_color_table(meta)
 
-    # Compute transition flows
+    # transitions per adjacent hop
     flows = []
     mask_flat = np.asarray(mask_bt).reshape(-1)
-
     for h in range(H - 1):
         a = np.asarray(top1[h]).reshape(-1)[mask_flat]
         b = np.asarray(top1[h + 1]).reshape(-1)[mask_flat]
@@ -975,7 +926,7 @@ def log_routing_sankey_if_available(
         for t in type_names
     }
 
-    # Build Sankey nodes and links
+    # nodes + links
     node_id = {}
     node_labels, node_colors = [], []
 
@@ -983,7 +934,6 @@ def log_routing_sankey_if_available(
         key_ = (h, int(e))
         if key_ in node_id:
             return node_id[key_]
-
         base = (
             labels_all[int(e)]
             or f"{initials[type_names[int(type_ids[int(e)])]]}{int(e)}"
@@ -995,12 +945,10 @@ def log_routing_sankey_if_available(
         return node_id[key_]
 
     link_src, link_tgt, link_val, link_col = [], [], [], []
-
     for h, mat in enumerate(flows):
         total = float(mat.sum())
         if total <= 0:
             continue
-
         flat = mat.flatten()
         k = min(top_paths_per_hop, flat.size)
         thr = max(int(min_frac * total), 1)
@@ -1016,12 +964,10 @@ def log_routing_sankey_if_available(
             v = int(flat[idx])
             if v <= 0:
                 continue
-
             e0 = idx // E
             e1 = idx % E
             s = _ensure_node(h, e0)
             t = _ensure_node(h + 1, e1)
-
             link_src.append(s)
             link_tgt.append(t)
             link_val.append(v)
@@ -1031,7 +977,6 @@ def log_routing_sankey_if_available(
     total_tokens = int(np.sum([m.sum() for m in flows])) if flows else 0
     coverage = (total_links / max(total_tokens, 1)) if total_tokens else 0.0
 
-    # Create Sankey figure
     fig_sankey = go.Figure(
         data=[
             go.Sankey(
@@ -1050,27 +995,23 @@ def log_routing_sankey_if_available(
             )
         ]
     )
-
     fig_sankey.update_layout(
         title=(
-            f"Routing Token Paths • step {step} • "
-            f"nodes={len(node_labels)} • links={len(link_val)} • "
-            f"cov={coverage:.2f}"
+            f"Routing Token Paths • step {step} • nodes={len(node_labels)} • "
+            f"links={len(link_val)} • cov={coverage:.2f}"
         ),
         font=dict(size=12),
         height=520,
         margin=dict(l=10, r=10, t=50, b=10),
     )
-
     wandb.log({"routing/sankey": fig_sankey, "step": step})
 
-    # Create transition heatmaps
+    # transition heatmaps (matplotlib)
     if flows:
         ncols = min(3, max(1, len(flows)))
         nrows = int(np.ceil(len(flows) / ncols))
         fig_hm, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
         axes = np.atleast_1d(axes).ravel()
-
         for i, mat in enumerate(flows):
             ax = axes[i]
             im = ax.imshow(mat, aspect="auto", cmap="magma")
@@ -1078,33 +1019,31 @@ def log_routing_sankey_if_available(
             ax.set_xlabel("Expert @ hop+1")
             ax.set_ylabel("Expert @ hop")
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
         for j in range(len(flows), len(axes)):
             axes[j].axis("off")
-
-        plt.tight_layout()
+        # plt.tight_layout()
         wandb.log({"routing/transition_heatmap": wandb.Image(fig_hm), "step": step})
         plt.close(fig_hm)
 
     return fig_sankey
 
 
-def analyze_routing_paths(
+# =============================================================================
+# Path Diversity
+# =============================================================================
+
+
+def analyze_path_diversity(
     model,
     batch: Dict[str, Any],
-    tok,
     *,
     key: jax.Array,
     gumbel_tau: float,
     router_temp: float,
     select_temp: float,
-    top_k_paths: int = 10,
-    samples_per_path: int = 5,
+    top_paths: int = 12,
 ):
-    """Analyze most common routing paths."""
-    if not has_routing(model):
-        return None
-
+    """Compute entropy, effective #paths, Gini, coverage + top-N barcodes."""
     top1, mask_bt, meta = _collect_top1_indices_all(
         model,
         batch,
@@ -1113,216 +1052,190 @@ def analyze_routing_paths(
         router_temp=router_temp,
         select_temp=select_temp,
     )
-
     if top1 is None:
         return None
 
     H, B, T = top1.shape
+    mask_np = np.asarray(mask_bt)
+    ids_np = np.asarray(batch["input_ids"])
 
-    # Create path signatures
     paths = []
     token_ids = []
-    positions = []
-
-    ids_np = np.asarray(batch["input_ids"])
-    mask_np = np.asarray(mask_bt)
-
     for b in range(B):
         for t in range(T):
             if not mask_np[b, t]:
                 continue
-
-            path = tuple(int(top1[h, b, t]) for h in range(H))
-            paths.append(path)
+            paths.append(tuple(int(top1[h, b, t]) for h in range(H)))
             token_ids.append(int(ids_np[b, t]))
-            positions.append((b, t))
+    if not paths:
+        return None
 
-    # Count path frequencies
-    path_counts = Counter(paths)
-    top_paths = path_counts.most_common(top_k_paths)
+    counts = Counter(paths)
+    total = sum(counts.values())
+    items = counts.most_common()
+    probs = np.array([c / total for _, c in items], dtype=np.float64)
 
-    # Collect examples for each top path
-    path_examples = {}
-    for path, count in top_paths:
-        path_tokens = [token_ids[i] for i, p in enumerate(paths) if p == path]
-        path_positions = [positions[i] for i, p in enumerate(paths) if p == path]
+    # diversity metrics
+    H_shannon = float(-(probs * np.log(probs + 1e-12)).sum())
+    unique = len(items)
+    H_norm = float(H_shannon / max(np.log(max(unique, 1)), 1e-12))  # 0..1
+    eff_num = float(np.exp(H_shannon))  # effective #paths
 
-        sample_size = min(samples_per_path, len(path_tokens))
-        if sample_size > 0:
-            sample_indices = np.random.choice(
-                len(path_tokens), sample_size, replace=False
-            )
-            sampled_tokens = [path_tokens[i] for i in sample_indices]
-            sampled_positions = [path_positions[i] for i in sample_indices]
+    p_sorted = np.sort(probs)
+    cum = np.cumsum(p_sorted)
+    lorenz = np.concatenate([[0.0], cum])
+    area = np.trapz(lorenz, dx=1.0 / len(p_sorted))
+    gini = float(1.0 - 2.0 * area)
 
-            # Decode tokens
-            decoded = []
-            for tid in sampled_tokens:
-                try:
-                    text = tok.decode([tid], skip_special_tokens=True)
-                    text = text.replace(" ", "␣") if text else "·"
-                    decoded.append(text)
-                except:
-                    decoded.append("?")
+    def topk_cov(k: int) -> float:
+        return float(sum(c for _, c in items[:k]) / total)
 
-            # Get context for examples
-            contexts = []
-            for b, t in sampled_positions[:3]:
-                start = max(0, t - 2)
-                end = min(T, t + 3)
-                context_ids = ids_np[b, start:end].tolist()
-                try:
-                    context_text = tok.decode(context_ids, skip_special_tokens=True)
-                    if t - start == 2:
-                        tokens = context_text.split()
-                        if len(tokens) > 2:
-                            tokens[2] = f"[{tokens[2]}]"
-                        context_text = " ".join(tokens)
-                except:
-                    context_text = "?"
-                contexts.append(context_text)
+    cov5, cov10, cov20 = topk_cov(5), topk_cov(10), topk_cov(20)
 
-            path_examples[path] = {
-                "count": count,
-                "frequency": count / len(paths) if paths else 0,
-                "tokens": sampled_tokens,
-                "decoded": decoded,
-                "contexts": contexts,
-                "expert_types": [meta["expert_types"][e] for e in path],
-            }
+    expert_rgba = _expert_color_table(meta)
+    topN = items[:top_paths]
 
-    return {
-        "top_paths": top_paths,
-        "path_examples": path_examples,
-        "total_tokens": len(paths),
-        "unique_paths": len(path_counts),
-        "meta": meta,
-    }
+    return dict(
+        meta=meta,
+        H=H,
+        total_tokens=total,
+        unique_paths=unique,
+        shannon=H_shannon,
+        shannon_norm=H_norm,
+        effective_paths=eff_num,
+        gini=gini,
+        coverage={5: cov5, 10: cov10, 20: cov20},
+        probs=probs,
+        items=items,
+        topN=topN,
+        expert_rgba=expert_rgba,
+    )
 
 
-def plot_path_analysis(path_analysis: Dict[str, Any], step: int):
-    """Create path analysis visualizations."""
-    if path_analysis is None:
+def plot_path_diversity_dashboard(div: Dict[str, Any], step: int):
+    """Multi-panel summary (metric tiles, Lorenz, top paths, barcodes)."""
+    if div is None:
         return
 
-    fig = plt.figure(figsize=(20, 12))
+    topN = div["topN"]
+    H = div["H"]
+    expert_rgba = div["expert_rgba"]
 
-    # Path frequency bar chart
-    ax1 = plt.subplot(2, 3, 1)
-    paths = []
-    counts = []
-    for i, (path, count) in enumerate(path_analysis["top_paths"][:10]):
-        paths.append(f"Path {i+1}")
-        counts.append(count)
+    # figure grid
+    fig = plt.figure(figsize=(18, 11))
+    gs = fig.add_gridspec(2, 3, height_ratios=[1.1, 1.4], wspace=0.25, hspace=0.35)
 
-    bars = ax1.barh(paths[::-1], counts[::-1], color="steelblue")
-    ax1.set_xlabel("Token Count")
-    ax1.set_title(f"Top 10 Routing Paths (Step {step})")
+    # (A) metric tiles
+    axA = fig.add_subplot(gs[0, :])
+    axA.axis("off")
+    tiles = [
+        ("Unique paths", f"{div['unique_paths']:,}"),
+        ("Effective #paths", f"{div['effective_paths']:.1f}"),
+        ("Entropy (norm.)", f"{div['shannon_norm']:.2f}"),
+        ("Gini (↓ better spread)", f"{div['gini']:.2f}"),
+        ("Top-5 cov.", f"{div['coverage'][5]*100:.1f}%"),
+        ("Top-10 cov.", f"{div['coverage'][10]*100:.1f}%"),
+    ]
+    x = 0.02
+    for title, value in tiles:
+        box = FancyBboxPatch(
+            (x, 0.15),
+            0.15,
+            0.7,
+            boxstyle="round,pad=0.02,rounding_size=0.02",
+            linewidth=0.8,
+            edgecolor="#ddd",
+            facecolor="#f7f7f9",
+        )
+        axA.add_patch(box)
+        axA.text(
+            x + 0.075, 0.58, value, ha="center", va="center", fontsize=16, weight="bold"
+        )
+        axA.text(
+            x + 0.075, 0.36, title, ha="center", va="center", fontsize=10, color="#555"
+        )
+        x += 0.165
+    axA.set_title(
+        f"Path Diversity • step {step}", loc="left", fontsize=13, weight="bold"
+    )
 
-    for bar, count in zip(bars, counts[::-1]):
-        width = bar.get_width()
-        ax1.text(
-            width,
-            bar.get_y() + bar.get_height() / 2,
-            f"{count}",
-            ha="left",
-            va="center",
+    # (B) Lorenz curve
+    axB = fig.add_subplot(gs[1, 0])
+    p_sorted = np.sort(div["probs"])
+    L = np.concatenate([[0.0], np.cumsum(p_sorted)])
+    X = np.linspace(0, 1, len(L))
+    axB.plot(X, L, linewidth=2.2)
+    axB.plot([0, 1], [0, 1], linestyle="--", linewidth=1.0)
+    axB.set_xlabel("Cumulative fraction of paths")
+    axB.set_ylabel("Cumulative fraction of tokens")
+    axB.set_title(f"Lorenz Curve (Gini={div['gini']:.2f})")
+
+    # (C) Top paths bar chart
+    axC = fig.add_subplot(gs[1, 1])
+    labels = [f"P{i+1}" for i in range(len(topN))]
+    counts = [c for _, c in topN]
+    bars = axC.bar(labels, counts)
+    axC.set_ylabel("Token count")
+    axC.set_title("Top paths")
+    for b, c in zip(bars, counts):
+        axC.text(
+            b.get_x() + b.get_width() / 2,
+            b.get_height(),
+            f"{c}",
+            ha="center",
+            va="bottom",
             fontsize=9,
         )
 
-    # Path diversity pie chart
-    ax2 = plt.subplot(2, 3, 2)
-    top10_count = sum(c for _, c in path_analysis["top_paths"][:10])
-    other_count = path_analysis["total_tokens"] - top10_count
+    # (D) Path barcodes (rows = paths, cols = hops)
+    axD = fig.add_subplot(gs[1, 2])
+    color_grid = np.zeros((len(topN), H, 4), dtype=np.float32)
+    for i, (path, _) in enumerate(topN):
+        e_ids = np.array(path, dtype=int)
+        color_grid[i, :, :] = expert_rgba[e_ids]
+    axD.imshow(color_grid.swapaxes(0, 1), aspect="auto", interpolation="nearest")
+    axD.set_xlabel("Hop")
+    axD.set_ylabel("Top paths")
+    axD.set_yticks(range(H))
+    axD.set_yticklabels([f"H{h}" for h in range(H)])
+    axD.set_title("Path composition (expert color)")
 
-    sizes = [top10_count, other_count]
-    labels = [
-        f"Top 10 paths\n({top10_count:,} tokens)",
-        f"Other paths\n({other_count:,} tokens)",
-    ]
-    colors = ["coral", "lightgray"]
-
-    wedges, texts, autotexts = ax2.pie(
-        sizes, labels=labels, colors=colors, autopct="%1.1f%%", startangle=90
-    )
-    ax2.set_title(f'Path Diversity\n({path_analysis["unique_paths"]} unique paths)')
-
-    # Path details table
-    ax3 = plt.subplot(2, 3, 3)
-    ax3.axis("tight")
-    ax3.axis("off")
-
-    table_data = [["Path", "Frequency", "Expert Types", "Example Tokens"]]
-    for i, (path, examples) in enumerate(
-        list(path_analysis["path_examples"].items())[:5]
-    ):
-        path_str = "→".join(str(e) for e in path)
-        freq = f"{examples['frequency']*100:.1f}%"
-        types = "→".join(set(examples["expert_types"]))
-        tokens = ", ".join(examples["decoded"][:3])
-        table_data.append([path_str, freq, types, tokens])
-
-    table = ax3.table(cellText=table_data, loc="center", cellLoc="left")
-    table.auto_set_font_size(False)
-    table.set_fontsize(9)
-    table.scale(1.2, 1.5)
-
-    for i in range(len(table_data[0])):
-        table[(0, i)].set_facecolor("#4CAF50")
-        table[(0, i)].set_text_props(weight="bold", color="white")
-
-    ax3.set_title("Top 5 Path Details", pad=20)
-
-    # Path type composition
-    ax4 = plt.subplot(2, 3, 4)
-    type_patterns = {}
-    for path, examples in list(path_analysis["path_examples"].items())[:10]:
-        pattern = tuple(examples["expert_types"])
-        type_patterns[pattern] = type_patterns.get(pattern, 0) + examples["count"]
-
-    patterns = list(type_patterns.keys())[:5]
-    pattern_counts = [type_patterns[p] for p in patterns]
-    pattern_labels = ["→".join(p) for p in patterns]
-
-    bars = ax4.bar(range(len(pattern_counts)), pattern_counts, color="teal")
-    ax4.set_xticks(range(len(pattern_labels)))
-    ax4.set_xticklabels(pattern_labels, rotation=45, ha="right")
-    ax4.set_ylabel("Token Count")
-    ax4.set_title("Top Module Type Sequences")
-
-    # Example contexts
-    ax5 = plt.subplot(2, 1, 2)
-    ax5.axis("off")
-
-    text_content = "Example Token Contexts for Top Paths:\n\n"
-    for i, (path, examples) in enumerate(
-        list(path_analysis["path_examples"].items())[:3]
-    ):
-        path_str = "→".join(str(e) for e in path)
-        text_content += f"Path {i+1} ({path_str}):\n"
-        for j, context in enumerate(examples["contexts"][:2]):
-            text_content += f"  • {context}\n"
-        text_content += "\n"
-
-    ax5.text(
-        0.05,
-        0.95,
-        text_content,
-        transform=ax5.transAxes,
-        fontsize=10,
-        verticalalignment="top",
-        family="monospace",
-        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-    )
-
-    plt.suptitle(f"Routing Path Analysis - Step {step}", fontsize=14, fontweight="bold")
-    plt.tight_layout()
-
-    wandb.log({"routing/path_analysis": wandb.Image(fig), "step": step})
+    # plt.tight_layout()
+    wandb.log({"routing/path_diversity": wandb.Image(fig), "step": step})
     plt.close(fig)
 
 
-def analyze_module_specialization(
+# =============================================================================
+#  Token ↔ Path Specialization
+# =============================================================================
+
+
+def _tok_category(s: str) -> str:
+    """Simple token category buckets for diagnostics."""
+    if s is None or s == "":
+        return "other"
+    if s.startswith("Ċ") or s == "\n":
+        return "newline"
+    if s.startswith("Ġ"):
+        s = s[1:] or " "
+        if s.strip() == "":
+            return "space"
+        if s[:1].isalpha():
+            return "space+word"
+    if s.strip() == "":
+        return "space"
+    if any(ch.isdigit() for ch in s) and s.strip().isdigit():
+        return "digit"
+    if all(not ch.isalnum() and not ch.isspace() for ch in s):
+        return "punct"
+    if s[:1].isalpha() and s[:1].upper() == s[:1] and s[1:].lower() == s[1:]:
+        return "Capital"
+    if any(ch.isalpha() for ch in s):
+        return "word"
+    return "other"
+
+
+def analyze_token_path_specialization(
     model,
     batch: Dict[str, Any],
     tok,
@@ -1331,306 +1244,216 @@ def analyze_module_specialization(
     gumbel_tau: float,
     router_temp: float,
     select_temp: float,
-    n_batches: int = 1,
+    max_paths: int = 10,
+    min_token_count: int = 5,
 ):
-    """Analyze module specialization patterns."""
-    if not has_routing(model):
+    """Which tokens/categories best characterize each path (by lift)."""
+    top1, mask_bt, meta = _collect_top1_indices_all(
+        model,
+        batch,
+        key=key,
+        gumbel_tau=gumbel_tau,
+        router_temp=router_temp,
+        select_temp=select_temp,
+    )
+    if top1 is None:
         return None
 
-    # Initialize statistics collectors
-    module_stats = {}
-    all_token_associations = {}
+    H, B, T = top1.shape
+    ids_np = np.asarray(batch["input_ids"])
+    mask_np = np.asarray(mask_bt)
 
-    for batch_idx in range(n_batches):
-        top1, mask_bt, meta = _collect_top1_indices_all(
-            model,
-            batch,
-            key=key,
-            gumbel_tau=gumbel_tau,
-            router_temp=router_temp,
-            select_temp=select_temp,
-        )
+    # build (token -> path) assignments
+    paths: List[Tuple[int, ...]] = []
+    token_ids: List[int] = []
+    for b in range(B):
+        for t in range(T):
+            if not mask_np[b, t]:
+                continue
+            paths.append(tuple(int(top1[h, b, t]) for h in range(H)))
+            token_ids.append(int(ids_np[b, t]))
+    if not paths:
+        return None
 
-        if top1 is None:
-            continue
+    path_counts = Counter(paths)
+    top_paths = [p for p, _ in path_counts.most_common(max_paths)]
+    path_index = {p: i for i, p in enumerate(top_paths)}
 
-        H, B, T = top1.shape
-        E = meta["n_experts"]
+    token_global = Counter(token_ids)
 
-        ids_np = np.asarray(batch["input_ids"])
-        mask_np = np.asarray(mask_bt)
+    per_path_tokens = [Counter() for _ in top_paths]
+    for tid, p in zip(token_ids, paths):
+        if p in path_index:
+            per_path_tokens[path_index[p]][tid] += 1
 
-        # Initialize module stats if needed
-        if not module_stats:
-            for e in range(E):
-                module_stats[e] = {
-                    "hop_usage": np.zeros(H),
-                    "total_usage": 0,
-                    "type": meta["expert_types"][e],
-                    "label": meta["expert_labels"][e],
-                    "position_histogram": np.zeros(T),
-                    "token_ids": [],
-                }
-                all_token_associations[e] = []
+    categories = [
+        "space",
+        "newline",
+        "digit",
+        "punct",
+        "Capital",
+        "word",
+        "space+word",
+        "other",
+    ]
+    cat_index = {c: i for i, c in enumerate(categories)}
+    cat_matrix = np.zeros((len(top_paths), len(categories)), dtype=np.float32)
+    top_token_lists = []
+    counts_out = []
 
-        # Collect statistics
-        for h in range(H):
-            for b in range(B):
-                for t in range(T):
-                    if not mask_np[b, t]:
-                        continue
+    N_total = len(token_ids)
 
-                    expert = int(top1[h, b, t])
-                    module_stats[expert]["hop_usage"][h] += 1
-                    module_stats[expert]["total_usage"] += 1
-                    module_stats[expert]["position_histogram"][t] += 1
-                    module_stats[expert]["token_ids"].append(int(ids_np[b, t]))
+    for i, p in enumerate(top_paths):
+        total_p = sum(per_path_tokens[i].values())
+        counts_out.append(total_p)
+        token_list = []
+        for tid, cnt in per_path_tokens[i].most_common(200):
+            if token_global[tid] < min_token_count:
+                continue
+            p_token_given_path = cnt / max(total_p, 1)
+            p_token = token_global[tid] / max(N_total, 1)
+            lift = p_token_given_path / max(p_token, 1e-12)
+            try:
+                s = tok.decode([tid], skip_special_tokens=True) or "·"
+            except Exception:
+                s = "?"
+            token_list.append((s, cnt, float(lift), tid))
+            cat = _tok_category(s)
+            cat_matrix[i, cat_index[cat]] += cnt
 
-                    all_token_associations[expert].append(
-                        {
-                            "token_id": int(ids_np[b, t]),
-                            "hop": h,
-                            "position": t,
-                            "batch": batch_idx,
-                        }
-                    )
+        token_list.sort(key=lambda x: (x[2], x[1]), reverse=True)
+        top_token_lists.append(token_list[:10])
 
-    # Analyze token patterns for each module
-    for e in module_stats:
-        token_ids = module_stats[e]["token_ids"]
-        if token_ids:
-            token_counts = Counter(token_ids)
-            top_tokens = token_counts.most_common(10)
+    # normalize rows to show mix proportions
+    row_sum = cat_matrix.sum(axis=1, keepdims=True) + 1e-9
+    cat_norm = cat_matrix / row_sum
 
-            decoded_tokens = []
-            for tid, count in top_tokens:
-                try:
-                    text = tok.decode([tid], skip_special_tokens=True)
-                    text = text.replace(" ", "␣") if text else "·"
-                except:
-                    text = "?"
-                decoded_tokens.append((text, count))
-
-            module_stats[e]["top_tokens"] = decoded_tokens
-            module_stats[e]["token_diversity"] = len(set(token_ids)) / max(
-                len(token_ids), 1
-            )
-        else:
-            # Handle modules with no tokens
-            module_stats[e]["top_tokens"] = []
-            module_stats[e]["token_diversity"] = 0.0
-
-    return {
-        "module_stats": module_stats,
-        "token_associations": all_token_associations,
-        "meta": meta,
-        "n_hops": H,
-        "n_experts": E,
-    }
+    return dict(
+        meta=meta,
+        H=H,
+        top_paths=top_paths,
+        path_counts=counts_out,
+        categories=categories,
+        category_matrix=cat_norm,
+        top_tokens=top_token_lists,
+    )
 
 
-def plot_module_specialization(specialization_data: Dict[str, Any], step: int):
-    """Create module specialization visualizations."""
-    if specialization_data is None:
+def plot_token_path_specialization(spec: Dict[str, Any], step: int):
+    """Heatmap (categories×paths) + path barcodes + per-path token cards."""
+    if spec is None:
         return
 
-    module_stats = specialization_data["module_stats"]
-    n_experts = specialization_data["n_experts"]
-    n_hops = specialization_data["n_hops"]
+    paths = spec["top_paths"]
+    cat = spec["categories"]
+    M, C = len(paths), len(cat)
+    H = spec["H"]
 
-    fig = plt.figure(figsize=(24, 16))
+    expert_rgba = _expert_color_table(spec["meta"])
+    color_grid = np.zeros((M, H, 4), dtype=np.float32)
+    for i, path in enumerate(paths):
+        e_ids = np.array(path, dtype=int)
+        color_grid[i, :, :] = expert_rgba[e_ids]
 
-    # Hop specialization heatmap
-    ax1 = plt.subplot(3, 4, 1)
-    hop_matrix = np.zeros((n_experts, n_hops))
-    for e in range(n_experts):
-        if module_stats[e]["total_usage"] > 0:
-            hop_matrix[e] = (
-                module_stats[e]["hop_usage"] / module_stats[e]["total_usage"]
-            )
-
-    im1 = ax1.imshow(hop_matrix, aspect="auto", cmap="YlOrRd")
-    ax1.set_xlabel("Hop")
-    ax1.set_ylabel("Module")
-    ax1.set_title("Module Hop Specialization")
-    ax1.set_xticks(range(n_hops))
-    ax1.set_xticklabels([f"H{i}" for i in range(n_hops)])
-    plt.colorbar(im1, ax=ax1, label="Usage Fraction")
-
-    # Module usage distribution
-    ax2 = plt.subplot(3, 4, 2)
-    usage_counts = [module_stats[e]["total_usage"] for e in range(n_experts)]
-    colors_by_type = []
-    for e in range(n_experts):
-        t = module_stats[e]["type"].lower()
-        if "attention" in t:
-            colors_by_type.append("skyblue")
-        elif "feed" in t or "mlp" in t:
-            colors_by_type.append("coral")
-        else:
-            colors_by_type.append("lightgreen")
-
-    bars = ax2.bar(range(n_experts), usage_counts, color=colors_by_type)
-    ax2.set_xlabel("Module ID")
-    ax2.set_ylabel("Total Usage Count")
-    ax2.set_title("Module Usage Distribution")
-    ax2.set_xticks(range(0, n_experts, max(1, n_experts // 8)))
-
-    legend_elements = [
-        Patch(facecolor="skyblue", label="Attention"),
-        Patch(facecolor="coral", label="FeedForward"),
-        Patch(facecolor="lightgreen", label="Other"),
-    ]
-    ax2.legend(handles=legend_elements, loc="upper right")
-
-    # Token diversity per module
-    ax3 = plt.subplot(3, 4, 3)
-    diversities = [
-        module_stats[e].get("token_diversity", 0.0) for e in range(n_experts)
-    ]
-    scatter = ax3.scatter(
-        range(n_experts), diversities, c=usage_counts, cmap="viridis", s=50, alpha=0.6
-    )
-    ax3.set_xlabel("Module ID")
-    ax3.set_ylabel("Token Diversity (unique/total)")
-    ax3.set_title("Module Token Specialization")
-    plt.colorbar(scatter, ax=ax3, label="Usage Count")
-
-    # Position preference heatmap
-    ax4 = plt.subplot(3, 4, 4)
-    position_prefs = np.zeros((min(8, n_experts), 32))
-    for e in range(min(8, n_experts)):
-        hist = module_stats[e]["position_histogram"][:32]
-        if hist.sum() > 0:
-            position_prefs[e] = hist / hist.sum()
-
-    im4 = ax4.imshow(position_prefs, aspect="auto", cmap="Blues")
-    ax4.set_xlabel("Token Position")
-    ax4.set_ylabel("Module")
-    ax4.set_title("Position Preferences (first 8 modules)")
-    plt.colorbar(im4, ax=ax4, label="Preference")
-
-    # Top modules by hop
-    for hop_idx in range(min(4, n_hops)):
-        ax = plt.subplot(3, 4, 5 + hop_idx)
-
-        hop_usage = [
-            (e, module_stats[e]["hop_usage"][hop_idx]) for e in range(n_experts)
-        ]
-        hop_usage.sort(key=lambda x: x[1], reverse=True)
-        top_modules = hop_usage[:10]
-
-        modules = [f"M{e}" for e, _ in top_modules]
-        counts = [c for _, c in top_modules]
-        colors = []
-        for e, _ in top_modules:
-            t = module_stats[e]["type"].lower()
-            if "attention" in t:
-                colors.append("skyblue")
-            elif "feed" in t:
-                colors.append("coral")
-            else:
-                colors.append("lightgreen")
-
-        bars = ax.barh(modules[::-1], counts[::-1], color=colors[::-1])
-        ax.set_xlabel("Usage Count")
-        ax.set_title(f"Top Modules - Hop {hop_idx}")
-
-    # Module type distribution by hop
-    ax9 = plt.subplot(3, 4, 9)
-    type_by_hop = np.zeros((3, n_hops))
-
-    for e in range(n_experts):
-        t = module_stats[e]["type"].lower()
-        type_idx = 0 if "attention" in t else (1 if "feed" in t else 2)
-        for h in range(n_hops):
-            type_by_hop[type_idx, h] += module_stats[e]["hop_usage"][h]
-
-    hop_totals = type_by_hop.sum(axis=0, keepdims=True) + 1e-9
-    type_by_hop = type_by_hop / hop_totals
-
-    x = np.arange(n_hops)
-    width = 0.6
-
-    ax9.bar(x, type_by_hop[0], width, label="Attention", color="skyblue")
-    ax9.bar(
-        x,
-        type_by_hop[1],
-        width,
-        bottom=type_by_hop[0],
-        label="FeedForward",
-        color="coral",
-    )
-    ax9.bar(
-        x,
-        type_by_hop[2],
-        width,
-        bottom=type_by_hop[0] + type_by_hop[1],
-        label="Other",
-        color="lightgreen",
+    fig = plt.figure(figsize=(20, 12))
+    gs = fig.add_gridspec(
+        2,
+        2,
+        width_ratios=[1.2, 1.0],
+        height_ratios=[0.9, 1.1],
+        wspace=0.25,
+        hspace=0.35,
     )
 
-    ax9.set_xlabel("Hop")
-    ax9.set_ylabel("Fraction")
-    ax9.set_title("Module Type Distribution by Hop")
-    ax9.set_xticks(x)
-    ax9.set_xticklabels([f"H{i}" for i in range(n_hops)])
-    ax9.legend()
+    # (1) categories × paths heatmap
+    ax1 = fig.add_subplot(gs[0, 0])
+    im = ax1.imshow(spec["category_matrix"], aspect="auto", cmap="viridis")
+    ax1.set_yticks(range(M))
+    ax1.set_yticklabels([f"P{i+1}" for i in range(M)])
+    ax1.set_xticks(range(C))
+    ax1.set_xticklabels(cat, rotation=30, ha="right")
+    ax1.set_title("Token category mix per path (row-normalized)")
+    plt.colorbar(im, ax=ax1, fraction=0.046, pad=0.04)
 
-    # Token examples for selected modules
-    for i in range(3):
-        ax = plt.subplot(3, 4, 10 + i)
-        ax.axis("off")
+    # (2) path barcodes
+    ax2 = fig.add_subplot(gs[1, 0])
+    ax2.imshow(color_grid.swapaxes(0, 1), aspect="auto", interpolation="nearest")
+    ax2.set_xlabel("Hop")
+    ax2.set_ylabel("Paths")
+    ax2.set_yticks(range(H))
+    ax2.set_yticklabels([f"H{h}" for h in range(H)])
+    ax2.set_title("Path composition (expert color)")
 
-        if i == 0:
-            candidates = [
-                e
-                for e in range(n_experts)
-                if "attention" in module_stats[e]["type"].lower()
-            ]
-        elif i == 1:
-            candidates = [
-                e for e in range(n_experts) if "feed" in module_stats[e]["type"].lower()
-            ]
-        else:
-            candidates = list(range(n_experts))
-
-        if candidates:
-            if i < 2:
-                e = max(candidates, key=lambda x: module_stats[x]["total_usage"])
-            else:
-                e = max(
-                    candidates, key=lambda x: module_stats[x].get("token_diversity", 0)
-                )
-
-            info = module_stats[e]
-            text = f"Module {e} ({info['type']})\n"
-            text += f"Total usage: {info['total_usage']}\n"
-            text += f"Token diversity: {info.get('token_diversity', 0):.3f}\n"
-            text += f"Primary hop: {np.argmax(info['hop_usage']) if info['total_usage'] > 0 else 'N/A'}\n\n"
-            text += "Top tokens:\n"
-
-            if "top_tokens" in info and info["top_tokens"]:
-                for token, count in info["top_tokens"][:8]:
-                    text += f"  '{token}': {count}\n"
-            else:
-                text += "  No tokens routed to this module\n"
-
-            ax.text(
-                0.05,
-                0.95,
-                text,
-                transform=ax.transAxes,
-                fontsize=9,
-                verticalalignment="top",
-                family="monospace",
-                bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-            )
+    # (3) per-path diagnostic tokens
+    ax3 = fig.add_subplot(gs[:, 1])
+    ax3.axis("off")
+    y = 0.95
+    for i, tokens in enumerate(spec["top_tokens"]):
+        text = f"P{i+1}  (n={spec['path_counts'][i]})\n"
+        for s, cnt, lift, _ in tokens[:6]:
+            s_disp = s.replace("\n", "\\n")
+            text += f"   • '{s_disp}'  ×{cnt}   lift {lift:.1f}\n"
+        ax3.text(
+            0.02,
+            y,
+            text,
+            transform=ax3.transAxes,
+            va="top",
+            family="monospace",
+            bbox=dict(
+                boxstyle="round", facecolor="#f7f7f9", edgecolor="#ddd", alpha=1.0
+            ),
+        )
+        y -= 0.17
+        if y < 0.05:
+            break
 
     plt.suptitle(
-        f"Module Specialization Analysis - Step {step}", fontsize=16, fontweight="bold"
+        f"Token ↔ Path Specialization • step {step}", fontsize=15, fontweight="bold"
     )
-    plt.tight_layout()
-
-    wandb.log({"routing/module_specialization": wandb.Image(fig), "step": step})
+    # plt.tight_layout()
+    wandb.log({"routing/token_path_specialization": wandb.Image(fig), "step": step})
     plt.close(fig)
+
+
+def log_token_path_sankey(spec: Dict[str, Any], step: int):
+    """Optional Plotly Sankey: token categories → paths."""
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        return
+
+    cat = spec["categories"]
+    # approximate counts by mixing proportions × path counts
+    mat = (spec["category_matrix"] * np.array(spec["path_counts"])[:, None]).T
+    M = len(spec["top_paths"])
+    C = len(cat)
+
+    labels = [f"cat:{c}" for c in cat] + [f"path:P{i+1}" for i in range(M)]
+    colors = ["rgba(120,120,120,0.85)"] * C + ["rgba(52,152,219,0.85)"] * M
+
+    src, dst, val = [], [], []
+    for i in range(C):
+        for j in range(M):
+            w = float(mat[i, j])
+            if w <= 0:
+                continue
+            src.append(i)
+            dst.append(C + j)
+            val.append(w)
+
+    fig = go.Figure(
+        data=[
+            go.Sankey(
+                arrangement="snap",
+                node=dict(label=labels, color=colors, pad=12, thickness=16),
+                link=dict(source=src, target=dst, value=val),
+            )
+        ]
+    )
+    fig.update_layout(
+        title=f"Token Categories → Paths • step {step}",
+        height=480,
+        margin=dict(l=10, r=10, t=50, b=10),
+    )
+    wandb.log({"routing/token_path_sankey": fig, "step": step})

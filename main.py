@@ -58,7 +58,7 @@ class Config:
 
     # logging/eval
     wandb_project: str = "dna-model-v2"
-    eval_every: int = 100
+    eval_every: int = 200
     log_every: int = 10
     eval_samples: int = 2048
     n_examples: int = 5
@@ -279,6 +279,7 @@ def main():
     log_initial_stats(
         model,
         first_batch,
+        cfg=cfg,
         seq_len=cfg.seq_len,
         capacity=cfg.capacity,
         topk=cfg.topk,

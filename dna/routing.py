@@ -170,7 +170,7 @@ class CosineRouter(eqx.Module):
         return mask_full, probs, logits_clean, logits_sel
 
 
-class SequenceRouter(eqx.Module):
+class LinearSequenceRouter(eqx.Module):
     """Recurrent router that accumulates sequence context before routing.
 
     Same API; supports normed probs via keyword.
@@ -200,7 +200,7 @@ class SequenceRouter(eqx.Module):
         gumbel_tau: float = 1.0,
         router_temp: float = 1.0,
         select_temp: Optional[float] = None,
-        norm_probs: bool = False, # TODO
+        norm_probs: bool = False,
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
 
         def step(carry, x_t):
@@ -224,4 +224,105 @@ class SequenceRouter(eqx.Module):
         probs = _mixing_probs(
             logits_clean, router_temp=router_temp, mask=mask_full, norm_probs=norm_probs
         )
+        return mask_full, probs, logits_clean, logits_sel
+
+
+class SequenceRouter(eqx.Module):
+    """Recurrent router with expressive MLP (SwiGLU) head + gated state update.
+
+    Update rule (per token)
+    -----------------------
+      z_t   = W_rec s_{t-1} + W_in x_t
+      c_t   = SiLU(z_t)                                # candidate state
+      g_t   = sigmoid(W_g x_t)                         # elementwise gate in (0,1)
+      s_t   = (1 - g_t) * s_{t-1} + g_t * c_t          # gated residual → stable grads
+
+      # Expressive projection (SwiGLU with expansion factor r)
+      u_t   = SiLU(W_up_a s_t) * (W_up_b s_t)          # (rd,)
+      logits_t = W_down u_t                             # (E)
+
+    Notes
+    -----
+    - SwiGLU improves expressivity while remaining cheap and well-behaved.
+    - Elementwise gate lets the model decide how much to carry vs. refresh per dim.
+    - All mixing/selection behavior is handled by shared helpers for consistency.
+    """
+
+    # Recurrent core
+    w_in: eqx.nn.Linear  # d -> d
+    w_rec: eqx.nn.Linear  # d -> d
+    w_gate: eqx.nn.Linear  # d -> d  (elementwise gate)
+
+    # Expressive projection (SwiGLU with expansion r)
+    up_a: eqx.nn.Linear  # d -> r*d
+    up_b: eqx.nn.Linear  # d -> r*d
+    down: eqx.nn.Linear  # r*d -> E
+
+    h0: jnp.ndarray  # (d,) learnable/initial hidden state
+
+    # Statics
+    k: int = eqx.field(static=True)
+    r: int = eqx.field(static=True)  # expansion factor
+
+    def __init__(self, d_model: int, n_exp: int, k: int, *, key, expansion: int = 4):
+        assert k <= n_exp, f"topk ({k}) must be ≤ n_exp ({n_exp})"
+        self.k = int(k)
+        self.r = int(expansion)
+
+        k_in, k_rec, k_gate, k_upa, k_upb, k_down, _ = jax.random.split(key, 7)
+        # No biases to match your style elsewhere
+        self.w_in = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_in)
+        self.w_rec = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_rec)
+        self.w_gate = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_gate)
+
+        self.up_a = eqx.nn.Linear(d_model, d_model * self.r, use_bias=False, key=k_upa)
+        self.up_b = eqx.nn.Linear(d_model, d_model * self.r, use_bias=False, key=k_upb)
+        self.down = eqx.nn.Linear(d_model * self.r, n_exp, use_bias=False, key=k_down)
+
+        self.h0 = jnp.zeros((d_model,), dtype=jnp.float32)
+
+    def __call__(
+        self,
+        h: jnp.ndarray,  # (T, d)
+        *,
+        key: Optional[jax.Array],
+        inference: bool,
+        gumbel_tau: float = 1.0,
+        router_temp: float = 1.0,
+        select_temp: Optional[float] = None,
+        norm_probs: bool = False,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+
+        # Recurrent scan to produce contextual logits_clean
+        def step(s_prev, x_t):
+            # Candidate update and gate
+            z_t = self.w_rec(s_prev) + self.w_in(x_t)  # (d,)
+            c_t = jnn.silu(z_t)  # (d,)
+            g_t = jnn.sigmoid(self.w_gate(x_t))  # (d,)
+            s_t = (1.0 - g_t) * s_prev + g_t * c_t  # (d,)
+
+            # Expressive projection to experts (SwiGLU)
+            u = jnn.silu(self.up_a(s_t)) * self.up_b(s_t)  # (r*d,)
+            logits_t = self.down(u)  # (E,)
+            return s_t, logits_t
+
+        _, logits_seq = jax.lax.scan(step, self.h0, h)  # (T, E)
+        logits_clean = logits_seq
+
+        # Selection + mask (shared helpers)
+        logits_sel, mask_full = _select_mask_and_logits(
+            logits_clean,
+            router_temp=router_temp,
+            select_temp=select_temp,
+            inference=inference,
+            key=key,
+            gumbel_tau=gumbel_tau,
+            k=self.k,
+        )
+
+        # Mixing (shared helper; supports normed or dense probs)
+        probs = _mixing_probs(
+            logits_clean, router_temp=router_temp, mask=mask_full, norm_probs=norm_probs
+        )
+
         return mask_full, probs, logits_clean, logits_sel

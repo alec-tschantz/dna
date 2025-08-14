@@ -242,7 +242,7 @@ def run_eval_suite(
 
 
 # =============================================================================
-# Routing metrics/visuals (used only if routers exist)
+# Routing metrics/visuals 
 # =============================================================================
 
 

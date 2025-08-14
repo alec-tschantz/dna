@@ -32,7 +32,7 @@ class Config:
     n_heads: int = 16
     n_hops: int = 6
     n_modules: int = 16
-    topk: int = 2
+    topk: int = 1  
     capacity: int = 64
     mlp_mult: int = 4
     dropout: float = 0.1
@@ -51,7 +51,7 @@ class Config:
     # training
     steps: int = 20_000
     warmup: int = 2_000
-    lr_peak: float = 3e-4
+    lr_peak: float = 2e-4
     wd: float = 0.1
     clip: float = 1.0
     seed: int = 0

@@ -1565,6 +1565,7 @@ def log_token_path_sankey(spec: Dict[str, Any], step: int):
     )
     wandb.log({"routing/token_path_sankey": fig, "step": step})
 
+
 def log_token_expert_flow_arrows(
     model,
     batch: Dict[str, Any],
@@ -1576,8 +1577,8 @@ def log_token_expert_flow_arrows(
     select_temp: float,
     step: int,
     max_tokens: int = 64,
-    show_topk: int = 2,         # << only draw the actual routed top-k edges
-    max_experts: int = 16,      # global cap to keep the canvas readable
+    show_topk: int = 2,  # << only draw the actual routed top-k edges
+    max_experts: int = 16,  # global cap to keep the canvas readable
     show_other_bucket: bool = True,
     eps: float = 1e-8,
 ):
@@ -1613,10 +1614,10 @@ def log_token_expert_flow_arrows(
         return
 
     # Shapes
-    H = int(np.asarray(example_stats["top1_expert"]).shape[0])   # hops
-    ids_all = np.asarray(example_stats["ids"])[0]                # (T,)
-    mask_all = np.asarray(example_stats["mask"])[0].astype(bool) # (T,)
-    probs_all = np.asarray(example_stats["probs"])[:, 0, :, :]   # (H, T, E)
+    H = int(np.asarray(example_stats["top1_expert"]).shape[0])  # hops
+    ids_all = np.asarray(example_stats["ids"])[0]  # (T,)
+    mask_all = np.asarray(example_stats["mask"])[0].astype(bool)  # (T,)
+    probs_all = np.asarray(example_stats["probs"])[:, 0, :, :]  # (H, T, E)
     E = int(probs_all.shape[-1])
 
     # ---- Visible window (keep order) ----
@@ -1627,16 +1628,18 @@ def log_token_expert_flow_arrows(
     vis_idx = valid_pos[:Tvis]
 
     # Slice tensors to visible window
-    ids = ids_all[vis_idx]                # (Tvis,)
+    ids = ids_all[vis_idx]  # (Tvis,)
     mask = np.ones_like(ids, dtype=bool)
-    P = probs_all[:, vis_idx, :]          # (H, Tvis, E)
+    P = probs_all[:, vis_idx, :]  # (H, Tvis, E)
 
     # ---- Token text (robust, matching preview) ----
     def _ids_to_tokens(ids_1d: np.ndarray) -> list[str]:
         # 1) HF: convert_ids_to_tokens if available (preserves exact split)
         if hasattr(tok, "convert_ids_to_tokens"):
             try:
-                toks = tok.convert_ids_to_tokens(ids_1d.tolist(), skip_special_tokens=False)
+                toks = tok.convert_ids_to_tokens(
+                    ids_1d.tolist(), skip_special_tokens=False
+                )
                 # make them compact but faithful
                 out = []
                 for s in toks:
@@ -1655,7 +1658,11 @@ def log_token_expert_flow_arrows(
                 # Not all tokenizers accept clean_up_tokenization_spaces;
                 # try best-effort and fall back.
                 try:
-                    s = tok.decode([int(tid)], skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                    s = tok.decode(
+                        [int(tid)],
+                        skip_special_tokens=False,
+                        clean_up_tokenization_spaces=False,
+                    )
                 except TypeError:
                     s = tok.decode([int(tid)], skip_special_tokens=False)
             except Exception:
@@ -1671,7 +1678,11 @@ def log_token_expert_flow_arrows(
     # Preview line uses the same ids slice to avoid any mismatch
     try:
         try:
-            preview = tok.decode(ids.tolist(), skip_special_tokens=False, clean_up_tokenization_spaces=False)
+            preview = tok.decode(
+                ids.tolist(),
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
         except TypeError:
             preview = tok.decode(ids.tolist(), skip_special_tokens=False)
     except Exception:
@@ -1689,7 +1700,9 @@ def log_token_expert_flow_arrows(
     keep = order[: min(max_experts, E)].tolist()
     keep_set = set(int(e) for e in keep)
     OTHER = -1
-    include_other = show_other_bucket and (len(keep_set) < E and float(mass_per_e.sum()) > 0.0)
+    include_other = show_other_bucket and (
+        len(keep_set) < E and float(mass_per_e.sum()) > 0.0
+    )
 
     # Fixed X positions for experts (even across the token span)
     n_nodes = len(keep_set) + (1 if include_other else 0)
@@ -1711,9 +1724,11 @@ def log_token_expert_flow_arrows(
         if eid == OTHER:
             return "O"
         tname = type_names[int(expert_type_ids[eid])]
-        return ("A" if "ttent" in tname.lower()
-                else "F" if ("feed" in tname.lower() or "mlp" in tname.lower())
-                else "I")
+        return (
+            "A"
+            if "ttent" in tname.lower()
+            else "F" if ("feed" in tname.lower() or "mlp" in tname.lower()) else "I"
+        )
 
     def _expert_label(eid: int) -> str:
         return "Other" if eid == OTHER else f"{_etype_initial(eid)}{int(eid)}"
@@ -1752,7 +1767,7 @@ def log_token_expert_flow_arrows(
     pred_disp = _ids_to_tokens(pred_ids)
 
     # ---- Layout with EXTRA spacing ----
-    row_gap = 1.55   # << more vertical spacing
+    row_gap = 1.55  # << more vertical spacing
     token_h = 0.74
     expert_h = 0.70
 
@@ -1774,15 +1789,44 @@ def log_token_expert_flow_arrows(
     # Background bands per expert row
     for h in range(H):
         y0 = y_expert_row(h) - 0.55
-        ax.add_patch(Rectangle((-0.9, y0), Tvis + 1.8, 1.9, facecolor="#fafafa", edgecolor="none", zorder=0))
+        ax.add_patch(
+            Rectangle(
+                (-0.9, y0),
+                Tvis + 1.8,
+                1.9,
+                facecolor="#fafafa",
+                edgecolor="none",
+                zorder=0,
+            )
+        )
 
     # Draw a token row
-    def _draw_token_row(y: float, labels: list[str], face="#e7eef6", edge="#c9d5e3", txt="#0f172a"):
+    def _draw_token_row(
+        y: float, labels: list[str], face="#e7eef6", edge="#c9d5e3", txt="#0f172a"
+    ):
         for j in range(Tvis):
-            ax.add_patch(Rectangle((j - 0.42, y - token_h/2), 0.84, token_h,
-                                   facecolor=face, edgecolor=edge, linewidth=0.8, zorder=7))
-            ax.text(j, y, labels[j], ha="center", va="center",
-                    fontsize=8, family="monospace", color=txt, zorder=9)
+            ax.add_patch(
+                Rectangle(
+                    (j - 0.42, y - token_h / 2),
+                    0.84,
+                    token_h,
+                    facecolor=face,
+                    edgecolor=edge,
+                    linewidth=0.8,
+                    zorder=7,
+                )
+            )
+            ax.text(
+                j,
+                y,
+                labels[j],
+                ha="center",
+                va="center",
+                fontsize=8,
+                family="monospace",
+                color=txt,
+                zorder=9,
+            )
 
     # Top token row
     _draw_token_row(y_token_row(0), tok_disp)
@@ -1792,19 +1836,48 @@ def log_token_expert_flow_arrows(
         yE = y_expert_row(h)
         for e in e_list:
             col = _expert_color(e)
-            ax.add_patch(Rectangle((e_to_x[e] - 0.50, yE - expert_h/2), 1.00, expert_h,
-                                   facecolor=col, edgecolor="#0f172a", linewidth=0.45, zorder=5))
-            ax.text(e_to_x[e], yE, _expert_label(e),
-                    ha="center", va="center", fontsize=7, color="white",
-                    weight="bold", family="monospace", zorder=6)
+            ax.add_patch(
+                Rectangle(
+                    (e_to_x[e] - 0.50, yE - expert_h / 2),
+                    1.00,
+                    expert_h,
+                    facecolor=col,
+                    edgecolor="#0f172a",
+                    linewidth=0.45,
+                    zorder=5,
+                )
+            )
+            ax.text(
+                e_to_x[e],
+                yE,
+                _expert_label(e),
+                ha="center",
+                va="center",
+                fontsize=7,
+                color="white",
+                weight="bold",
+                family="monospace",
+                zorder=6,
+            )
 
     # Curved connectors token(h) -> expert(h)
     def _curve(x0, y0, x1, y1, col, lw):
         xm = (x0 + x1) / 2.0
         ym = (y0 + y1) / 2.0 + 0.30
-        path = MplPath([(x0, y0), (xm, ym), (x1, y1)],
-                       [MplPath.MOVETO, MplPath.CURVE3, MplPath.CURVE3])
-        ax.add_patch(PathPatch(path, facecolor="none", edgecolor=col, linewidth=lw, capstyle="round", zorder=4))
+        path = MplPath(
+            [(x0, y0), (xm, ym), (x1, y1)],
+            [MplPath.MOVETO, MplPath.CURVE3, MplPath.CURVE3],
+        )
+        ax.add_patch(
+            PathPatch(
+                path,
+                facecolor="none",
+                edgecolor=col,
+                linewidth=lw,
+                capstyle="round",
+                zorder=4,
+            )
+        )
 
     # Draw only top-k edges per token per hop
     k = max(1, int(show_topk))
@@ -1830,18 +1903,60 @@ def log_token_expert_flow_arrows(
 
     # Bottom predictions
     for j in range(Tvis):
-        ax.add_patch(Rectangle((j - 0.42, y_pred - token_h/2), 0.84, token_h,
-                               facecolor="#d1fae5", edgecolor="#10b981", linewidth=0.9, zorder=8))
-        ax.text(j, y_pred, pred_disp[j], ha="center", va="center",
-                fontsize=8, family="monospace", color="#065f46", zorder=9)
+        ax.add_patch(
+            Rectangle(
+                (j - 0.42, y_pred - token_h / 2),
+                0.84,
+                token_h,
+                facecolor="#d1fae5",
+                edgecolor="#10b981",
+                linewidth=0.9,
+                zorder=8,
+            )
+        )
+        ax.text(
+            j,
+            y_pred,
+            pred_disp[j],
+            ha="center",
+            va="center",
+            fontsize=8,
+            family="monospace",
+            color="#065f46",
+            zorder=9,
+        )
 
     # Titles / legend
-    ax.text(0.0, y_pred + 0.78, f"Token → Expert Flow per Hop • step {step}",
-            fontsize=13, weight="bold", ha="left", va="bottom", transform=ax.transData)
-    ax.text(0.0, y_pred + 0.41, f"input preview: {preview}",
-            fontsize=9, color="#374151", ha="left", va="bottom", transform=ax.transData)
-    ax.text(-0.6, y_pred + 0.10, "Predicted next tokens (greedy):",
-            fontsize=9, color="#065f46", ha="left", va="bottom", transform=ax.transData)
+    ax.text(
+        0.0,
+        y_pred + 0.78,
+        f"Token → Expert Flow per Hop • step {step}",
+        fontsize=13,
+        weight="bold",
+        ha="left",
+        va="bottom",
+        transform=ax.transData,
+    )
+    ax.text(
+        0.0,
+        y_pred + 0.41,
+        f"input preview: {preview}",
+        fontsize=9,
+        color="#374151",
+        ha="left",
+        va="bottom",
+        transform=ax.transData,
+    )
+    ax.text(
+        -0.6,
+        y_pred + 0.10,
+        "Predicted next tokens (greedy):",
+        fontsize=9,
+        color="#065f46",
+        ha="left",
+        va="bottom",
+        transform=ax.transData,
+    )
 
     # Legend by module type (+ Other)
     try:
@@ -1850,19 +1965,39 @@ def log_token_expert_flow_arrows(
             cmap = plt.get_cmap(_type_base_cmap(tname))
             rgba = np.array(cmap(0.75))
             handles.append(
-                plt.Line2D([0], [0], marker="s", linestyle="",
-                           markerfacecolor=rgba, markeredgecolor="none", label=tname)
+                plt.Line2D(
+                    [0],
+                    [0],
+                    marker="s",
+                    linestyle="",
+                    markerfacecolor=rgba,
+                    markeredgecolor="none",
+                    label=tname,
+                )
             )
         if include_other:
             handles.append(
-                plt.Line2D([0], [0], marker="s", linestyle="",
-                           markerfacecolor=(0.62, 0.62, 0.68), markeredgecolor="none", label="Other")
+                plt.Line2D(
+                    [0],
+                    [0],
+                    marker="s",
+                    linestyle="",
+                    markerfacecolor=(0.62, 0.62, 0.68),
+                    markeredgecolor="none",
+                    label="Other",
+                )
             )
         if handles:
-            ax.legend(handles=handles, title="Expert types",
-                      loc="upper right", bbox_to_anchor=(1.0, 1.02),
-                      frameon=False, ncol=min(3, len(handles)),
-                      fontsize=8, title_fontsize=9)
+            ax.legend(
+                handles=handles,
+                title="Expert types",
+                loc="upper right",
+                bbox_to_anchor=(1.0, 1.02),
+                frameon=False,
+                ncol=min(3, len(handles)),
+                fontsize=8,
+                title_fontsize=9,
+            )
     except Exception:
         pass
 

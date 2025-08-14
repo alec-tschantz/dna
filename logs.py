@@ -1340,78 +1340,172 @@ def analyze_token_path_specialization(
 
 
 def plot_token_path_specialization(spec: Dict[str, Any], step: int):
-    """Heatmap (categories×paths) + path barcodes + per-path token cards."""
+    """Token-category mix (top-left) + expert-path barcode + compact top-token cards.
+    API unchanged. Logs a single matplotlib figure to W&B.
+    """
     if spec is None:
         return
 
-    paths = spec["top_paths"]
-    cat = spec["categories"]
-    M, C = len(paths), len(cat)
-    H = spec["H"]
+    paths = spec["top_paths"]  # list[tuple(expert_id per hop)]
+    categories = spec["categories"]  # list[str]
+    M, C = len(paths), len(categories)  # #paths, #categories
+    H = spec["H"]  # #hops
+    counts_per_path = spec["path_counts"]  # absolute token counts per path
 
-    expert_rgba = _expert_color_table(spec["meta"])
-    color_grid = np.zeros((M, H, 4), dtype=np.float32)
-    for i, path in enumerate(paths):
+    # --- Colors for experts (grouped by module type) ---
+    expert_rgba = _expert_color_table(spec["meta"])  # (E,4) RGBA per expert
+
+    # Build barcode grid: rows=hops, cols=paths (so read columns as paths)
+    color_grid = np.zeros((H, M, 4), dtype=np.float32)
+    for j, path in enumerate(paths):
         e_ids = np.array(path, dtype=int)
-        color_grid[i, :, :] = expert_rgba[e_ids]
+        color_grid[:, j, :] = expert_rgba[e_ids]
 
-    fig = plt.figure(figsize=(20, 12))
+    # --- Figure/layout ---
+    fig = plt.figure(figsize=(19, 11))
     gs = fig.add_gridspec(
         2,
         2,
-        width_ratios=[1.2, 1.0],
-        height_ratios=[0.9, 1.1],
-        wspace=0.25,
-        hspace=0.35,
+        width_ratios=[1.35, 1.0],
+        height_ratios=[1.0, 1.0],
+        wspace=0.35,
+        hspace=0.38,
     )
 
-    # (1) categories × paths heatmap
+    # ============== (1) TOP-LEFT: Category mix per path (row-normalized) ==========
     ax1 = fig.add_subplot(gs[0, 0])
-    im = ax1.imshow(spec["category_matrix"], aspect="auto", cmap="viridis")
+    mat = np.asarray(spec["category_matrix"])  # shape (M, C), rows sum to 1
+
+    im = ax1.imshow(mat, aspect="auto", cmap="viridis", vmin=0.0, vmax=1.0)
+    # Row labels include counts so you know the absolute scale for each path
+    row_labels = [f"P{i+1}  (n={counts_per_path[i]})" for i in range(M)]
     ax1.set_yticks(range(M))
-    ax1.set_yticklabels([f"P{i+1}" for i in range(M)])
+    ax1.set_yticklabels(row_labels)
     ax1.set_xticks(range(C))
-    ax1.set_xticklabels(cat, rotation=30, ha="right")
-    ax1.set_title("Token category mix per path (row-normalized)")
-    plt.colorbar(im, ax=ax1, fraction=0.046, pad=0.04)
+    ax1.set_xticklabels(categories, rotation=28, ha="right")
+    ax1.set_title("Token category mix by path (row-normalized)", pad=8)
 
-    # (2) path barcodes
+    # Light vertical grid lines to help scan categories
+    for x in range(C):
+        ax1.axvline(x - 0.5, color="white", alpha=0.07, linewidth=1)
+
+    cbar = plt.colorbar(im, ax=ax1, fraction=0.046, pad=0.04)
+    cbar.set_label("Proportion within path", rotation=270, labelpad=16)
+
+    # Optional annotations for strong cells
+    try:
+        if M * C <= 200:  # annotate only when reasonably small
+            for i in range(M):
+                for j in range(C):
+                    v = mat[i, j]
+                    if v >= 0.35:
+                        ax1.text(
+                            j,
+                            i,
+                            f"{v*100:.0f}%",
+                            ha="center",
+                            va="center",
+                            fontsize=8,
+                            color="white",
+                            weight="bold",
+                        )
+    except Exception:
+        pass
+
+    # ============== (2) BOTTOM-LEFT: Path composition (experts per hop) ===========
     ax2 = fig.add_subplot(gs[1, 0])
-    ax2.imshow(color_grid.swapaxes(0, 1), aspect="auto", interpolation="nearest")
-    ax2.set_xlabel("Hop")
-    ax2.set_ylabel("Paths")
-    ax2.set_yticks(range(H))
-    ax2.set_yticklabels([f"H{h}" for h in range(H)])
-    ax2.set_title("Path composition (expert color)")
+    ax2.imshow(color_grid, aspect="auto", interpolation="nearest")  # shape (H, M, 4)
 
-    # (3) per-path diagnostic tokens
+    # Correct, informative axes: X=paths, Y=hops
+    ax2.set_xlabel("Path")
+    ax2.set_xticks(range(M))
+    ax2.set_xticklabels([f"P{i+1}" for i in range(M)], rotation=0)
+    ax2.set_ylabel("Hop")
+    ax2.set_yticks(range(H))
+    ax2.set_yticklabels([f"H{i}" for i in range(H)])
+    ax2.set_title("Path composition (expert per hop)", pad=8)
+
+    # Legend for module types (uses base colormap mid-shade)
+    type_names = list(spec["meta"]["id_to_type"])
+    legend_handles = []
+    for t in type_names:
+        cmap = plt.get_cmap(_type_base_cmap(t))
+        rgba = np.array(cmap(0.7))
+        legend_handles.append(
+            plt.Line2D(
+                [0],
+                [0],
+                marker="s",
+                linestyle="",
+                markerfacecolor=rgba,
+                markeredgecolor="none",
+                label=t,
+            )
+        )
+    if legend_handles:
+        ax2.legend(
+            handles=legend_handles,
+            title="Module types",
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.10),
+            ncol=min(3, len(legend_handles)),
+            frameon=False,
+        )
+
+    # ============== (3) RIGHT COLUMN: Compact top-token cards ======================
     ax3 = fig.add_subplot(gs[:, 1])
     ax3.axis("off")
-    y = 0.95
+
+    # Build two columns of cards for readability
+    cards = []
     for i, tokens in enumerate(spec["top_tokens"]):
-        text = f"P{i+1}  (n={spec['path_counts'][i]})\n"
+        # Path signature (expert IDs) for quick reference
+        path_sig = "→".join(str(e) for e in paths[i])
+        card = f"P{i+1}  (n={counts_per_path[i]})\n" f"path: [{path_sig}]\n"
         for s, cnt, lift, _ in tokens[:6]:
-            s_disp = s.replace("\n", "\\n")
-            text += f"   • '{s_disp}'  ×{cnt}   lift {lift:.1f}\n"
+            s_disp = (s or "·").replace("\n", "\\n")
+            card += f"  • '{s_disp}'  ×{cnt}   lift {lift:.1f}\n"
+        cards.append(card.rstrip())
+
+    # Layout cards in up to 2 columns
+    n = len(cards)
+    ncols = 2
+    nrows = int(np.ceil(n / ncols))
+    y_top = 0.96
+    y_step = 0.9 / max(nrows, 1)
+
+    box_kw = dict(
+        boxstyle="round,pad=0.45",
+        facecolor="#f8fafc",
+        edgecolor="#d9e2ec",
+        linewidth=1.0,
+        alpha=1.0,
+    )
+
+    for idx, text in enumerate(cards):
+        col = idx // nrows
+        row = idx % nrows
+        x = 0.02 + col * 0.48
+        y = y_top - row * y_step
         ax3.text(
-            0.02,
+            x,
             y,
             text,
             transform=ax3.transAxes,
             va="top",
+            ha="left",
             family="monospace",
-            bbox=dict(
-                boxstyle="round", facecolor="#f7f7f9", edgecolor="#ddd", alpha=1.0
-            ),
+            fontsize=9,
+            bbox=box_kw,
         )
-        y -= 0.17
-        if y < 0.05:
-            break
 
     plt.suptitle(
-        f"Token ↔ Path Specialization • step {step}", fontsize=15, fontweight="bold"
+        f"Token ↔ Path Specialization • step {step}",
+        fontsize=15,
+        fontweight="bold",
+        y=0.98,
     )
-    # plt.tight_layout()
+
     wandb.log({"routing/token_path_specialization": wandb.Image(fig), "step": step})
     plt.close(fig)
 

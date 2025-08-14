@@ -30,10 +30,10 @@ class Config:
     vocab_size: int = 50_257
     d_model: int = 512
     n_heads: int = 16
-    n_hops: int = 8
-    n_modules: int = 9
+    n_hops: int = 6
+    n_modules: int = 16
     topk: int = 2
-    capacity: int = 256
+    capacity: int = 64
     mlp_mult: int = 4
     dropout: float = 0.1
     rope_base: float = 10_000.0
@@ -51,7 +51,7 @@ class Config:
     # training
     steps: int = 20_000
     warmup: int = 2_000
-    lr_peak: float = 1e-4
+    lr_peak: float = 3e-4
     wd: float = 0.1
     clip: float = 1.0
     seed: int = 0
@@ -77,22 +77,26 @@ def make_modules(
     dropout: float,
     key: jax.Array,
 ) -> Tuple[eqx.Module, ...]:
-    n_att = n_modules // 3
-    n_ff = n_modules // 3
-    n_id = n_modules // 3
+    n_att = n_modules // 2
+    n_ff = n_modules // 2
+    # n_id = n_modules // 3
     keys = list(jax.random.split(key, n_modules))
     keys_att = keys[:n_att]
-    keys_ff = keys[n_att : n_att + n_ff]
+    keys_ff = keys[n_att:]
     attn = [Attention(d_model, n_heads, dropout, key=k) for k in keys_att]
     ffn = [FeedForward(d_model, mlp_mult, dropout, key=k) for k in keys_ff]
-    ident = [Identity() for _ in range(n_id)]
-    return tuple(attn + ffn + ident)
+    # ident = [Identity() for _ in range(n_id)]
+    return tuple(attn + ffn)
 
 
 def make_backbone(
     *, d_model: int, n_heads: int, mlp_mult: int, dropout: float, key: jax.Array
 ) -> Tuple[eqx.Module, ...]:
-    return (FeedForward(d_model, mlp_mult, dropout, key=key),)
+    k1, k2 = jax.random.split(key)
+    return (
+        Attention(d_model, n_heads, dropout, key=k1),
+        FeedForward(d_model, mlp_mult, dropout, key=k2),
+    )
 
 
 def build_model(cfg: Config, key: jax.Array) -> eqx.Module:

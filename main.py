@@ -28,12 +28,12 @@ from logs import log_initial_stats, log_train_step, run_eval_suite, log_checkpoi
 class Config:
     # architecture
     model_type: str = "dna"
-    router_type: str = "sequence"  # "default", "cosine", "norm"
+    router_type: str = "sequence"  # "default", "cosine", "sequence"
     vocab_size: int = 50_257
     d_model: int = 512
     n_heads: int = 16
     n_hops: int = 8
-    n_modules: int = 8
+    n_modules: int = 16
     topk: int = 2
     capacity: int = 64
     mlp_mult: int = 4
@@ -153,7 +153,7 @@ def build_model(cfg: Config, key: jax.Array) -> eqx.Module:
             vocab=cfg.vocab_size,
             d_model=cfg.d_model,
             n_heads=cfg.n_heads,
-            n_layers=cfg.n_hops,  #
+            n_layers=cfg.n_hops,  
             mlp_mult=cfg.mlp_mult,
             dropout=cfg.dropout,
             rope_base=cfg.rope_base,

@@ -13,6 +13,7 @@ import wandb
 from transformers import AutoTokenizer
 
 from dna import DNA, Dense, Attention, FeedForward, Identity
+from dna.routing import Router, NormRouter, CosineRouter
 from dna.dataloader import load_dataset_stream, sample_batch
 from logs import (
     log_initial_stats,
@@ -27,12 +28,13 @@ from logs import (
 class Config:
     # architecture
     model_type: str = "dna"
+    router_type: str = "default"  # "default", "cosine", or "norm"
     vocab_size: int = 50_257
     d_model: int = 512
     n_heads: int = 16
     n_hops: int = 6
     n_modules: int = 16
-    topk: int = 2  
+    topk: int = 2
     capacity: int = 64
     mlp_mult: int = 4
     dropout: float = 0.1
@@ -77,16 +79,16 @@ def make_modules(
     dropout: float,
     key: jax.Array,
 ) -> Tuple[eqx.Module, ...]:
-    n_att = n_modules // 3
-    n_ff = n_modules // 3
-    n_id = n_modules // 3
+    n_att = n_modules // 2
+    n_ff = n_modules // 2
+    # n_id = n_modules // 3
     keys = list(jax.random.split(key, n_modules))
     keys_att = keys[:n_att]
-    keys_ff = keys[n_att: n_att + n_ff]
+    keys_ff = keys[n_att : n_att + n_ff]
     attn = [Attention(d_model, n_heads, dropout, key=k) for k in keys_att]
     ffn = [FeedForward(d_model, mlp_mult, dropout, key=k) for k in keys_ff]
-    ident = [Identity() for _ in range(n_id)]
-    return tuple(attn + ffn + ident)
+    # ident = [Identity() for _ in range(n_id)]
+    return tuple(attn + ffn)
 
 
 def make_backbone(
@@ -102,6 +104,12 @@ def make_backbone(
 def build_model(cfg: Config, key: jax.Array) -> eqx.Module:
     mt = cfg.model_type.lower()
     if mt == "dna":
+        router_cls = Router
+        if cfg.router_type.lower() == "cosine":
+            router_cls = CosineRouter
+        elif cfg.router_type.lower() == "norm":
+            router_cls = NormRouter
+
         km, kb, kmodel = jax.random.split(key, 3)
         modules = make_modules(
             d_model=cfg.d_model,
@@ -120,6 +128,7 @@ def build_model(cfg: Config, key: jax.Array) -> eqx.Module:
         )
         return DNA(
             modules=modules,
+            router_cls=router_cls,
             vocab=cfg.vocab_size,
             d_model=cfg.d_model,
             n_heads=cfg.n_heads,
@@ -241,7 +250,7 @@ def main():
 
     run_name = f"{cfg.model_type}-{cfg.dataset_name.split('/')[-1]}-h{cfg.n_hops}"
     if cfg.model_type.lower() == "dna":
-        run_name += f"-k{cfg.topk}-c{cfg.capacity}"
+        run_name += f"-k{cfg.topk}-c{cfg.capacity}-r{cfg.router_type}"
 
     wandb.init(project=cfg.wandb_project, name=run_name, config=asdict(cfg))
 

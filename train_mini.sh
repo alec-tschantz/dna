@@ -3,6 +3,7 @@ set -euo pipefail
 
 python main.py \
   --model_type "dna" \
+  --router_type "cosine" \
   --dataset_name "roneneldan/TinyStories" \
   --dataset_config "default" \
   --batch_size 8 \
@@ -34,4 +35,5 @@ python main.py \
   --log_every 10 \
   --eval_samples 4096 \
   --n_examples 2 \
-  --gen_len 100
+  --gen_len 100 \
+  --wandb_project "dna-cpu" \

@@ -145,6 +145,7 @@ class DNA(eqx.Module):
         self,
         *,
         modules: Tuple[eqx.Module, ...],
+        router_cls: type[Router],
         vocab: int,
         d_model: int,
         n_heads: int,
@@ -200,7 +201,7 @@ class DNA(eqx.Module):
         total_experts = len(modules)
         router_keys = jax.random.split(k_routers, n_hops)
         self.routers = tuple(
-            Router(d_model, total_experts, topk, key=k) for k in router_keys
+            router_cls(d_model, total_experts, topk, key=k) for k in router_keys
         )
 
     def _hop(
@@ -292,8 +293,8 @@ class DNA(eqx.Module):
         # Route outputs back to tokens
         combine = jnp.einsum("ecd,ect,et->td", expert_out, slot, combine_w.T)  # (T, d)
 
-        # Apply residual update (Eq. 3) and preserve padding 
-        # TODO: scale rho?       
+        # Apply residual update (Eq. 3) and preserve padding
+        # TODO: scale rho?
         h_next = h + combine - rho * h
         h_next = jnp.where(token_mask[:, None], h_next, h)
 

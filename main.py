@@ -17,7 +17,7 @@ import wandb
 from transformers import AutoTokenizer
 
 from dna import DNA, Dense, Attention, FeedForward, Identity
-from dna.routing import Router, CosineRouter
+from dna.routing import Router, CosineRouter, NormRouter
 from dna.dataloader import load_dataset_stream, sample_batch
 from logs import log_initial_stats, log_train_step, run_eval_suite, log_checkpoint
 
@@ -28,7 +28,7 @@ from logs import log_initial_stats, log_train_step, run_eval_suite, log_checkpoi
 class Config:
     # architecture
     model_type: str = "dna"
-    router_type: str = "default"  # "default", "cosine"
+    router_type: str = "default"  # "default", "cosine", "norm"
     vocab_size: int = 50_257
     d_model: int = 512
     n_heads: int = 16
@@ -106,7 +106,7 @@ def make_backbone(
 
 
 def make_router_cls(router_type):
-    return {"default": Router, "cosine": CosineRouter}[router_type]
+    return {"default": Router, "cosine": CosineRouter, "norm": NormRouter}[router_type]
 
 
 def build_model(cfg: Config, key: jax.Array) -> eqx.Module:

@@ -17,7 +17,7 @@ import wandb
 from transformers import AutoTokenizer
 
 from dna import DNA, Dense, Attention, FeedForward, Identity
-from dna.routing import Router, CosineRouter, NormRouter, SequenceRouter
+from dna.routing import Router, CosineRouter, SequenceRouter
 from dna.dataloader import load_dataset_stream, sample_batch
 from logs import log_initial_stats, log_train_step, run_eval_suite, log_checkpoint
 
@@ -33,7 +33,7 @@ class Config:
     d_model: int = 512
     n_heads: int = 16
     n_hops: int = 8
-    n_modules: int = 16
+    n_modules: int = 8
     topk: int = 2
     capacity: int = 64
     mlp_mult: int = 4
@@ -109,7 +109,6 @@ def make_router_cls(router_type):
     return {
         "default": Router,
         "cosine": CosineRouter,
-        "norm": NormRouter,
         "sequence": SequenceRouter,
     }[router_type]
 

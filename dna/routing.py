@@ -1,4 +1,3 @@
-# dna/routing.py
 from __future__ import annotations
 from typing import Tuple, Optional
 
@@ -8,11 +7,76 @@ import jax.nn as jnn
 import equinox as eqx
 
 
+# ------------------------------- utils -------------------------------- #
+
+
 def _topk_mask(logits: jnp.ndarray, k: int) -> jnp.ndarray:
     """Boolean mask of top-k per row. logits: (T, E) -> mask: (T, E)."""
     _, idx = jax.lax.top_k(logits, k)  # (T, k)
     hard = jnn.one_hot(idx, logits.shape[-1]).sum(axis=-2)  # (T, E) in {0,1}
     return hard.astype(bool)
+
+
+def _selection_logits(logits_clean: jnp.ndarray, select_temp: float) -> jnp.ndarray:
+    t_sel = jnp.clip(select_temp, 1e-6, None)
+    return logits_clean / t_sel
+
+
+def _maybe_add_gumbel(
+    logits_sel: jnp.ndarray,
+    *,
+    inference: bool,
+    key: Optional[jax.Array],
+    gumbel_tau: float,
+) -> jnp.ndarray:
+    if inference:
+        return logits_sel
+    assert key is not None, "Router needs PRNG key during training"
+    u = jax.random.uniform(key, logits_sel.shape, minval=1e-6, maxval=1 - 1e-6)
+    g = -jnp.log(-jnp.log(u))
+    return logits_sel + gumbel_tau * g
+
+
+def _select_mask_and_logits(
+    logits_clean: jnp.ndarray,
+    *,
+    router_temp: float,
+    select_temp: Optional[float],
+    inference: bool,
+    key: Optional[jax.Array],
+    gumbel_tau: float,
+    k: int,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    t_sel = router_temp if select_temp is None else select_temp
+    logits_sel = _selection_logits(logits_clean, t_sel)
+    logits_sel = _maybe_add_gumbel(
+        logits_sel, inference=inference, key=key, gumbel_tau=gumbel_tau
+    )
+    mask_full = _topk_mask(logits_sel, k)
+    return logits_sel, mask_full
+
+
+def _mixing_probs(
+    logits_clean: jnp.ndarray,
+    *,
+    router_temp: float,
+    mask: Optional[jnp.ndarray],
+    norm_probs: bool,
+) -> jnp.ndarray:
+    """Return per-token mixing probabilities from clean logits.
+    If norm_probs=True, concentrate mass on `mask` and renormalize per token.
+    """
+    t_mix = jnp.clip(router_temp, 1e-6, None)
+    dense = jnn.softmax(logits_clean / t_mix, axis=-1)  # (T, E)
+    if not norm_probs:
+        return dense
+    assert mask is not None, "mask is required when norm_probs=True"
+    masked = jnp.where(mask, dense, 0.0)
+    denom = masked.sum(axis=-1, keepdims=True) + 1e-9
+    return masked / denom
+
+
+# ------------------------------ routers ------------------------------- #
 
 
 class Router(eqx.Module):
@@ -35,38 +99,29 @@ class Router(eqx.Module):
         gumbel_tau: float = 1.0,
         router_temp: float = 1.0,  # for mixing
         select_temp: Optional[float] = None,  # for top-k selection
+        norm_probs: bool = False,  # if True, renorm over selected experts
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        """
-        Returns:
-          mask_full:   (T, E) bool — hard top-k using *selection* scores
-          probs:       (T, E) float — soft mixing probabilities (no noise)
-          logits_clean:(T, E) float — raw linear logits (pre-temp)
-          logits_sel:  (T, E) float — selection logits after temp (+gumbel if train)
-        """
         logits_clean = jax.vmap(self.proj)(h)  # (T, E)
 
-        # Mixing probs use router_temperature (no exploration)
-        t_mix = jnp.clip(router_temp, 1e-6, None)
-        probs = jnn.softmax(logits_clean / t_mix, axis=-1)  # (T, E)
-
-        # Selection logits may use different temperature (+ gumbel if training)
-        t_sel = jnp.clip(
-            router_temp if select_temp is None else select_temp,
-            1e-6,
-            None,
+        logits_sel, mask_full = _select_mask_and_logits(
+            logits_clean,
+            router_temp=router_temp,
+            select_temp=select_temp,
+            inference=inference,
+            key=key,
+            gumbel_tau=gumbel_tau,
+            k=self.k,
         )
-        logits_sel = logits_clean / t_sel
-        if not inference:
-            assert key is not None, "Router needs PRNG key during training"
-            u = jax.random.uniform(key, logits_sel.shape, minval=1e-6, maxval=1 - 1e-6)
-            g = -jnp.log(-jnp.log(u))
-            logits_sel = logits_sel + gumbel_tau * g
 
-        mask_full = _topk_mask(logits_sel, self.k)  # (T, E)
+        probs = _mixing_probs(
+            logits_clean, router_temp=router_temp, mask=mask_full, norm_probs=norm_probs
+        )
         return mask_full, probs, logits_clean, logits_sel
 
 
 class CosineRouter(eqx.Module):
+    """Router using cosine-similarity prototypes."""
+
     prototypes: jnp.ndarray  # (E, P, d)
     scale: float = eqx.field(static=True)
     k: int = eqx.field(static=True)
@@ -77,8 +132,7 @@ class CosineRouter(eqx.Module):
         self.k = int(k)
         self.P = 2
         self.scale = 10.0
-        k_proto = key
-        self.prototypes = jax.random.normal(k_proto, (n_exp, self.P, d_model)) * (
+        self.prototypes = jax.random.normal(key, (n_exp, self.P, d_model)) * (
             1.0 / jnp.sqrt(d_model)
         )
 
@@ -91,94 +145,35 @@ class CosineRouter(eqx.Module):
         gumbel_tau: float = 1.0,
         router_temp: float = 1.0,
         select_temp: float | None = None,
-    ):
+        norm_probs: bool = False,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         eps = 1e-6
         h_norm = h / (jnp.linalg.norm(h, axis=-1, keepdims=True) + eps)  # (T, d)
-        # (E,P,d)
         p_norm = self.prototypes / (
             jnp.linalg.norm(self.prototypes, axis=-1, keepdims=True) + eps
+        )  # (E, P, d)
+        sims = jnp.einsum("td,epd->tep", h_norm, p_norm)  # (T, E, P)
+        logits_clean = self.scale * jax.nn.logsumexp(sims, axis=-1)  # (T, E)
+
+        logits_sel, mask_full = _select_mask_and_logits(
+            logits_clean,
+            router_temp=router_temp,
+            select_temp=select_temp,
+            inference=inference,
+            key=key,
+            gumbel_tau=gumbel_tau,
+            k=self.k,
         )
-        sims = jnp.einsum("td,epd->tep", h_norm, p_norm)  # (T,E,P)
-        logits_clean = self.scale * jax.nn.logsumexp(sims, axis=-1)  # (T,E)
-
-        t_mix = jnp.clip(router_temp, 1e-6, None)
-        probs = jnn.softmax(logits_clean / t_mix, axis=-1)
-
-        # Selection (+ optional gumbel)
-        t_sel = jnp.clip(
-            router_temp if select_temp is None else select_temp, 1e-6, None
+        probs = _mixing_probs(
+            logits_clean, router_temp=router_temp, mask=mask_full, norm_probs=norm_probs
         )
-        logits_sel = logits_clean / t_sel
-        if not inference:
-            assert key is not None
-            u = jax.random.uniform(key, logits_sel.shape, minval=1e-6, maxval=1 - 1e-6)
-            g = -jnp.log(-jnp.log(u))
-            logits_sel = logits_sel + gumbel_tau * g
-
-        mask_full = _topk_mask(logits_sel, self.k)
-        return mask_full, probs, logits_clean, logits_sel
-
-
-class NormRouter(eqx.Module):
-    proj: eqx.nn.Linear
-    k: int = eqx.field(static=True)
-
-    def __init__(self, d_model: int, n_exp: int, k: int, *, key):
-        assert k <= n_exp
-        self.k = int(k)
-        self.proj = eqx.nn.Linear(d_model, n_exp, use_bias=False, key=key)
-
-    def __call__(
-        self,
-        h: jnp.ndarray,
-        *,
-        key: jax.Array | None,
-        inference: bool,
-        gumbel_tau: float = 1.0,
-        router_temp: float = 1.0,
-        select_temp: float | None = None,
-    ):
-        logits_clean = jax.vmap(self.proj)(h)  # (T,E)
-
-        t_sel = jnp.clip(
-            router_temp if select_temp is None else select_temp, 1e-6, None
-        )
-        logits_sel = logits_clean / t_sel
-        if not inference:
-            assert key is not None
-            u = jax.random.uniform(key, logits_sel.shape, minval=1e-6, maxval=1 - 1e-6)
-            g = -jnp.log(-jnp.log(u))
-            logits_sel = logits_sel + gumbel_tau * g
-        mask_full = _topk_mask(logits_sel, self.k)  # (T,E)
-
-        # Mixing: concentrate mass only on selected experts, then renormalize per token
-        t_mix = jnp.clip(router_temp, 1e-6, None)
-        dense = jnn.softmax(logits_clean / t_mix, axis=-1)  # (T,E)
-        masked = jnp.where(mask_full, dense, 0.0)
-        denom = masked.sum(axis=-1, keepdims=True) + 1e-9
-        probs = masked / denom  # (T,E), sparse over top-k
-
         return mask_full, probs, logits_clean, logits_sel
 
 
 class SequenceRouter(eqx.Module):
     """Recurrent router that accumulates sequence context before routing.
 
-    Idea
-    ----
-    Instead of classifying each token h_t independently, maintain a tiny
-    hidden state s_t that summarizes previous tokens, then classify from s_t:
-        s_t = tanh(W_rec s_{t-1} + W_in h_t)
-        logits_t = W_out s_t
-
-    This lets routing decisions use *across-sequence* information (e.g., topic,
-    entity continuity) while staying lightweight.
-
-    Shapes
-    ------
-    - Input tokens: h: (T, d)
-    - Hidden state: s_t: (d,)   (we keep hidden dim = d for simplicity)
-    - Logits over experts: (T, E)
+    Same API; supports normed probs via keyword.
     """
 
     w_in: eqx.nn.Linear  # (d -> d) input-to-hidden
@@ -190,15 +185,10 @@ class SequenceRouter(eqx.Module):
     def __init__(self, d_model: int, n_exp: int, k: int, *, key):
         assert k <= n_exp, f"topk ({k}) must be ≤ n_exp ({n_exp})"
         self.k = int(k)
-
-        # Init parameters
-        k_in, k_rec, k_out, k_h0 = jax.random.split(key, 4)
+        k_in, k_rec, k_out, _ = jax.random.split(key, 4)
         self.w_in = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_in)
         self.w_rec = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_rec)
         self.proj = eqx.nn.Linear(d_model, n_exp, use_bias=False, key=k_out)
-
-        # Start with zeros for stability; make it a parameter so the model can
-        # learn a useful start-of-sequence bias if beneficial.
         self.h0 = jnp.zeros((d_model,), dtype=jnp.float32)
 
     def __call__(
@@ -208,40 +198,30 @@ class SequenceRouter(eqx.Module):
         key: Optional[jax.Array],
         inference: bool,
         gumbel_tau: float = 1.0,
-        router_temp: float = 1.0,  # for mixing
-        select_temp: Optional[float] = None,  # for top-k selection
+        router_temp: float = 1.0,
+        select_temp: Optional[float] = None,
+        norm_probs: bool = False,
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        """Return (mask_full, probs, logits_clean, logits_sel) like the base Router."""
 
-        # --- Tiny RNN over the sequence (scan is JIT-friendly) ---
         def step(carry, x_t):
             s_prev = carry  # (d,)
-            # Simple Elman-style update with tanh nonlinearity.
             s_t = jnp.tanh(self.w_rec(s_prev) + self.w_in(x_t))  # (d,)
-            # Classify from the *contextual* hidden state.
             logits_t = self.proj(s_t)  # (E,)
             return s_t, logits_t
 
-        # Run recurrently across T tokens
-        _, logits_seq = jax.lax.scan(step, self.h0, h)  # logits_seq: (T, E)
+        _, logits_seq = jax.lax.scan(step, self.h0, h)  # (T, E)
         logits_clean = logits_seq
 
-        # --- Mixing distribution (no exploration) ---
-        t_mix = jnp.clip(router_temp, 1e-6, None)
-        probs = jnn.softmax(logits_clean / t_mix, axis=-1)  # (T, E)
-
-        # --- Selection scores (optionally different temp + Gumbel) ---
-        t_sel = jnp.clip(
-            router_temp if select_temp is None else select_temp, 1e-6, None
+        logits_sel, mask_full = _select_mask_and_logits(
+            logits_clean,
+            router_temp=router_temp,
+            select_temp=select_temp,
+            inference=inference,
+            key=key,
+            gumbel_tau=gumbel_tau,
+            k=self.k,
         )
-        logits_sel = logits_clean / t_sel
-        if not inference:
-            assert key is not None, "SequenceRouter needs PRNG key during training"
-            u = jax.random.uniform(key, logits_sel.shape, minval=1e-6, maxval=1 - 1e-6)
-            g = -jnp.log(-jnp.log(u))
-            logits_sel = logits_sel + gumbel_tau * g
-
-        # --- Hard top-k selection mask ---
-        mask_full = _topk_mask(logits_sel, self.k)  # (T, E)
-
+        probs = _mixing_probs(
+            logits_clean, router_temp=router_temp, mask=mask_full, norm_probs=norm_probs
+        )
         return mask_full, probs, logits_clean, logits_sel

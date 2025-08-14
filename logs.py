@@ -35,12 +35,12 @@ def log_checkpoint(
     opt_state,
     lr_value: float,
 ):
-    ckpt_root = Path(cfg.ckpt_dir)
-    ckpt_root.mkdir(parents=True, exist_ok=True)
-    tag = f"{run_name}_step{step:06d}"
-    model_path = ckpt_root / f"{tag}.model.eqx"
-    opt_path = ckpt_root / f"{tag}.opt.eqx"
-    meta_path = ckpt_root / f"{tag}.meta.json"
+    ckpt_dir = Path(cfg.ckpt_dir) / run_name
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    model_path = ckpt_dir / f"modelstep{step}.eqx"
+    opt_path = ckpt_dir / f"optstep{step}.eqx"
+    meta_path = ckpt_dir / f"metastep{step}.json"
 
     eqx.tree_serialise_leaves(model_path, eqx.filter(model, eqx.is_array))
     eqx.tree_serialise_leaves(opt_path, opt_state)
@@ -65,7 +65,8 @@ def log_checkpoint(
     }
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
-    print(f"[ckpt] saved: {model_path.name}, {opt_path.name}")
+
+    print(f"[ckpt] saved: {model_path}  |  {opt_path}")
 
 
 def log_initial_stats(

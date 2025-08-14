@@ -1,9 +1,13 @@
-# main.py
 from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Tuple
 
 import time
+import os
+import json
+from pathlib import Path
+from datetime import datetime
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -13,13 +17,9 @@ import wandb
 from transformers import AutoTokenizer
 
 from dna import DNA, Dense, Attention, FeedForward, Identity
-from dna.routing import Router, NormRouter, CosineRouter
+from dna.routing import Router
 from dna.dataloader import load_dataset_stream, sample_batch
-from logs import (
-    log_initial_stats,
-    log_train_step,
-    run_eval_suite,
-)
+from logs import log_initial_stats, log_train_step, run_eval_suite, log_checkpoint
 
 # ------------------------------ config ------------------------------ #
 
@@ -28,7 +28,6 @@ from logs import (
 class Config:
     # architecture
     model_type: str = "dna"
-    router_type: str = "default"  # "default", "cosine", or "norm"
     vocab_size: int = 50_257
     d_model: int = 512
     n_heads: int = 16
@@ -65,6 +64,10 @@ class Config:
     eval_samples: int = 2048
     n_examples: int = 5
     gen_len: int = 200
+
+    # checkpoints
+    save_every: int = 1000
+    ckpt_dir: str = "checkpoints"
 
 
 # ------------------------------ builders ------------------------------ #
@@ -104,12 +107,6 @@ def make_backbone(
 def build_model(cfg: Config, key: jax.Array) -> eqx.Module:
     mt = cfg.model_type.lower()
     if mt == "dna":
-        router_cls = Router
-        if cfg.router_type.lower() == "cosine":
-            router_cls = CosineRouter
-        elif cfg.router_type.lower() == "norm":
-            router_cls = NormRouter
-
         km, kb, kmodel = jax.random.split(key, 3)
         modules = make_modules(
             d_model=cfg.d_model,
@@ -128,7 +125,7 @@ def build_model(cfg: Config, key: jax.Array) -> eqx.Module:
         )
         return DNA(
             modules=modules,
-            router_cls=router_cls,
+            router_cls=Router,
             vocab=cfg.vocab_size,
             d_model=cfg.d_model,
             n_heads=cfg.n_heads,
@@ -351,6 +348,16 @@ def main():
                 tok=tok,
                 model_kwargs_train=model_kwargs,
                 sample_batch_fn=sample_batch,
+            )
+
+        if step % cfg.save_every == 0:
+            log_checkpoint(
+                run_name=run_name,
+                cfg=cfg,
+                step=step,
+                model=model,
+                opt_state=opt_state,
+                lr_value=float(schedule_fn(step)),
             )
 
 

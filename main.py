@@ -33,7 +33,7 @@ class Config:
     d_model: int = 512
     n_heads: int = 16
     n_hops: int = 8
-    n_modules: int = 16
+    n_modules: int = 8
     topk: int = 2
     capacity: int = 64
     mlp_mult: int = 4

@@ -200,7 +200,7 @@ class SequenceRouter(eqx.Module):
         gumbel_tau: float = 1.0,
         router_temp: float = 1.0,
         select_temp: Optional[float] = None,
-        norm_probs: bool = False,
+        norm_probs: bool = False, # TODO
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
 
         def step(carry, x_t):

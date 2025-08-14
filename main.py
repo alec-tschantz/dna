@@ -12,9 +12,9 @@ import tyro
 import wandb
 from transformers import AutoTokenizer
 
-from dna import Model, Dense, Attention, FeedForward, Identity
-from dataloader import load_dataset_stream, sample_batch
-from metrics import (
+from dna import DNA, Dense, Attention, FeedForward, Identity
+from dna.dataloader import load_dataset_stream, sample_batch
+from logs import (
     log_initial_stats,
     log_train_step,
     run_eval_suite,
@@ -57,6 +57,7 @@ class Config:
     seed: int = 0
 
     # logging/eval
+    wandb_project: str = "dna-model-v2"
     eval_every: int = 100
     log_every: int = 10
     eval_samples: int = 2048
@@ -113,7 +114,7 @@ def build_model(cfg: Config, key: jax.Array) -> eqx.Module:
             dropout=cfg.dropout,
             key=kb,
         )
-        return Model(
+        return DNA(
             modules=modules,
             vocab=cfg.vocab_size,
             d_model=cfg.d_model,
@@ -238,7 +239,7 @@ def main():
     if cfg.model_type.lower() == "dna":
         run_name += f"-k{cfg.topk}-c{cfg.capacity}"
 
-    wandb.init(project="dna-model-v2", name=run_name, config=asdict(cfg))
+    wandb.init(project=cfg.wandb_project, name=run_name, config=asdict(cfg))
 
     tok = AutoTokenizer.from_pretrained("gpt2")
     tok.pad_token = tok.eos_token

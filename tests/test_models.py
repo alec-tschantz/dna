@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import equinox as eqx
 from jaxtyping import Int, Float, Array, Bool
 
-from dna.model import Model
+from dna.dna import DNA
 from dna.modules import Attention, FeedForward, Identity
 from dna.generate import sample
 
@@ -25,7 +25,7 @@ def make_small_dna(
     dropout: float = 0.0,
     rope_base: float = 10_000.0,
     key: jax.Array,
-) -> Model:
+) -> DNA:
     k_mods = jax.random.split(key, n_experts)
     mods = []
     for i in range(n_experts):
@@ -36,7 +36,7 @@ def make_small_dna(
         else:
             mods.append(Identity())
     k_model = jax.random.split(key, 1)[0]
-    model = Model(
+    model = DNA(
         modules=tuple(mods),
         vocab=vocab,
         d_model=d_model,

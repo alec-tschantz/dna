@@ -6,5 +6,5 @@ Implementation of [Towards Distributed Neural Architectures](https://arxiv.org/a
 ```sh
 pip install -e . 
 pytest 
-python scripts/main.py
+python main.py
 ``` 

@@ -118,7 +118,7 @@ def _capacity_select(
 # ============================================================================
 
 
-class Model(eqx.Module):
+class DNA(eqx.Module):
     """DNA model with routing-based expert execution.
 
     Processes sequences through multiple routing hops, where each hop

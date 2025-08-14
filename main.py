@@ -28,7 +28,7 @@ from logs import log_initial_stats, log_train_step, run_eval_suite, log_checkpoi
 class Config:
     # architecture
     model_type: str = "dna"
-    router_type: str = "default"  # "default", "cosine", "norm"
+    router_type: str = "sequence"  # "default", "cosine", "norm"
     vocab_size: int = 50_257
     d_model: int = 512
     n_heads: int = 16
@@ -100,7 +100,7 @@ def make_backbone(
 ) -> Tuple[eqx.Module, ...]:
     k1, k2 = jax.random.split(key)
     return (
-        Attention(d_model, n_heads, dropout, key=k1),
+        # Attention(d_model, n_heads, dropout, key=k1),
         FeedForward(d_model, mlp_mult, dropout, key=k2),
     )
 

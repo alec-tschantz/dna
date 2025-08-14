@@ -32,7 +32,7 @@ class Config:
     vocab_size: int = 50_257
     d_model: int = 512
     n_heads: int = 16
-    n_hops: int = 6
+    n_hops: int = 8
     n_modules: int = 16
     topk: int = 2
     capacity: int = 64

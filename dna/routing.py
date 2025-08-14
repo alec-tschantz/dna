@@ -159,3 +159,89 @@ class NormRouter(eqx.Module):
         probs = masked / denom  # (T,E), sparse over top-k
 
         return mask_full, probs, logits_clean, logits_sel
+
+
+class SequenceRouter(eqx.Module):
+    """Recurrent router that accumulates sequence context before routing.
+
+    Idea
+    ----
+    Instead of classifying each token h_t independently, maintain a tiny
+    hidden state s_t that summarizes previous tokens, then classify from s_t:
+        s_t = tanh(W_rec s_{t-1} + W_in h_t)
+        logits_t = W_out s_t
+
+    This lets routing decisions use *across-sequence* information (e.g., topic,
+    entity continuity) while staying lightweight.
+
+    Shapes
+    ------
+    - Input tokens: h: (T, d)
+    - Hidden state: s_t: (d,)   (we keep hidden dim = d for simplicity)
+    - Logits over experts: (T, E)
+    """
+
+    w_in: eqx.nn.Linear  # (d -> d) input-to-hidden
+    w_rec: eqx.nn.Linear  # (d -> d) hidden-to-hidden (no bias)
+    proj: eqx.nn.Linear  # (d -> E) hidden-to-expert logits
+    h0: jnp.ndarray  # (d,) learnable/initial hidden state
+    k: int = eqx.field(static=True)
+
+    def __init__(self, d_model: int, n_exp: int, k: int, *, key):
+        assert k <= n_exp, f"topk ({k}) must be ≤ n_exp ({n_exp})"
+        self.k = int(k)
+
+        # Init parameters
+        k_in, k_rec, k_out, k_h0 = jax.random.split(key, 4)
+        self.w_in = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_in)
+        self.w_rec = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_rec)
+        self.proj = eqx.nn.Linear(d_model, n_exp, use_bias=False, key=k_out)
+
+        # Start with zeros for stability; make it a parameter so the model can
+        # learn a useful start-of-sequence bias if beneficial.
+        self.h0 = jnp.zeros((d_model,), dtype=jnp.float32)
+
+    def __call__(
+        self,
+        h: jnp.ndarray,  # (T, d)
+        *,
+        key: Optional[jax.Array],
+        inference: bool,
+        gumbel_tau: float = 1.0,
+        router_temp: float = 1.0,  # for mixing
+        select_temp: Optional[float] = None,  # for top-k selection
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Return (mask_full, probs, logits_clean, logits_sel) like the base Router."""
+
+        # --- Tiny RNN over the sequence (scan is JIT-friendly) ---
+        def step(carry, x_t):
+            s_prev = carry  # (d,)
+            # Simple Elman-style update with tanh nonlinearity.
+            s_t = jnp.tanh(self.w_rec(s_prev) + self.w_in(x_t))  # (d,)
+            # Classify from the *contextual* hidden state.
+            logits_t = self.proj(s_t)  # (E,)
+            return s_t, logits_t
+
+        # Run recurrently across T tokens
+        _, logits_seq = jax.lax.scan(step, self.h0, h)  # logits_seq: (T, E)
+        logits_clean = logits_seq
+
+        # --- Mixing distribution (no exploration) ---
+        t_mix = jnp.clip(router_temp, 1e-6, None)
+        probs = jnn.softmax(logits_clean / t_mix, axis=-1)  # (T, E)
+
+        # --- Selection scores (optionally different temp + Gumbel) ---
+        t_sel = jnp.clip(
+            router_temp if select_temp is None else select_temp, 1e-6, None
+        )
+        logits_sel = logits_clean / t_sel
+        if not inference:
+            assert key is not None, "SequenceRouter needs PRNG key during training"
+            u = jax.random.uniform(key, logits_sel.shape, minval=1e-6, maxval=1 - 1e-6)
+            g = -jnp.log(-jnp.log(u))
+            logits_sel = logits_sel + gumbel_tau * g
+
+        # --- Hard top-k selection mask ---
+        mask_full = _topk_mask(logits_sel, self.k)  # (T, E)
+
+        return mask_full, probs, logits_clean, logits_sel

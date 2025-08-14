@@ -3,7 +3,7 @@ set -euo pipefail
 
 python main.py \
   --model_type "dna" \
-  --router_type "default" \
+  --router_type "sequence" \
   --dataset_name "roneneldan/TinyStories" \
   --dataset_config "default" \
   --batch_size 8 \

@@ -7,6 +7,9 @@ from pathlib import Path
 from datetime import datetime
 import json
 
+import matplotlib as mpl
+
+mpl.rcParams["text.usetex"] = False
 from matplotlib.patches import Rectangle, PathPatch
 from matplotlib.path import Path as MplPath
 
@@ -113,7 +116,7 @@ def log_checkpoint(
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f" [Checkpoint] saved: {model_path}  |  {opt_path}")
+    print(f"  [Checkpoint] saved: {model_path}  |  {opt_path}")
 
 
 # -----------------------------------------------------------------------------
@@ -124,7 +127,6 @@ def log_checkpoint(
 def log_initial_stats(
     model, first_batch: Dict[str, Any], cfg: Any, *, stream: Optional[Any] = None
 ) -> None:
-    _print_ascii_dna()
 
     n_params = sum(
         p.size for p in jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
@@ -156,7 +158,6 @@ def log_initial_stats(
 
     _print_ascii_dna()
     print(_ansi_box("Dataset & Model Summary", lines, width=66))
-
 
     wandb.log(
         {
@@ -436,6 +437,15 @@ def router_l2_norm(model) -> float:
 # =============================================================================
 
 
+def _mpl_safe(s: str) -> str:
+    """Make a string safe for Matplotlib text rendering."""
+    if s is None:
+        return ""
+    s = s.replace("\n", "\\n")
+    s = s.replace("$", r"\$")
+    return s
+
+
 def _ansi_box(title: str, body_lines: list[str], width: int = 88) -> str:
     """Render a heavy-line ANSI box with a title and wrapped body lines."""
     h, v = "━", "┃"
@@ -492,7 +502,7 @@ def _render_generation_cards(results, temps: Dict[str, float], step: int):
 
         prompt = results[i]["prompt"]
         comp = results[i]["completions"][0]
-        text = comp["text"].strip().replace("\n", " ")
+        text = _mpl_safe(comp["text"].strip())
         info = f"len={comp['length']} | eos={bool(comp.get('stopped_eos', False))}"
         header = f"Prompt: {prompt}"
         wrapped = textwrap.fill(text, width=70, break_long_words=False)
@@ -892,6 +902,7 @@ def plot_token_flow_rich(
         preview = tok.decode(ids_vis.tolist(), skip_special_tokens=True)
     except Exception:
         preview = "[decode error]"
+    preview = _mpl_safe(preview)
     if len(preview) > 120:
         preview = preview[:117] + "..."
 
@@ -1620,7 +1631,7 @@ def plot_token_path_specialization(spec: Dict[str, Any], step: int):
         path_sig = "→".join(str(e) for e in paths[i])
         card = f"P{i+1}  (n={counts_per_path[i]})\n" f"path: [{path_sig}]\n"
         for s, cnt, lift, _ in tokens[:6]:
-            s_disp = (s or "·").replace("\n", "\\n")
+            s_disp = _mpl_safe(s or "·")  # escape $ and newlines
             card += f"  • '{s_disp}'  ×{cnt}   lift {lift:.1f}\n"
         cards.append(card.rstrip())
 
@@ -1802,6 +1813,8 @@ def log_token_expert_flow_arrows(
     except Exception:
         preview = ""
     preview = preview.replace("\n", "\\n")
+    preview = _mpl_safe(preview)
+
     if len(preview) > 160:
         preview = preview[:157] + "…"
 

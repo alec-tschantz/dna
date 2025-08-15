@@ -39,7 +39,7 @@ class Config:
     # routing temperatures
     router_temp: float = 1.0
     select_temp: float = 1.0
-    gumbel_tau: float = 0.1
+    gumbel_tau: float = 0.0
 
     # module pool (routed)
     n_att_modules: int = 4

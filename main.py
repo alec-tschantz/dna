@@ -6,6 +6,8 @@ import time
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import jax.nn as jnn
+
 import optax
 import tyro
 import wandb
@@ -197,15 +199,117 @@ def compute_loss(
         return logits, stats
 
     logits, stats = jax.vmap(forward, in_axes=(0, 0, 0))(ids, mask, keys)
-    logits_shift = logits[:, :-1]
-    labels_shift = ids[:, 1:]
-    mask_shift = mask[:, 1:]
+
+    # language modeling CE (standard)
+    logits_shift = logits[:, :-1]  # (B, T-1, V)
+    labels_shift = ids[:, 1:]  # (B, T-1)
+    mask_shift = mask[:, 1:]  # (B, T-1)
     raw_loss = optax.softmax_cross_entropy_with_integer_labels(
         logits_shift, labels_shift
     )
     total_loss = (raw_loss * mask_shift).sum()
     total_tokens = jnp.maximum(mask_shift.sum(), 1.0)
-    loss = total_loss / total_tokens
+    ce_loss = total_loss / total_tokens
+
+    # -------------------- Fisher-whitening over PATHS (hardcoded) --------------------
+    # Only run if the model exposes the DNA extras on the last hop.
+    # Constants (hardcoded):
+    F_WEIGHT = 1e-3
+    PATH_BINS = 256  # hash buckets for approximate unique paths
+    TOPK_GROUPS = 32  # compare top-K populated groups
+    MIN_COUNT = 16.0  # ignore tiny groups
+    EPS = 1e-4
+
+    def fisher_paths_loss_fn():
+        # last hop stats carry "path_id", "h_final", "token_mask_final"
+        last = stats[-1]
+        h_final_bt = last["h_final"]  # (B, T, d)
+        path_id_bt = last["path_id"]  # (B, T)
+        # Align features/paths to CE positions (0..T-2)
+        h_bt = h_final_bt[:, :-1, :]  # (B, T-1, d)
+        pid_bt = path_id_bt[:, :-1]  # (B, T-1)
+        m_bt = mask_shift > 0  # (B, T-1) — use CE mask
+
+        B_, Tm1, d = h_bt.shape
+        V = logits_shift.shape[-1]
+        N = B_ * Tm1
+
+        # Empirical Fisher diag in feature space: s_h = W^T (y - p)
+        # W: tied unembedding (V,d)
+        W = model.embed.weight
+        p_bt = jnn.softmax(logits_shift, axis=-1)  # (B,T-1,V)
+        y_bt = jnn.one_hot(labels_shift, V, dtype=logits_shift.dtype)
+        s_z = y_bt - p_bt  # (B,T-1,V)
+        s_h = jnp.einsum("btv,vd->btd", s_z, W)  # (B,T-1,d)
+        fisher_diag = (s_h * s_h) * m_bt[..., None]
+        fisher_diag = fisher_diag.sum(axis=(0, 1)) / (m_bt.sum() + 1e-9)  # (d,)
+        fisher_diag = fisher_diag + EPS
+        sf = jnp.sqrt(fisher_diag)  # (d,)
+
+        # Flatten tokens
+        h_nd = h_bt.reshape(N, d)  # (N,d)
+        pid_n = pid_bt.reshape(N)  # (N,)
+        m_n = m_bt.reshape(N).astype(h_nd.dtype)  # (N,)
+
+        # Hash paths to fixed bins for static shapes
+        P = PATH_BINS
+        K = min(TOPK_GROUPS, P)
+        pid_u = pid_n.astype(jnp.uint32)
+        bins = jnp.mod(
+            pid_u * jnp.uint32(2654435761) + jnp.uint32(1013904223),
+            jnp.uint32(P),
+        ).astype(
+            jnp.int32
+        )  # (N,)
+
+        # Per-bin counts and means
+        counts = jnp.zeros((P,), dtype=h_nd.dtype)
+        counts = counts.at[bins].add(m_n)  # (P,)
+
+        sums = jnp.zeros((P, d), dtype=h_nd.dtype)
+        sums = sums.at[bins].add(h_nd * m_n[:, None])  # (P,d)
+        means = sums / (counts[:, None] + 1e-9)  # (P,d)
+
+        # Top-K populated groups
+        top_vals, top_idx = jax.lax.top_k(counts, K)  # (K,)
+        M = means[top_idx]  # (K,d)
+        present = (top_vals >= MIN_COUNT).astype(M.dtype)  # (K,)
+
+        # Fisher-weight rows, L2-normalise, and build Gram
+        Z = M * sf[None, :]  # (K,d)
+        Z_norm = Z / (jnp.linalg.norm(Z, axis=1, keepdims=True) + 1e-9)
+        G = Z_norm @ Z_norm.T  # (K,K)
+
+        I = jnp.eye(K, dtype=G.dtype)
+        pairmask = present[:, None] * present[None, :]
+        offmask = pairmask * (1.0 - I)
+
+        denom_off = jnp.maximum(offmask.sum(), 1.0)
+        off_loss = ((G * offmask) ** 2).sum() / denom_off
+
+        denom_diag = jnp.maximum(present.sum(), 1.0)
+        diag_loss = (((jnp.diag(G) - 1.0) * present) ** 2).sum() / denom_diag
+
+        return off_loss + 0.1 * diag_loss
+
+    # Guard: only apply when DNA extras are present (keeps Dense working)
+    fisher_ok = (
+        isinstance(stats, tuple)
+        and isinstance(stats[-1], dict)
+        and ("h_final" in stats[-1])
+        and ("path_id" in stats[-1])
+        and hasattr(model, "embed")
+        and hasattr(model.embed, "weight")
+        and (F_WEIGHT > 0.0)
+    )
+    fisher_loss = jax.lax.cond(
+        fisher_ok,
+        lambda: fisher_paths_loss_fn(),
+        lambda: jnp.array(0.0, dtype=ce_loss.dtype),
+    )
+    loss = ce_loss + F_WEIGHT * fisher_loss
+    # -------------------------------------------------------------------------
+
     return loss, (logits_shift, labels_shift, mask_shift, stats)
 
 
@@ -241,10 +345,12 @@ def eval_step(model, batch, *, key, model_kwargs):
 #     cos = 0.5 * (1 + jnp.cos(jnp.pi * progress))
 #     return jnp.where(step >= warmup, lr_peak * cos, lr).astype(jnp.float32)
 
+
 def lr_schedule(step, warmup, steps, lr_peak):
     warm = jnp.minimum(step / warmup, 1.0)
     lr = lr_peak * warm
     return lr.astype(jnp.float32)
+
 
 # ------------------------------ main ------------------------------ #
 

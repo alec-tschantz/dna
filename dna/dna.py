@@ -299,10 +299,15 @@ class DNA(eqx.Module):
         h_next = h + combine - rho * h
         h_next = jnp.where(token_mask[:, None], h_next, h)
 
+        # ----- NEW: per-token choice (top kept expert after capacity) -----
+        sel_scores = jnp.where(kept_t, logits_sel, -jnp.inf)           # (T, E)
+        choice = jnp.argmax(sel_scores, axis=1).astype(jnp.int32)      # (T,)
+
         # Collect raw statistics (no aggregation here)
         stats = self._stats(
             kept=kept, probs=probs_full, mask=mask_full, rho=rho, token_mask=token_mask
         )
+        stats["choice"] = choice  # (T,) int32
 
         return h_next, stats
 
@@ -350,6 +355,16 @@ class DNA(eqx.Module):
             jnp.ones((T,), dtype=bool) if mask is None else mask.astype(bool)
         )
 
+        # ---- NEW: infer number of experts and init path code ----
+        def _infer_n_exp(rtr):
+            if hasattr(rtr, "proj"):
+                return int(rtr.proj.weight.shape[0])        # Linear routers
+            if hasattr(rtr, "prototypes"):
+                return int(rtr.prototypes.shape[0])         # Cosine router
+            raise ValueError("Cannot infer number of experts from router.")
+        E = _infer_n_exp(self.routers[0])
+        path_id = jnp.zeros((T,), dtype=jnp.int32)
+
         # Embed tokens and apply dropout
         h: Float[Array, "T d"] = jax.vmap(self.embed)(ids)  # (T, d)
         key, sub = jax.random.split(key)
@@ -380,11 +395,22 @@ class DNA(eqx.Module):
                 router_temp=router_temp,
                 select_temp=select_temp,
             )
+            # ---- NEW: accumulate base-E path code using per-hop choice ----
+            path_id = path_id * E + st["choice"]
             stats_all.append(st)
 
         # Final layer norm and unembedding (tied weights)
         h = jax.vmap(self.ln_out)(h)  # (T, d)
+        h_final = h                   # ---- NEW: expose final features ----
         logits: Float[Array, "T V"] = jax.vmap(lambda t: t @ self.embed.weight.T)(h)
+
+        # ---- NEW: attach sequence-level extras to the last hop's stats ----
+        if len(stats_all) > 0:
+            last = {**stats_all[-1],
+                    "path_id": path_id,                 # (T,) int32
+                    "h_final": h_final,                 # (T,d) float
+                    "token_mask_final": token_mask}     # (T,) bool
+            stats_all[-1] = last
 
         return logits, tuple(stats_all)
 

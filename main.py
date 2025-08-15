@@ -66,7 +66,7 @@ class Config:
     seed: int = 0
 
     # logging/eval
-    wandb_project: str = "dna-slurm"
+    wandb_project: str = "dna-slurm-v2"
     eval_every: int = 200
     log_every: int = 10
     n_examples: int = 5
@@ -302,6 +302,7 @@ def compute_loss(
         and hasattr(model.embed, "weight")
         and (F_WEIGHT > 0.0)
     )
+
     fisher_loss = jax.lax.cond(
         fisher_ok,
         lambda: fisher_paths_loss_fn(),
@@ -362,7 +363,7 @@ def main():
         f"{cfg.model_type}-{cfg.dataset_name.split('/')[-1]}"
         f"-h{cfg.n_hops}-k{cfg.topk}-c{cfg.capacity}-r{cfg.router_type}"
         f"-d{cfg.d_model}-n{cfg.n_att_modules}-n{cfg.n_ff_modules}-i{cfg.n_id_modules}"
-        f"-b{cfg.backbone}-s{cfg.seed}-l{cfg.lr_peak}-g{cfg.gumbel_tau}"
+        f"-b{cfg.backbone}-s{cfg.seed}-l{cfg.lr_peak}-g{cfg.gumbel_tau}-fisher"
     )
     wandb.init(project=cfg.wandb_project, name=run_name, config=asdict(cfg))
 

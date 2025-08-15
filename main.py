@@ -29,7 +29,7 @@ class Config:
     vocab_size: int = 50_257
     d_model: int = 512
     n_heads: int = 16
-    n_hops: int = 8
+    n_hops: int = 12
     topk: int = 2
     capacity: int = 64
     mlp_mult: int = 4
@@ -42,12 +42,12 @@ class Config:
     gumbel_tau: float = 1.0
 
     # module pool (routed)
-    n_att_modules: int = 4
-    n_ff_modules: int = 4
+    n_att_modules: int = 6
+    n_ff_modules: int = 6
     n_id_modules: int = 0
 
     # backbone
-    backbone: List[str] = ("feedforward",)
+    backbone: Tuple[str] = ("feedforward",)
 
     # data
     dataset_name: str = "roneneldan/TinyStories"
@@ -58,7 +58,7 @@ class Config:
     # training
     steps: int = 20_000
     warmup: int = 2_000
-    lr_peak: float = 2e-4
+    lr_peak: float = 1e-4
     wd: float = 0.1
     clip: float = 1.0
     seed: int = 0

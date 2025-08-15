@@ -72,7 +72,7 @@ class Config:
     eval_samples: int = 8192
 
     # checkpoints
-    save_every: int = 1000
+    save_every: int = 2000
     ckpt_dir: str = "checkpoints"
 
 

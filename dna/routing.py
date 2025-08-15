@@ -90,6 +90,7 @@ class Router(eqx.Module):
         assert k <= n_exp, f"topk ({k}) must be ≤ n_exp ({n_exp})"
         self.k = int(k)
         self.proj = eqx.nn.Linear(d_model, n_exp, use_bias=False, key=key)
+        self.norm_probs = norm_probs
 
     def __call__(
         self,

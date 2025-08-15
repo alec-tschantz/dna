@@ -1,13 +1,8 @@
 from __future__ import annotations
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, List
 
 import time
-import os
-import json
-from pathlib import Path
-from datetime import datetime
-
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -21,6 +16,7 @@ from dna.routing import Router, CosineRouter, SequenceRouter
 from dna.dataloader import load_dataset_stream, sample_batch
 from logs import log_initial_stats, log_train_step, run_eval_suite, log_checkpoint
 
+
 # ------------------------------ config ------------------------------ #
 
 
@@ -28,21 +24,30 @@ from logs import log_initial_stats, log_train_step, run_eval_suite, log_checkpoi
 class Config:
     # architecture
     model_type: str = "dna"
-    router_type: str = "sequence"  # "default", "cosine", "sequence"
+    router_type: str = "sequence"
+    norm_probs: bool = False
     vocab_size: int = 50_257
     d_model: int = 512
     n_heads: int = 16
     n_hops: int = 8
-    n_modules: int = 8
     topk: int = 2
     capacity: int = 64
     mlp_mult: int = 4
     dropout: float = 0.1
     rope_base: float = 10_000.0
 
+    # routing temperatures
     router_temp: float = 1.0
     select_temp: float = 1.0
     gumbel_tau: float = 1.0
+
+    # module pool (routed)
+    n_att_modules: int = 4
+    n_ff_modules: int = 4
+    n_id_modules: int = 0
+
+    # backbone
+    backbone: List[str] = ("feedforward",)
 
     # data
     dataset_name: str = "roneneldan/TinyStories"
@@ -62,9 +67,9 @@ class Config:
     wandb_project: str = "dna-slurm"
     eval_every: int = 200
     log_every: int = 10
-    eval_samples: int = 2048
     n_examples: int = 5
     gen_len: int = 200
+    eval_samples: int = 2048
 
     # checkpoints
     save_every: int = 1000
@@ -78,50 +83,57 @@ def make_modules(
     *,
     d_model: int,
     n_heads: int,
-    n_modules: int,
+    n_att: int,
+    n_ff: int,
+    n_id: int,
     mlp_mult: int,
     dropout: float,
     key: jax.Array,
 ) -> Tuple[eqx.Module, ...]:
-    n_att = n_modules // 2
-    n_ff = n_modules // 2
-    # n_id = n_modules // 3
-    keys = list(jax.random.split(key, n_modules))
-    keys_att = keys[:n_att]
-    keys_ff = keys[n_att : n_att + n_ff]
-    attn = [Attention(d_model, n_heads, dropout, key=k) for k in keys_att]
-    ffn = [FeedForward(d_model, mlp_mult, dropout, key=k) for k in keys_ff]
-    # ident = [Identity() for _ in range(n_id)]
-    return tuple(attn + ffn)
+    total_param = n_att + n_ff
+    keys = list(jax.random.split(key, total_param)) if total_param > 0 else []
+    att = [Attention(d_model, n_heads, dropout, key=k) for k in keys[:n_att]]
+    ff = [FeedForward(d_model, mlp_mult, dropout, key=k) for k in keys[n_att:]]
+    ids = [Identity() for _ in range(n_id)]
+    return tuple(att + ff + ids)
 
 
 def make_backbone(
-    *, d_model: int, n_heads: int, mlp_mult: int, dropout: float, key: jax.Array
+    *,
+    d_model: int,
+    n_heads: int,
+    mlp_mult: int,
+    dropout: float,
+    backbone: List[str],
+    key: jax.Array,
 ) -> Tuple[eqx.Module, ...]:
-    k1, k2 = jax.random.split(key)
-    return (
-        # Attention(d_model, n_heads, dropout, key=k1),
-        FeedForward(d_model, mlp_mult, dropout, key=k2),
-    )
+    """Build backbone exactly as specified in `backbone` list."""
+    keys = list(jax.random.split(key, len(backbone))) if backbone else []
+    out: List[eqx.Module] = []
+    for i, layer_type in enumerate(backbone):
+        if layer_type.lower() == "attention":
+            out.append(Attention(d_model, n_heads, dropout, key=keys[i]))
+        elif layer_type.lower() == "feedforward":
+            out.append(FeedForward(d_model, mlp_mult, dropout, key=keys[i]))
+        else:
+            raise ValueError(f"Unknown backbone layer type '{layer_type}'")
+    return tuple(out)
 
 
-def make_router_cls(router_type):
-    return {
-        "default": Router,
-        "cosine": CosineRouter,
-        "sequence": SequenceRouter,
-    }[router_type]
+def make_router_cls(router_type: str):
+    cfg = {"default": Router, "cosine": CosineRouter, "sequence": SequenceRouter}
+    return cfg[router_type]
 
 
 def build_model(cfg: Config, key: jax.Array) -> eqx.Module:
-    mt = cfg.model_type.lower()
-    if mt == "dna":
-
+    if cfg.model_type.lower() == "dna":
         km, kb, kmodel = jax.random.split(key, 3)
         modules = make_modules(
             d_model=cfg.d_model,
             n_heads=cfg.n_heads,
-            n_modules=cfg.n_modules,
+            n_att=cfg.n_att_modules,
+            n_ff=cfg.n_ff_modules,
+            n_id=cfg.n_id_modules,
             mlp_mult=cfg.mlp_mult,
             dropout=cfg.dropout,
             key=km,
@@ -131,12 +143,12 @@ def build_model(cfg: Config, key: jax.Array) -> eqx.Module:
             n_heads=cfg.n_heads,
             mlp_mult=cfg.mlp_mult,
             dropout=cfg.dropout,
+            backbone=cfg.backbone,
             key=kb,
         )
-        router_cls = make_router_cls(cfg.router_type)
         return DNA(
             modules=modules,
-            router_cls=router_cls,
+            router_cls=make_router_cls(cfg.router_type),
             vocab=cfg.vocab_size,
             d_model=cfg.d_model,
             n_heads=cfg.n_heads,
@@ -145,24 +157,23 @@ def build_model(cfg: Config, key: jax.Array) -> eqx.Module:
             n_hops=cfg.n_hops,
             dropout=cfg.dropout,
             rope_base=cfg.rope_base,
+            norm_probs=cfg.norm_probs,
             backbone=backbone,
             key=kmodel,
         )
-    elif mt == "dense":
+    elif cfg.model_type.lower() == "dense":
         return Dense(
             vocab=cfg.vocab_size,
             d_model=cfg.d_model,
             n_heads=cfg.n_heads,
-            n_layers=cfg.n_hops,  
+            n_layers=cfg.n_hops,
             mlp_mult=cfg.mlp_mult,
             dropout=cfg.dropout,
             rope_base=cfg.rope_base,
             key=key,
         )
     else:
-        raise ValueError(
-            f"Unknown model_type '{cfg.model_type}' (use 'dna' or 'dense')."
-        )
+        raise ValueError(f"Unknown model_type '{cfg.model_type}'")
 
 
 # ------------------------------ training fns ------------------------------ #
@@ -199,15 +210,7 @@ def compute_loss(
 
 
 @eqx.filter_jit
-def train_step(
-    model: eqx.Module,
-    opt: optax.GradientTransformation,
-    opt_state,
-    batch: Dict[str, Any],
-    *,
-    key: jax.Array,
-    model_kwargs: Dict[str, jax.Array],
-):
+def train_step(model, opt, opt_state, batch, *, key, model_kwargs):
     (loss, (logits, labels, mask, stats)), grads = eqx.filter_value_and_grad(
         compute_loss, has_aux=True
     )(model, batch, key, inference=False, model_kwargs=model_kwargs)
@@ -215,33 +218,22 @@ def train_step(
     model = eqx.apply_updates(model, updates)
     predictions = jnp.argmax(logits, axis=-1)
     valid = mask > 0
-    correct = (predictions == labels) & valid
-    acc = correct.sum() / jnp.maximum(valid.sum(), 1)
+    acc = ((predictions == labels) & valid).sum() / jnp.maximum(valid.sum(), 1)
     gnorm = optax.global_norm(grads)
     return model, opt_state, loss, acc, stats, gnorm
 
 
 @eqx.filter_jit
-def eval_step(
-    model: eqx.Module,
-    batch: Dict[str, Any],
-    *,
-    key: jax.Array,
-    model_kwargs: Dict[str, jax.Array],
-) -> Tuple[float, float]:
-    loss, (logits, labels, mask, _stats) = compute_loss(
+def eval_step(model, batch, *, key, model_kwargs):
+    loss, (logits, labels, mask, _) = compute_loss(
         model, batch, key, inference=True, model_kwargs=model_kwargs
     )
-    predictions = jnp.argmax(logits, axis=-1)
-    valid = mask > 0
-    correct = (predictions == labels) & valid
-    acc = correct.sum() / jnp.maximum(valid.sum(), 1)
+    denom = jnp.maximum(mask.sum(), 1)
+    acc = ((jnp.argmax(logits, -1) == labels) & (mask > 0)).sum() / denom
     return loss, acc
 
 
-def lr_schedule(
-    step: jnp.ndarray, warmup: int, steps: int, lr_peak: float
-) -> jnp.ndarray:
+def lr_schedule(step, warmup, steps, lr_peak):
     warm = jnp.minimum(step / warmup, 1.0)
     lr = lr_peak * warm
     decay_steps = jnp.maximum(steps - warmup, 1)
@@ -256,10 +248,12 @@ def lr_schedule(
 def main():
     cfg: Config = tyro.cli(Config)
 
-    run_name = f"{cfg.model_type}-{cfg.dataset_name.split('/')[-1]}-h{cfg.n_hops}"
-    if cfg.model_type.lower() == "dna":
-        run_name += f"-k{cfg.topk}-c{cfg.capacity}-r{cfg.router_type}"
-
+    run_name = (
+        f"{cfg.model_type}-{cfg.dataset_name.split('/')[-1]}"
+        f"-h{cfg.n_hops}-k{cfg.topk}-c{cfg.capacity}-r{cfg.router_type}-a{cfg.n}"
+        f"-d{cfg.d_model}-n{cfg.n_att_modules}-n{cfg.n_ff_modules}-i{cfg.n_id_modules}"
+        f"-b{cfg.backbone}-s{cfg.seed}"
+    )
     wandb.init(project=cfg.wandb_project, name=run_name, config=asdict(cfg))
 
     tok = AutoTokenizer.from_pretrained("gpt2")
@@ -286,28 +280,18 @@ def main():
     key, model_key = jax.random.split(key)
     model = build_model(cfg, model_key)
 
-    model_kwargs: Dict[str, jax.Array] = {
+    model_kwargs = {
         "gumbel_tau": jnp.array([cfg.gumbel_tau], dtype=jnp.float32),
         "router_temp": jnp.array([cfg.router_temp], dtype=jnp.float32),
         "select_temp": jnp.array([cfg.select_temp], dtype=jnp.float32),
     }
 
     first_batch = sample_batch(train_stream, cfg.batch_size)
-    log_initial_stats(
-        model,
-        first_batch,
-        cfg=cfg,
-        seq_len=cfg.seq_len,
-        capacity=cfg.capacity,
-        topk=cfg.topk,
-        n_hops=cfg.n_hops,
-        model_type=cfg.model_type,
-    )
+    log_initial_stats(model, first_batch, cfg, stream=train_stream)
 
     schedule_fn = lambda step: lr_schedule(
         jnp.array(step), cfg.warmup, cfg.steps, cfg.lr_peak
     )
-
     opt = optax.chain(
         optax.clip_by_global_norm(cfg.clip),
         optax.adamw(
@@ -316,19 +300,13 @@ def main():
     )
     opt_state = opt.init(eqx.filter(model, eqx.is_array))
 
-    print(f"\nStarting training for {cfg.steps} steps...")
-    print("=" * 60)
-
     for step in range(cfg.steps + 1):
         batch = sample_batch(train_stream, cfg.batch_size)
-
         key, step_key = jax.random.split(key)
         t0 = time.perf_counter()
         model, opt_state, loss, acc, stats, gnorm = train_step(
             model, opt, opt_state, batch, key=step_key, model_kwargs=model_kwargs
         )
-        step_time_ms = (time.perf_counter() - t0) * 1000.0
-
         if step % cfg.log_every == 0:
             log_train_step(
                 step=step,
@@ -338,16 +316,10 @@ def main():
                 loss=loss,
                 acc=acc,
                 gnorm=gnorm,
-                step_time_ms=step_time_ms,
+                step_time_ms=(time.perf_counter() - t0) * 1000.0,
                 stats=stats,
                 model_kwargs=model_kwargs,
             )
-            if step % (cfg.log_every * 10) == 0:
-                print(
-                    f"Step {step:5d} | Loss: {float(loss):.4f} | Acc: {float(acc):.4f} | "
-                    f"LR: {float(schedule_fn(step)):.2e} | Time: {step_time_ms:.1f}ms"
-                )
-
         if step % cfg.eval_every == 0 and step > 0:
             key = run_eval_suite(
                 step=step,
@@ -360,7 +332,6 @@ def main():
                 model_kwargs_train=model_kwargs,
                 sample_batch_fn=sample_batch,
             )
-
         if step % cfg.save_every == 0:
             log_checkpoint(
                 run_name=run_name,

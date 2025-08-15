@@ -12,24 +12,22 @@ def sample(
     model: eqx.Module,
     prompt_ids: Int[Array, "T0"],
     max_new_tokens: int,
+    pad_id: int,
     *,
     key,
     temperature: float = 0.8,
     greedy: bool = False,
-    pad_id: int = 0,
     eos_id: Optional[int] = None,
     router_temp: float = 1.0,
     select_temp: Optional[float] = None,
     gumbel_tau: float = 1.0,
 ) -> Int[Array, "T"]:
-    """Autoregressive sampler."""
     if eos_id is None:
         eos_id = int(pad_id)
 
     prompt_len = int(prompt_ids.shape[0])
     total_len = int(prompt_len + max_new_tokens)
 
-    # ---- Allocate output token buffer and write prompt ----
     tokens: Int[Array, "T"] = jnp.full((total_len,), pad_id, dtype=jnp.int32)
     tokens = tokens.at[:prompt_len].set(prompt_ids)
 
@@ -39,7 +37,6 @@ def sample(
         toks, cur, done, k = carry
         k, subkey = jax.random.split(k)
 
-        # Valid positions are strictly < cur
         attn_mask = jnp.arange(total_len, dtype=jnp.int32) < cur  # (T,)
 
         logits, _stats = model(
@@ -47,7 +44,7 @@ def sample(
             key=subkey,
             inference=True,
             mask=attn_mask,
-            gumbel_tau=gumbel_tau,  
+            gumbel_tau=gumbel_tau,
             router_temp=router_temp,
             select_temp=select_temp,
         )
@@ -104,8 +101,9 @@ def generate(
 
     results: List[Dict[str, Any]] = []
 
-    eos_id = tok.eos_token_id if tok.eos_token_id is not None else tok.pad_token_id
-    pad_id = tok.pad_token_id if tok.pad_token_id is not None else 0
+    # TODO
+    pad_id = tok.pad_token_id
+    eos_id = tok.eos_token_id if tok.eos_token_id is not None else pad_id
 
     for p in prompts[:n_examples]:
         prompt_ids = jnp.array(tok.encode(p), dtype=jnp.int32)
@@ -118,17 +116,17 @@ def generate(
                 model=model,
                 prompt_ids=prompt_ids,
                 max_new_tokens=gen_len,
+                pad_id=pad_id,
                 temperature=temperature,
                 key=k,
                 router_temp=router_temp,
                 select_temp=select_temp,
                 gumbel_tau=gumbel_tau,
                 greedy=greedy,
-                pad_id=pad_id,
                 eos_id=eos_id,
             )
 
-        toks = _sample(subs)  
+        toks = _sample(subs)
         prompt_result = {"prompt": p, "completions": []}
 
         for seq in jax.device_get(toks):

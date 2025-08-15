@@ -1,13 +1,14 @@
-# logs.py
-"""Generic training/eval utilities for DNA + Dense models."""
-
-from __future__ import annotations
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import textwrap
+import plotly.graph_objects as go
+from rich.pretty import pprint as rpprint
 from collections import Counter
 from pathlib import Path
 from datetime import datetime
 import json
+
+from matplotlib.patches import Rectangle, PathPatch
+from matplotlib.path import Path as MplPath
 
 import equinox as eqx
 import jax
@@ -17,24 +18,72 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch
 import wandb
 
-from dna import generate
+from dna import generate, Attention, FeedForward, Identity
 
 
-# =============================================================================
-# Public logging API
-# =============================================================================
+def _print_ascii_dna() -> None:
+    D = [
+        "███████  ",
+        "██    ██ ",
+        "██    ██ ",
+        "██    ██ ",
+        "██    ██ ",
+        "███████  ",
+    ]
+    N = [
+        "██    ██ ",
+        "███   ██ ",
+        "██ ██ ██ ",
+        "██  ███  ",
+        "██   ███ ",
+        "██    ██ ",
+    ]
+    A = [
+        "  █████  ",
+        " ██   ██ ",
+        "██     ██",
+        "█████████",
+        "██     ██",
+        "██     ██",
+    ]
+
+    rows = max(len(D), len(N), len(A))
+    lines = []
+    for i in range(rows):
+        d = D[i] if i < len(D) else " " * len(D[0])
+        n = N[i] if i < len(N) else " " * len(N[0])
+        a = A[i] if i < len(A) else " " * len(A[0])
+        lines.append(d + "   " + n + "   " + a)
+
+    h, w = len(lines), max(len(l) for l in lines)
+    dx, dy = 2, 1
+    canvas = [[" " for _ in range(w + dx)] for _ in range(h + dy)]
+    for y in range(h):
+        for x, ch in enumerate(lines[y]):
+            if ch != " ":
+                if canvas[y + dy][x + dx] == " ":
+                    canvas[y + dy][x + dx] = "░"
+                canvas[y][x] = ch
+
+    shaded = ["".join(row).rstrip() for row in canvas]
+    width = max(66, min(140, max(len(s) for s in shaded) + 4))  # nice box width
+    print(_ansi_box("DNA", shaded, width=width))
+
+
+# -----------------------------------------------------------------------------
+# Checkpoints
+# -----------------------------------------------------------------------------
 
 
 def log_checkpoint(
     *,
     run_name: str,
-    cfg: Config,
+    cfg: Any,
     step: int,
     model: eqx.Module,
     opt_state,
     lr_value: float,
 ):
-    """Save model/optimizer + minimal JSON meta."""
     ckpt_dir = Path(cfg.ckpt_dir) / run_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -44,7 +93,6 @@ def log_checkpoint(
 
     eqx.tree_serialise_leaves(model_path, eqx.filter(model, eqx.is_array))
     eqx.tree_serialise_leaves(opt_path, opt_state)
-
     meta = {
         "step": int(step),
         "run_name": run_name,
@@ -52,64 +100,80 @@ def log_checkpoint(
         "lr": float(lr_value),
         "seed": int(cfg.seed),
         "model_type": cfg.model_type,
-        "router_type": cfg.router_type,
+        "router_type": getattr(cfg, "router_type", None),
         "seq_len": int(cfg.seq_len),
         "batch_size": int(cfg.batch_size),
         "n_hops": int(cfg.n_hops),
-        "topk": int(cfg.topk),
-        "capacity": int(cfg.capacity),
+        "topk": int(getattr(cfg, "topk", 0)),
+        "capacity": int(getattr(cfg, "capacity", 0)),
         "d_model": int(cfg.d_model),
         "n_heads": int(cfg.n_heads),
-        "n_modules": int(cfg.n_modules),
         "wandb_project": cfg.wandb_project,
     }
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"[ckpt] saved: {model_path}  |  {opt_path}")
+    print(f" [Checkpoint] saved: {model_path}  |  {opt_path}")
+
+
+# -----------------------------------------------------------------------------
+# Initial stats
+# -----------------------------------------------------------------------------
 
 
 def log_initial_stats(
-    model,
-    first_batch: Dict[str, Any],
-    *,
-    cfg: Any = None,
-    seq_len: int = 0,
-    capacity: Optional[int] = None,
-    topk: Optional[int] = None,
-    n_hops: Optional[int] = None,
-    model_type: str = "dna",
+    model, first_batch: Dict[str, Any], cfg: Any, *, stream: Optional[Any] = None
 ) -> None:
-    """Log initial model + data stats. (API unchanged)"""
-    n_params = count_params(model)
-    lmean, lmin, lmax, pmean = batch_seq_stats(
-        jnp.asarray(first_batch["attention_mask"]), seq_len
+    _print_ascii_dna()
+
+    n_params = sum(
+        p.size for p in jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
+    )
+    mask = jnp.asarray(first_batch["attention_mask"])
+    seq_len = int(mask.shape[1])
+    lengths = mask.sum(axis=1)
+    lmean, lmin, lmax = float(lengths.mean()), int(lengths.min()), int(lengths.max())
+    pmean = float((seq_len - lengths).mean())
+    pad_frac = pmean / max(seq_len, 1)
+
+    lines = [
+        f"dataset: {cfg.dataset_name}"
+        + (f" [{cfg.dataset_config}]" if getattr(cfg, "dataset_config", None) else ""),
+        f"batch_size: {cfg.batch_size} | seq_len: {seq_len}",
+        f"avg_tokens: {lmean:.1f} | min: {lmin} | max: {lmax}",
+        f"avg_pad: {pmean:.1f} ({pad_frac:.1%})",
+        f"params: {n_params:,}",
+        f"model_type: {cfg.model_type} | hops: {cfg.n_hops}"
+        + (
+            f" | topk: {cfg.topk} | capacity: {cfg.capacity}"
+            if cfg.model_type.lower() == "dna"
+            else ""
+        ),
+    ]
+
+    rpprint(vars(cfg))
+    rpprint(eqx.filter(model, eqx.is_array))
+
+    _print_ascii_dna()
+    print(_ansi_box("Dataset & Model Summary", lines, width=66))
+
+
+    wandb.log(
+        {
+            "init/n_params": n_params,
+            "init/seq_len": seq_len,
+            "init/seq_len_mean": lmean,
+            "init/seq_len_min": lmin,
+            "init/seq_len_max": lmax,
+            "init/pad_mean": pmean,
+            "step": 0,
+        }
     )
 
-    print(cfg)
-    print("=" * 60)
-    print(f"Total parameters: {n_params:,}")
-    if model_type.lower() == "dna":
-        print(f"Architecture: Capacity={capacity}, TopK={topk}, Hops={n_hops}")
-    else:
-        print(f"Architecture: Dense | Layers(n_hops)={n_hops}")
-    print(f"Sequence stats: mean={lmean:.1f}, min={lmin}, max={lmax}")
-    print(f"Average padding: {pmean:.1f}")
-    print("=" * 60)
 
-    base = {
-        "model/type": model_type,
-        "n_params": n_params,
-        "hops": n_hops,
-        "seq/len_mean": lmean,
-        "seq/len_min": lmin,
-        "seq/len_max": lmax,
-        "seq/pad_mean": pmean,
-        "step": 0,
-    }
-    if model_type.lower() == "dna":
-        base.update({"capacity": capacity, "topk": topk})
-    wandb.log(base)
+# -----------------------------------------------------------------------------
+# Train step
+# -----------------------------------------------------------------------------
 
 
 def log_train_step(
@@ -125,45 +189,58 @@ def log_train_step(
     stats,
     model_kwargs: Dict[str, jax.Array],
 ):
-    """Log training metrics + router metrics. (API unchanged)"""
-    train_logs = {
+    """Log core training metrics, with optional router metrics if available."""
+    tok_per_sec = (cfg.batch_size * cfg.seq_len) / max(step_time_ms / 1000.0, 1e-9)
+    logs = {
+        "step": int(step),
         "train/loss": float(loss),
         "train/acc": float(acc),
         "train/grad_norm": float(gnorm),
         "train/lr": float(schedule_fn(step)),
-        "train/tok_per_sec": cfg.batch_size
-        * cfg.seq_len
-        / max(step_time_ms / 1000.0, 1e-9),
-        "train/weights_global_norm": l2_tree_norm(model),
-        "step": step,
+        "train/tok_per_sec": float(tok_per_sec),
+        "train/weights_global_norm": float(l2_tree_norm(model)),
     }
 
     if has_routing(model) and isinstance(stats, (tuple, list)) and len(stats) > 0:
         stats_host = jax.tree_util.tree_map(jax.device_get, stats)
-        router_logs = {
-            "router/norm": router_l2_norm(model),
-            "router/temps/router": float(
-                model_kwargs.get("router_temp", jnp.array([0.0]))[0]
-            ),
-            "router/temps/select": float(
-                model_kwargs.get("select_temp", jnp.array([0.0]))[0]
-            ),
-            "router/temps/gumbel": float(
-                model_kwargs.get("gumbel_tau", jnp.array([0.0]))[0]
-            ),
-            "step": step,
-        }
-        router_logs.update(
+        logs.update(
+            {
+                "router/norm": float(router_l2_norm(model)),
+                "router/temp/router": float(
+                    model_kwargs.get("router_temp", jnp.array([0.0]))[0]
+                ),
+                "router/temp/select": float(
+                    model_kwargs.get("select_temp", jnp.array([0.0]))[0]
+                ),
+                "router/temp/gumbel": float(
+                    model_kwargs.get("gumbel_tau", jnp.array([0.0]))[0]
+                ),
+            }
+        )
+        logs.update(
             routing_metrics_from_stats(
                 stats_host,
                 prefix="router/train",
                 capacity=getattr(cfg, "capacity", None),
             )
         )
-        router_logs.update(_extra_routing_metrics(stats_host, prefix="router/train"))
-        wandb.log({**train_logs, **router_logs})
-    else:
-        wandb.log(train_logs)
+        logs.update(_extra_routing_metrics(stats_host, prefix="router/train"))
+
+    # --- Console ---
+    print(
+        f"  [Train] Step: {step} | "
+        f"Loss: {float(loss):.4f} | "
+        f"Acc: {float(acc):.4f} | "
+        f"LR: {logs['train/lr']:.5f} | "
+        f"T/s: {tok_per_sec:,.0f}"
+    )
+
+    wandb.log(logs)
+
+
+# -----------------------------------------------------------------------------
+# Evaluation suite
+# -----------------------------------------------------------------------------
 
 
 def run_eval_suite(
@@ -178,7 +255,6 @@ def run_eval_suite(
     model_kwargs_train: Dict[str, jax.Array],
     sample_batch_fn,
 ):
-    # ---- core eval ----
     key, eval_key = jax.random.split(key)
     eval_batch = sample_batch_fn(val_stream, cfg.eval_samples // cfg.seq_len)
     eval_kwargs = {
@@ -198,10 +274,8 @@ def run_eval_suite(
     wandb.log({"eval/loss": float(val_loss), "eval/acc": float(val_acc), "step": step})
     print(f"  [Eval] Loss: {float(val_loss):.4f} | Acc: {float(val_acc):.4f}")
 
-    # ---- routing visuals ----
     key, vis_key = jax.random.split(key)
     vis_batch = sample_batch_fn(val_stream, min(16, cfg.batch_size))
-
     log_routing_visuals_if_available(
         model,
         vis_batch,
@@ -214,23 +288,18 @@ def run_eval_suite(
         num_examples=1,
         max_tokens_grid=96,
     )
-
-    # ---- token→expert arrow graphic (new) ----
     key, arrows_key = jax.random.split(key)
-    try:
-        log_token_expert_flow_arrows(
-            model,
-            vis_batch,
-            tok,
-            key=arrows_key,
-            gumbel_tau=0.0,
-            router_temp=float(eval_kwargs["router_temp"][0]),
-            select_temp=float(eval_kwargs["select_temp"][0]),
-            step=step,
-            max_tokens=64,  # limit for readability (32–64 recommended)
-        )
-    except Exception as e:
-        print(f"[warn] token→expert arrows failed: {e}")
+    log_token_expert_flow_arrows(
+        model,
+        vis_batch,
+        tok,
+        key=arrows_key,
+        gumbel_tau=0.0,
+        router_temp=float(eval_kwargs["router_temp"][0]),
+        select_temp=float(eval_kwargs["select_temp"][0]),
+        step=step,
+        max_tokens=64,
+    )
 
     _ = log_routing_sankey_if_available(
         model,
@@ -245,7 +314,6 @@ def run_eval_suite(
         by_type=False,
     )
 
-    # ---- Path Diversity ----
     key, div_key = jax.random.split(key)
     div = analyze_path_diversity(
         model,
@@ -259,7 +327,6 @@ def run_eval_suite(
     if div is not None:
         plot_path_diversity_dashboard(div, step)
 
-    # ---- Token↔Path Specialization ----
     key, spec_key = jax.random.split(key)
     spec = analyze_token_path_specialization(
         model,
@@ -274,9 +341,8 @@ def run_eval_suite(
     )
     if spec is not None:
         plot_token_path_specialization(spec, step)
-        log_token_path_sankey(spec, step)  # optional, Plotly
+        log_token_path_sankey(spec, step)
 
-    # ---- generation ----
     key, gen_key = jax.random.split(key)
     prompts = [
         "Once upon a time, ",
@@ -285,34 +351,41 @@ def run_eval_suite(
         "One sunny morning, ",
         "The brave knight ",
     ]
+    temps = {
+        "router_temp": float(
+            model_kwargs_train.get("router_temp", jnp.array([1.0]))[0]
+        ),
+        "select_temp": float(
+            model_kwargs_train.get("select_temp", jnp.array([1.0]))[0]
+        ),
+        "gumbel_tau": float(model_kwargs_train.get("gumbel_tau", jnp.array([0.0]))[0]),
+    }
     results = generate(
         model,
         tok,
         key=gen_key,
         gen_len=cfg.gen_len,
         per_prompt=1,
-        router_temp=float(model_kwargs_train.get("router_temp", jnp.array([1.0]))[0]),
-        select_temp=float(model_kwargs_train.get("select_temp", jnp.array([1.0]))[0]),
-        gumbel_tau=float(model_kwargs_train.get("gumbel_tau", jnp.array([0.0]))[0]),
+        router_temp=temps["router_temp"],
+        select_temp=temps["select_temp"],
+        gumbel_tau=temps["gumbel_tau"],
         prompts=prompts,
         n_examples=cfg.n_examples,
     )
 
-    print("\n" + "=" * 60)
-    print("Generated Examples")
-    print("=" * 60)
     for r in results:
-        p = r["prompt"]
-        for comp in r["completions"]:
-            text = comp["text"].replace("\n", "\\n")
-            print(f"\nPrompt: {p}")
-            print(
-                f"Completion [{comp['length']} tokens]{' (eos)' if comp['stopped_eos'] else ''}:"
-            )
-            for line in textwrap.wrap(text, width=100, break_long_words=False):
-                print(line)
-            print("-" * 40)
+        prompt = r["prompt"]
+        comp = r["completions"][0]
+        text = comp["text"].replace("\n", " ")
+        lines = [
+            f"len={comp['length']} | eos={bool(comp.get('stopped_eos', False))}",
+            "",
+            text,
+        ]
+        print(_ansi_box(f"Prompt: {prompt}", lines, width=88))
+        print()
 
+    _render_generation_cards(results, temps, step)
     return key
 
 
@@ -356,6 +429,94 @@ def router_l2_norm(model) -> float:
         sq = sum(jnp.sum(jnp.square(x)) for x in leaves)
         return float(jnp.sqrt(sq + 1e-12))
     return 0.0
+
+
+# =============================================================================
+# Rendering
+# =============================================================================
+
+
+def _ansi_box(title: str, body_lines: list[str], width: int = 88) -> str:
+    """Render a heavy-line ANSI box with a title and wrapped body lines."""
+    h, v = "━", "┃"
+    tl, tr, bl, br = "┏", "┓", "┗", "┛"
+    sep_left, sep_right = "┣", "┫"
+
+    def pad(s: str) -> str:
+        s = s.replace("\t", " ")[: width - 4]
+        return s + " " * (width - 4 - len(s))
+
+    top = f"{tl}{h*(width-2)}{tr}"
+    title_line = f"{v} {pad(title)} {v}"
+    mid = f"{sep_left}{h*(width-2)}{sep_right}"
+    bot = f"{bl}{h*(width-2)}{br}"
+
+    lines = [top, title_line, mid]
+    for ln in body_lines:
+        for w in textwrap.wrap(ln, width=width - 4, break_long_words=False):
+            lines.append(f"{v} {pad(w)} {v}")
+    lines.append(bot)
+    return "\n".join(lines)
+
+
+def _render_generation_cards(results, temps: Dict[str, float], step: int):
+    max_cards = min(6, len(results))
+    cols = 2
+    rows = int(np.ceil(max_cards / cols))
+    fig_h = rows * 3.4
+    fig_w = cols * 6.2
+    fig = plt.figure(figsize=(fig_w, fig_h), dpi=160)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.axis("off")
+
+    margin_x, margin_y = 0.06, 0.08
+    card_w = (1 - margin_x * (cols + 1)) / cols
+    card_h = (1 - margin_y * (rows + 1)) / rows
+
+    for i in range(max_cards):
+        r, c = divmod(i, cols)
+        x = margin_x + c * (card_w + margin_x)
+        y = 1 - margin_y - (r + 1) * card_h - r * margin_y
+
+        # card
+        box = FancyBboxPatch(
+            (x, y),
+            card_w,
+            card_h,
+            boxstyle="round,pad=0.012,rounding_size=0.02",
+            linewidth=1.2,
+            edgecolor="black",
+            facecolor="white",
+        )
+        ax.add_patch(box)
+
+        prompt = results[i]["prompt"]
+        comp = results[i]["completions"][0]
+        text = comp["text"].strip().replace("\n", " ")
+        info = f"len={comp['length']} | eos={bool(comp.get('stopped_eos', False))}"
+        header = f"Prompt: {prompt}"
+        wrapped = textwrap.fill(text, width=70, break_long_words=False)
+        ax.text(
+            x + 0.02,
+            y + card_h - 0.06,
+            f"{header}\n\n{wrapped}\n\n{info}",
+            va="top",
+            ha="left",
+            fontsize=8.5,
+            family="DejaVu Sans",
+        )
+
+    footer = (
+        f"router_temp={temps['router_temp']:.2f} | "
+        f"select_temp={temps['select_temp']:.2f} | "
+        f"gumbel_tau={temps['gumbel_tau']:.2f} | step={step}"
+    )
+    ax.text(
+        0.5, 0.01, footer, ha="center", va="bottom", fontsize=8, family="DejaVu Sans"
+    )
+
+    wandb.log({"gen/cards": wandb.Image(fig), "step": step})
+    plt.close(fig)
 
 
 # =============================================================================
@@ -626,7 +787,6 @@ def evaluate_for_visuals(
         importance_matrix.append(avg)
     importance_matrix = jnp.stack(importance_matrix, axis=0)
 
-    # sample a few sequences for token-flow visual
     S = int(min(num_examples, B))
     sel_idx = jax.random.choice(
         jax.random.fold_in(key, 123), B, shape=(S,), replace=False
@@ -698,7 +858,6 @@ def plot_heatmap(batch_stats: Dict[str, Any], step: int) -> None:
     ax.set_yticks(range(imp.shape[1]))
     ax.set_yticklabels(labels)
 
-    # plt.tight_layout()
     wandb.log({"routing/heatmap": wandb.Image(fig), "step": step})
     plt.close(fig)
 
@@ -788,7 +947,6 @@ def plot_token_flow_rich(
     ax.set_xticks([])
     ax.set_title(f"{title} • step {step}\npreview: {preview}", pad=10)
 
-    # plt.tight_layout()
     wandb.log({"routing/token_flow_rich": wandb.Image(fig), "step": step})
     plt.close(fig)
 
@@ -896,11 +1054,6 @@ def log_routing_sankey_if_available(
     min_frac: float = 0.01,
     by_type: bool = False,
 ):
-    """Interactive Sankey of token routing transitions + transition heatmaps."""
-    try:
-        import plotly.graph_objects as go
-    except ImportError:
-        return None
 
     top1, mask_bt, meta = _collect_top1_indices_all(
         model,
@@ -1019,7 +1172,6 @@ def log_routing_sankey_if_available(
     )
     wandb.log({"routing/sankey": fig_sankey, "step": step})
 
-    # transition heatmaps (matplotlib)
     if flows:
         ncols = min(3, max(1, len(flows)))
         nrows = int(np.ceil(len(flows) / ncols))
@@ -1034,7 +1186,6 @@ def log_routing_sankey_if_available(
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         for j in range(len(flows), len(axes)):
             axes[j].axis("off")
-        # plt.tight_layout()
         wandb.log({"routing/transition_heatmap": wandb.Image(fig_hm), "step": step})
         plt.close(fig_hm)
 
@@ -1138,7 +1289,6 @@ def plot_path_diversity_dashboard(div: Dict[str, Any], step: int):
     fig = plt.figure(figsize=(18, 11))
     gs = fig.add_gridspec(2, 3, height_ratios=[1.1, 1.4], wspace=0.25, hspace=0.35)
 
-    # (A) metric tiles
     axA = fig.add_subplot(gs[0, :])
     axA.axis("off")
     tiles = [
@@ -1172,7 +1322,6 @@ def plot_path_diversity_dashboard(div: Dict[str, Any], step: int):
         f"Path Diversity • step {step}", loc="left", fontsize=13, weight="bold"
     )
 
-    # (B) Lorenz curve
     axB = fig.add_subplot(gs[1, 0])
     p_sorted = np.sort(div["probs"])
     L = np.concatenate([[0.0], np.cumsum(p_sorted)])
@@ -1183,7 +1332,6 @@ def plot_path_diversity_dashboard(div: Dict[str, Any], step: int):
     axB.set_ylabel("Cumulative fraction of tokens")
     axB.set_title(f"Lorenz Curve (Gini={div['gini']:.2f})")
 
-    # (C) Top paths bar chart
     axC = fig.add_subplot(gs[1, 1])
     labels = [f"P{i+1}" for i in range(len(topN))]
     counts = [c for _, c in topN]
@@ -1200,7 +1348,6 @@ def plot_path_diversity_dashboard(div: Dict[str, Any], step: int):
             fontsize=9,
         )
 
-    # (D) Path barcodes (rows = paths, cols = hops)
     axD = fig.add_subplot(gs[1, 2])
     color_grid = np.zeros((len(topN), H, 4), dtype=np.float32)
     for i, (path, _) in enumerate(topN):
@@ -1385,7 +1532,6 @@ def plot_token_path_specialization(spec: Dict[str, Any], step: int):
         hspace=0.38,
     )
 
-    # ============== (1) TOP-LEFT: Category mix per path (row-normalized) ==========
     ax1 = fig.add_subplot(gs[0, 0])
     mat = np.asarray(spec["category_matrix"])  # shape (M, C), rows sum to 1
 
@@ -1425,7 +1571,6 @@ def plot_token_path_specialization(spec: Dict[str, Any], step: int):
     except Exception:
         pass
 
-    # ============== (2) BOTTOM-LEFT: Path composition (experts per hop) ===========
     ax2 = fig.add_subplot(gs[1, 0])
     ax2.imshow(color_grid, aspect="auto", interpolation="nearest")  # shape (H, M, 4)
 
@@ -1465,7 +1610,6 @@ def plot_token_path_specialization(spec: Dict[str, Any], step: int):
             frameon=False,
         )
 
-    # ============== (3) RIGHT COLUMN: Compact top-token cards ======================
     ax3 = fig.add_subplot(gs[:, 1])
     ax3.axis("off")
 
@@ -1507,7 +1651,7 @@ def plot_token_path_specialization(spec: Dict[str, Any], step: int):
             transform=ax3.transAxes,
             va="top",
             ha="left",
-            family="monospace",
+            # family="monospace",
             fontsize=9,
             bbox=box_kw,
         )
@@ -1531,7 +1675,6 @@ def log_token_path_sankey(spec: Dict[str, Any], step: int):
         return
 
     cat = spec["categories"]
-    # approximate counts by mixing proportions × path counts
     mat = (spec["category_matrix"] * np.array(spec["path_counts"])[:, None]).T
     M = len(spec["top_paths"])
     C = len(cat)
@@ -1566,6 +1709,10 @@ def log_token_path_sankey(spec: Dict[str, Any], step: int):
     wandb.log({"routing/token_path_sankey": fig, "step": step})
 
 
+from matplotlib.patches import Rectangle, PathPatch  # add near your other imports
+from matplotlib.path import Path as MplPath  # add near your other imports
+
+
 def log_token_expert_flow_arrows(
     model,
     batch: Dict[str, Any],
@@ -1577,30 +1724,15 @@ def log_token_expert_flow_arrows(
     select_temp: float,
     step: int,
     max_tokens: int = 64,
-    show_topk: int = 2,  # << only draw the actual routed top-k edges
-    max_experts: int = 16,  # global cap to keep the canvas readable
+    show_topk: int = 2,
+    max_experts: int = 32,
     show_other_bucket: bool = True,
     eps: float = 1e-8,
 ):
-    """
-    Token → (top-k) lines → Experts → Tokens, repeated for each hop.
-    - Tokens are repeated per hop (T(h) -> E(h) -> T(h+1)), so per-step routing is explicit.
-    - Only the top-k edges (default 2) per token & hop are drawn.
-    - Experts are a fixed global subset ranked by mass on the visible slice, with optional 'Other'.
-    - Line width/opacity/color reflect the routing probability.
-    - Bottom row shows greedy predicted next tokens.
-    Logs a matplotlib figure to W&B at 'routing/token_expert_flow_arrows'.
-    """
-    import numpy as np
-    import jax.numpy as jnp
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Rectangle, PathPatch
-    from matplotlib.path import Path as MplPath
-
     if not has_routing(model):
         return
 
-    # ---- Collect routing/example stats (reuses your helper) ----
+    # Collect routing/example stats
     batch_stats, example_stats = evaluate_for_visuals(
         model,
         batch,
@@ -1614,49 +1746,30 @@ def log_token_expert_flow_arrows(
         return
 
     # Shapes
-    H = int(np.asarray(example_stats["top1_expert"]).shape[0])  # hops
-    ids_all = np.asarray(example_stats["ids"])[0]  # (T,)
-    mask_all = np.asarray(example_stats["mask"])[0].astype(bool)  # (T,)
+    H = int(np.asarray(example_stats["top1_expert"]).shape[0])
+    ids_all = np.asarray(example_stats["ids"])[0]
+    mask_all = np.asarray(example_stats["mask"])[0].astype(bool)
     probs_all = np.asarray(example_stats["probs"])[:, 0, :, :]  # (H, T, E)
     E = int(probs_all.shape[-1])
 
-    # ---- Visible window (keep order) ----
+    # Visible window (keep order)
     valid_pos = np.where(mask_all)[0]
     if valid_pos.size == 0:
         return
-    Tvis = int(min(valid_pos.size, max(8, max_tokens)))
+    Tvis = int(min(valid_pos.size, max_tokens))
     vis_idx = valid_pos[:Tvis]
 
     # Slice tensors to visible window
-    ids = ids_all[vis_idx]  # (Tvis,)
-    mask = np.ones_like(ids, dtype=bool)
+    ids = ids_all[vis_idx]
     P = probs_all[:, vis_idx, :]  # (H, Tvis, E)
 
-    # ---- Token text (robust, matching preview) ----
+    # Token text (ASCII-safe)
+    VISIBLE_SPACE = "·"
+
     def _ids_to_tokens(ids_1d: np.ndarray) -> list[str]:
-        # 1) HF: convert_ids_to_tokens if available (preserves exact split)
-        if hasattr(tok, "convert_ids_to_tokens"):
-            try:
-                toks = tok.convert_ids_to_tokens(
-                    ids_1d.tolist(), skip_special_tokens=False
-                )
-                # make them compact but faithful
-                out = []
-                for s in toks:
-                    s = str(s)
-                    # Show space markers from BPEs in a human way but keep alignment
-                    s = s.replace("Ġ", "␠")
-                    out.append(s if len(s) <= 4 else (s[:3] + "…"))
-                return out
-            except Exception:
-                pass
-        # 2) Fallback: decode each id individually without skipping/cleanup
         out = []
         for tid in ids_1d.tolist():
-            s = ""
             try:
-                # Not all tokenizers accept clean_up_tokenization_spaces;
-                # try best-effort and fall back.
                 try:
                     s = tok.decode(
                         [int(tid)],
@@ -1667,15 +1780,16 @@ def log_token_expert_flow_arrows(
                     s = tok.decode([int(tid)], skip_special_tokens=False)
             except Exception:
                 s = "?"
-            s = (s or "·").replace("\n", "⏎")
+            s = (s or "").replace("Ġ", VISIBLE_SPACE)
+            s = s.replace("\n", "\\n")
             if s.strip() == "":
-                s = "␠"
+                s = VISIBLE_SPACE
             out.append(s if len(s) <= 4 else (s[:3] + "…"))
         return out
 
     tok_disp = _ids_to_tokens(ids)
 
-    # Preview line uses the same ids slice to avoid any mismatch
+    # Preview text (escaped newlines for a single-line title)
     try:
         try:
             preview = tok.decode(
@@ -1687,15 +1801,16 @@ def log_token_expert_flow_arrows(
             preview = tok.decode(ids.tolist(), skip_special_tokens=False)
     except Exception:
         preview = ""
+    preview = preview.replace("\n", "\\n")
     if len(preview) > 160:
         preview = preview[:157] + "…"
 
-    # ---- Normalize probs per (hop, token) ----
+    # Normalize probs per (hop, token)
     denom = P.sum(axis=-1, keepdims=True)
-    Pn = np.where(denom > eps, P / (denom + eps), 0.0)  # (H, Tvis, E)
+    Pn = np.where(denom > eps, P / (denom + eps), 0.0)
 
-    # ---- Choose a fixed global subset of experts to display ----
-    mass_per_e = Pn.sum(axis=(0, 1))  # (E,)
+    # Choose a fixed global subset of experts to display
+    mass_per_e = Pn.sum(axis=(0, 1))
     order = np.argsort(-mass_per_e)
     keep = order[: min(max_experts, E)].tolist()
     keep_set = set(int(e) for e in keep)
@@ -1704,18 +1819,19 @@ def log_token_expert_flow_arrows(
         len(keep_set) < E and float(mass_per_e.sum()) > 0.0
     )
 
-    # Fixed X positions for experts (even across the token span)
-    n_nodes = len(keep_set) + (1 if include_other else 0)
+    n_nodes = len(keep) + (1 if include_other else 0)
     if n_nodes == 0:
         return
-    if n_nodes == 1:
-        ex_x = np.array([max(0, (Tvis - 1) * 0.5)], dtype=float)
-    else:
-        ex_x = np.linspace(0, max(Tvis - 1, 1), num=n_nodes, dtype=float)
-    e_list = list(keep_set) + ([OTHER] if include_other else [])
+    ex_x = (
+        np.array([max(0, (Tvis - 1) * 0.5)], dtype=float)
+        if n_nodes == 1
+        else np.linspace(0, max(Tvis - 1, 1), num=n_nodes, dtype=float)
+    )
+    # keep order is deterministic (descending mass), then optional OTHER
+    e_list = keep + ([OTHER] if include_other else [])
     e_to_x = {int(e): float(x) for e, x in zip(e_list, ex_x)}
 
-    # ---- Colors ----
+    # Colors / labels
     expert_rgba = _expert_color_table(batch_stats)  # (E,4)
     type_names = list(batch_stats["id_to_type"])
     expert_type_ids = np.asarray(batch_stats["expert_type_ids"])
@@ -1727,7 +1843,7 @@ def log_token_expert_flow_arrows(
         return (
             "A"
             if "ttent" in tname.lower()
-            else "F" if ("feed" in tname.lower() or "mlp" in tname.lower()) else "I"
+            else ("F" if ("feed" in tname.lower() or "mlp" in tname.lower()) else "I")
         )
 
     def _expert_label(eid: int) -> str:
@@ -1738,7 +1854,6 @@ def log_token_expert_flow_arrows(
             return np.array([0.62, 0.62, 0.68, 1.0], dtype=np.float32)
         return expert_rgba[int(eid)]
 
-    # color/opacity/width as a function of prob
     def _line_style(eid: int, p: float) -> tuple[np.ndarray, float]:
         base = _expert_color(eid).copy()
         p = float(np.clip(p, 0.0, 1.0))
@@ -1747,10 +1862,10 @@ def log_token_expert_flow_arrows(
         lw = 0.8 + 3.0 * p
         return base, lw
 
-    # ---- Greedy predictions aligned to same positions ----
+    # Greedy predictions aligned to same positions
     try:
         logits, _ = model(
-            jnp.asarray(ids_all[None, :]),  # full sequence for logits alignment
+            jnp.asarray(ids_all[None, :]),
             key=key,
             inference=True,
             mask=jnp.asarray(mask_all[None, :], dtype=jnp.float32),
@@ -1766,8 +1881,8 @@ def log_token_expert_flow_arrows(
     pred_ids = pred_full[vis_idx]
     pred_disp = _ids_to_tokens(pred_ids)
 
-    # ---- Layout with EXTRA spacing ----
-    row_gap = 1.55  # << more vertical spacing
+    # Layout
+    row_gap = 1.55
     token_h = 0.74
     expert_h = 0.70
 
@@ -1777,8 +1892,7 @@ def log_token_expert_flow_arrows(
     def y_expert_row(h: int) -> float:
         return (2 * h + 1) * row_gap
 
-    y_pred = y_token_row(H) + 0.40 + 0.60
-
+    y_pred = y_token_row(H) + 1.0
     fig_w = max(15.0, 0.34 * Tvis + 10.0)
     fig_h = max(7.5, (2 * H + 1) * row_gap + 2.8)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=170)
@@ -1800,7 +1914,7 @@ def log_token_expert_flow_arrows(
             )
         )
 
-    # Draw a token row
+    # Token row helper
     def _draw_token_row(
         y: float, labels: list[str], face="#e7eef6", edge="#c9d5e3", txt="#0f172a"
     ):
@@ -1823,7 +1937,6 @@ def log_token_expert_flow_arrows(
                 ha="center",
                 va="center",
                 fontsize=8,
-                family="monospace",
                 color=txt,
                 zorder=9,
             )
@@ -1856,7 +1969,6 @@ def log_token_expert_flow_arrows(
                 fontsize=7,
                 color="white",
                 weight="bold",
-                family="monospace",
                 zorder=6,
             )
 
@@ -1885,10 +1997,9 @@ def log_token_expert_flow_arrows(
         y0 = y_token_row(h) + 0.24
         y1 = y_expert_row(h) - 0.24
         for j in range(Tvis):
-            pe = Pn[h, j]  # (E,)
+            pe = Pn[h, j]
             if pe.sum() <= eps:
                 continue
-            # top-k for this token
             kk = min(k, int(np.count_nonzero(pe > eps)))
             idx = np.argpartition(pe, -kk)[-kk:]
             idx = idx[np.argsort(-pe[idx])]
@@ -1921,7 +2032,6 @@ def log_token_expert_flow_arrows(
             ha="center",
             va="center",
             fontsize=8,
-            family="monospace",
             color="#065f46",
             zorder=9,
         )
@@ -1958,7 +2068,6 @@ def log_token_expert_flow_arrows(
         transform=ax.transData,
     )
 
-    # Legend by module type (+ Other)
     try:
         handles = []
         for tname in list(batch_stats["id_to_type"]):

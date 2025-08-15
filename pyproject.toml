@@ -24,6 +24,7 @@ dependencies = [
   "transformers",
   "numpy",
   "plotly",
+  "rich
 ]
 
 [tool.setuptools.packages.find]

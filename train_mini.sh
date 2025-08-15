@@ -13,7 +13,8 @@ python main.py \
   --d_model 192 \
   --n_heads 6 \
   --n_hops 4 \
-  --n_modules 8 \
+  --n_ff_modules 4 \
+  --n_att_modules 4 \
   --topk 2 \
   --capacity 32 \
   --mlp_mult 4 \

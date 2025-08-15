@@ -84,8 +84,9 @@ class Router(eqx.Module):
 
     proj: eqx.nn.Linear
     k: int = eqx.field(static=True)
+    norm_probs: bool = eqx.field(static=True)
 
-    def __init__(self, d_model: int, n_exp: int, k: int, *, key):
+    def __init__(self, d_model: int, n_exp: int, k: int, norm_probs: bool, *, key):
         assert k <= n_exp, f"topk ({k}) must be ≤ n_exp ({n_exp})"
         self.k = int(k)
         self.proj = eqx.nn.Linear(d_model, n_exp, use_bias=False, key=key)
@@ -99,7 +100,6 @@ class Router(eqx.Module):
         gumbel_tau: float = 1.0,
         router_temp: float = 1.0,  # for mixing
         select_temp: Optional[float] = None,  # for top-k selection
-        norm_probs: bool = False,  # if True, renorm over selected experts
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         logits_clean = jax.vmap(self.proj)(h)  # (T, E)
 
@@ -114,7 +114,10 @@ class Router(eqx.Module):
         )
 
         probs = _mixing_probs(
-            logits_clean, router_temp=router_temp, mask=mask_full, norm_probs=norm_probs
+            logits_clean,
+            router_temp=router_temp,
+            mask=mask_full,
+            norm_probs=self.norm_probs,
         )
         return mask_full, probs, logits_clean, logits_sel
 
@@ -124,14 +127,16 @@ class CosineRouter(eqx.Module):
 
     prototypes: jnp.ndarray  # (E, P, d)
     scale: float = eqx.field(static=True)
+    norm_probs: bool = eqx.field(static=True)
     k: int = eqx.field(static=True)
     P: int = eqx.field(static=True)
 
-    def __init__(self, d_model: int, n_exp: int, k: int, *, key):
+    def __init__(self, d_model: int, n_exp: int, k: int, norm_probs: bool, *, key):
         assert k <= n_exp
         self.k = int(k)
         self.P = 2
         self.scale = 10.0
+        self.norm_probs = norm_probs
         self.prototypes = jax.random.normal(key, (n_exp, self.P, d_model)) * (
             1.0 / jnp.sqrt(d_model)
         )
@@ -145,7 +150,6 @@ class CosineRouter(eqx.Module):
         gumbel_tau: float = 1.0,
         router_temp: float = 1.0,
         select_temp: float | None = None,
-        norm_probs: bool = False,
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         eps = 1e-6
         h_norm = h / (jnp.linalg.norm(h, axis=-1, keepdims=True) + eps)  # (T, d)
@@ -165,7 +169,10 @@ class CosineRouter(eqx.Module):
             k=self.k,
         )
         probs = _mixing_probs(
-            logits_clean, router_temp=router_temp, mask=mask_full, norm_probs=norm_probs
+            logits_clean,
+            router_temp=router_temp,
+            mask=mask_full,
+            norm_probs=self.norm_probs,
         )
         return mask_full, probs, logits_clean, logits_sel
 
@@ -181,8 +188,9 @@ class SequenceRouter(eqx.Module):
     proj: eqx.nn.Linear  # (d -> E) hidden-to-expert logits
     h0: jnp.ndarray  # (d,) learnable/initial hidden state
     k: int = eqx.field(static=True)
+    norm_probs: bool = eqx.field(static=True)
 
-    def __init__(self, d_model: int, n_exp: int, k: int, *, key):
+    def __init__(self, d_model: int, n_exp: int, k: int, norm_probs: bool, *, key):
         assert k <= n_exp, f"topk ({k}) must be ≤ n_exp ({n_exp})"
         self.k = int(k)
         k_in, k_rec, k_out, _ = jax.random.split(key, 4)
@@ -190,6 +198,7 @@ class SequenceRouter(eqx.Module):
         self.w_rec = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_rec)
         self.proj = eqx.nn.Linear(d_model, n_exp, use_bias=False, key=k_out)
         self.h0 = jnp.zeros((d_model,), dtype=jnp.float32)
+        self.norm_probs = norm_probs
 
     def __call__(
         self,
@@ -200,7 +209,6 @@ class SequenceRouter(eqx.Module):
         gumbel_tau: float = 1.0,
         router_temp: float = 1.0,
         select_temp: Optional[float] = None,
-        norm_probs: bool = False,
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
 
         def step(carry, x_t):
@@ -222,6 +230,9 @@ class SequenceRouter(eqx.Module):
             k=self.k,
         )
         probs = _mixing_probs(
-            logits_clean, router_temp=router_temp, mask=mask_full, norm_probs=norm_probs
+            logits_clean,
+            router_temp=router_temp,
+            mask=mask_full,
+            norm_probs=self.norm_probs,
         )
         return mask_full, probs, logits_clean, logits_sel

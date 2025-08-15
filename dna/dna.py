@@ -154,6 +154,7 @@ class DNA(eqx.Module):
         n_hops: int,
         dropout: float,
         rope_base: float,
+        norm_probs: bool = False,
         backbone: Optional[Tuple[eqx.Module, ...]] = None,
         key,
     ):
@@ -201,7 +202,7 @@ class DNA(eqx.Module):
         total_experts = len(modules)
         router_keys = jax.random.split(k_routers, n_hops)
         self.routers = tuple(
-            router_cls(d_model, total_experts, topk, key=k) for k in router_keys
+            router_cls(d_model, total_experts, topk, norm_probs, key=k) for k in router_keys
         )
 
     def _hop(

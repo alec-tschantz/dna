@@ -250,7 +250,7 @@ def main():
 
     run_name = (
         f"{cfg.model_type}-{cfg.dataset_name.split('/')[-1]}"
-        f"-h{cfg.n_hops}-k{cfg.topk}-c{cfg.capacity}-r{cfg.router_type}-a{cfg.n}"
+        f"-h{cfg.n_hops}-k{cfg.topk}-c{cfg.capacity}-r{cfg.router_type}"
         f"-d{cfg.d_model}-n{cfg.n_att_modules}-n{cfg.n_ff_modules}-i{cfg.n_id_modules}"
         f"-b{cfg.backbone}-s{cfg.seed}"
     )

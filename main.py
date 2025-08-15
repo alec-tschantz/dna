@@ -69,7 +69,7 @@ class Config:
     log_every: int = 10
     n_examples: int = 5
     gen_len: int = 200
-    eval_samples: int = 4096
+    eval_samples: int = 8192
 
     # checkpoints
     save_every: int = 1000

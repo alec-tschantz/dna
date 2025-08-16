@@ -58,7 +58,7 @@ class Config:
 
     # training
     steps: int = 20_000
-    warmup: int = 2000
+    warmup: int = 1_000
     lr_peak: float = 3e-4
     wd: float = 0.01  
     clip: float = 1.0

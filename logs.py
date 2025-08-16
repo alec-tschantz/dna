@@ -13,6 +13,7 @@ mpl.rcParams["text.usetex"] = False
 from matplotlib.patches import Rectangle, PathPatch
 from matplotlib.path import Path as MplPath
 
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -1732,10 +1733,6 @@ def log_token_path_sankey(spec: Dict[str, Any], step: int):
         margin=dict(l=10, r=10, t=50, b=10),
     )
     wandb.log({"routing/token_path_sankey": fig, "step": step})
-
-
-from matplotlib.patches import Rectangle, PathPatch  # add near your other imports
-from matplotlib.path import Path as MplPath  # add near your other imports
 
 
 def log_token_expert_flow_arrows(

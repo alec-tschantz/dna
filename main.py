@@ -58,9 +58,9 @@ class Config:
 
     # training
     steps: int = 20_000
-    warmup: int = 1000
+    warmup: int = 2000
     lr_peak: float = 3e-4
-    wd: float = 0.01
+    wd: float = 0.01  
     clip: float = 1.0
     seed: int = 0
 
@@ -73,7 +73,7 @@ class Config:
     eval_samples: int = 8192
 
     # checkpoints
-    save_every: int = 2000
+    save_every: int = 5000
     ckpt_dir: str = "checkpoints"
 
 
@@ -242,7 +242,6 @@ def lr_schedule(step, warmup, steps, lr_peak):
     progress = jnp.clip((step - warmup) / decay_steps, 0.0, 1.0)
     cos = 0.5 * (1 + jnp.cos(jnp.pi * progress))
     return jnp.where(step >= warmup, lr_peak * cos, lr).astype(jnp.float32)
-
 
 
 # ------------------------------ main ------------------------------ #

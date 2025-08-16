@@ -12,7 +12,7 @@ import wandb
 from transformers import AutoTokenizer
 
 from dna import DNA, Dense, Attention, FeedForward, Identity
-from dna.routing import Router, CosineRouter, SequenceRouter
+from dna.routing import LinearRouter, CosineRouter, SequenceRouter
 from dna.dataloader import load_dataset_stream, sample_batch
 from logs import log_initial_stats, log_train_step, run_eval_suite, log_checkpoint
 
@@ -26,6 +26,7 @@ class Config:
     model_type: str = "dna"
     router_type: str = "sequence"
     norm_probs: bool = False
+    norm_after_capacity: bool = False
     vocab_size: int = 50_257
     d_model: int = 512
     n_heads: int = 16
@@ -33,7 +34,7 @@ class Config:
     topk: int = 2
     capacity: int = 64
     mlp_mult: int = 4
-    dropout: float = 0.1
+    dropout: float = 0.0
     rope_base: float = 10_000.0
 
     # routing temperatures
@@ -57,14 +58,14 @@ class Config:
 
     # training
     steps: int = 20_000
-    warmup: int = 2000
-    lr_peak: float = 2.5e-4
-    wd: float = 0.1
+    warmup: int = 1000
+    lr_peak: float = 3e-4
+    wd: float = 0.01
     clip: float = 1.0
     seed: int = 0
 
     # logging/eval
-    wandb_project: str = "dna-slurm"
+    wandb_project: str = "dna-slurm-v2"
     eval_every: int = 200
     log_every: int = 10
     n_examples: int = 5
@@ -121,7 +122,7 @@ def make_backbone(
 
 
 def make_router_cls(router_type: str):
-    cfg = {"default": Router, "cosine": CosineRouter, "sequence": SequenceRouter}
+    cfg = {"linear": LinearRouter, "cosine": CosineRouter, "sequence": SequenceRouter}
     return cfg[router_type]
 
 
@@ -158,6 +159,7 @@ def build_model(cfg: Config, key: jax.Array) -> eqx.Module:
             dropout=cfg.dropout,
             rope_base=cfg.rope_base,
             norm_probs=cfg.norm_probs,
+            norm_after_capacity=cfg.norm_after_capacity,
             backbone=backbone,
             key=kmodel,
         )
@@ -233,18 +235,15 @@ def eval_step(model, batch, *, key, model_kwargs):
     return loss, acc
 
 
-# def lr_schedule(step, warmup, steps, lr_peak):
-#     warm = jnp.minimum(step / warmup, 1.0)
-#     lr = lr_peak * warm
-#     decay_steps = jnp.maximum(steps - warmup, 1)
-#     progress = jnp.clip((step - warmup) / decay_steps, 0.0, 1.0)
-#     cos = 0.5 * (1 + jnp.cos(jnp.pi * progress))
-#     return jnp.where(step >= warmup, lr_peak * cos, lr).astype(jnp.float32)
-
 def lr_schedule(step, warmup, steps, lr_peak):
     warm = jnp.minimum(step / warmup, 1.0)
     lr = lr_peak * warm
-    return lr.astype(jnp.float32)
+    decay_steps = jnp.maximum(steps - warmup, 1)
+    progress = jnp.clip((step - warmup) / decay_steps, 0.0, 1.0)
+    cos = 0.5 * (1 + jnp.cos(jnp.pi * progress))
+    return jnp.where(step >= warmup, lr_peak * cos, lr).astype(jnp.float32)
+
+
 
 # ------------------------------ main ------------------------------ #
 
@@ -254,9 +253,9 @@ def main():
 
     run_name = (
         f"{cfg.model_type}-{cfg.dataset_name.split('/')[-1]}"
-        f"-h{cfg.n_hops}-k{cfg.topk}-c{cfg.capacity}-r{cfg.router_type}"
+        f"-h{cfg.n_hops}-k{cfg.topk}-c{cfg.capacity}-r{cfg.router_type}-wd{cfg.wd}"
         f"-d{cfg.d_model}-n{cfg.n_att_modules}-n{cfg.n_ff_modules}-i{cfg.n_id_modules}"
-        f"-b{cfg.backbone}-s{cfg.seed}-l{cfg.lr_peak}-g{cfg.gumbel_tau}"
+        f"-b{cfg.backbone}-s{cfg.seed}-l{cfg.lr_peak}-g{cfg.gumbel_tau}-c{cfg.norm_after_capacity}"
     )
     wandb.init(project=cfg.wandb_project, name=run_name, config=asdict(cfg))
 

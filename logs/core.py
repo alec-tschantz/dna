@@ -27,8 +27,9 @@ from .plots.color_grid import log_token_expert_color_grid
 from .plots.sankey import log_routing_sankey_if_available
 from .plots.diversity import analyze_path_diversity, plot_path_diversity_dashboard
 from .plots.modular import analyze_token_path_specialization, plot_token_path_specialization, log_token_path_sankey
-
-
+from .plots.histograms import log_router_histograms
+from .plots.transitions import log_expert_transition_heatmap, log_type_transition_heatmap
+from .plots.temp_sweep import log_temperature_sweep_grid
 def log_checkpoint(
     *,
     run_name: str,
@@ -181,6 +182,7 @@ def log_train_step(
     wandb.log(logs)
 
 
+
 def run_eval_suite(
     *,
     step: int,
@@ -223,10 +225,14 @@ def run_eval_suite(
             )
         )
         eval_logs.update(extra_routing_metrics(stats_host, prefix="router/eval"))
-    
+
+        # NEW: histograms/distributions
+        log_router_histograms(stats_host, step=step, prefix="router/eval")
+
     wandb.log(eval_logs)
     print(f"  [Eval] Loss: {float(val_loss):.4f} | Acc: {float(val_acc):.4f}")
 
+    # Existing visuals
     key, vis_key = jax.random.split(key)
     vis_batch = sample_batch_fn(val_stream, min(16, cfg.batch_size))
     log_routing_visuals_if_available(
@@ -310,6 +316,47 @@ def run_eval_suite(
         plot_token_path_specialization(spec, step)
         log_token_path_sankey(spec, step)
 
+    # NEW: expert transition heatmaps (expert→expert, type→type)
+    key, tkey1 = jax.random.split(key)
+    log_expert_transition_heatmap(
+        model,
+        vis_batch,
+        key=tkey1,
+        gumbel_tau=0.0,
+        router_temp=float(eval_kwargs["router_temp"][0]),
+        select_temp=float(eval_kwargs["select_temp"][0]),
+        step=step,
+        top_experts=24,
+    )
+    key, tkey2 = jax.random.split(key)
+    log_type_transition_heatmap(
+        model,
+        vis_batch,
+        key=tkey2,
+        gumbel_tau=0.0,
+        router_temp=float(eval_kwargs["router_temp"][0]),
+        select_temp=float(eval_kwargs["select_temp"][0]),
+        step=step,
+    )
+
+    # NEW: tiny temperature sweep grid (quick)
+    key = log_temperature_sweep_grid(
+        model=model,
+        eval_step_fn=eval_step_fn,
+        val_stream=val_stream,
+        key=key,
+        tok=tok,
+        cfg=cfg,
+        base_router_temp=float(eval_kwargs["router_temp"][0]),
+        base_select_temp=float(eval_kwargs["select_temp"][0]),
+        sample_batch_fn=sample_batch_fn,
+        step=step,
+        r_scales=(0.7, 1.0, 1.3),
+        s_scales=(0.7, 1.0, 1.3),
+        batch_tokens=8192,
+    )
+
+    # Text generation (unchanged)
     key, gen_key = jax.random.split(key)
     prompts = [
         "Once upon a time, ",
@@ -319,13 +366,9 @@ def run_eval_suite(
         "The brave knight ",
     ]
     temps = {
-        "router_temp": float(
-            model_kwargs_train.get("router_temp", jnp.array([1.0]))[0]
-        ),
-        "select_temp": float(
-            model_kwargs_train.get("select_temp", jnp.array([1.0]))[0]
-        ),
-        "gumbel_tau": float(model_kwargs_train.get("gumbel_tau", jnp.array([0.0]))[0]),
+        "router_temp": float(eval_kwargs["router_temp"][0]),
+        "select_temp": float(eval_kwargs["select_temp"][0]),
+        "gumbel_tau": 0.0,
     }
     results = generate(
         model,

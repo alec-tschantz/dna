@@ -86,9 +86,9 @@ def log_expert_transition_heatmap(
     )
     logs = {
         "step": step,
-        "router/eval/transition_heatmap": wandb.Image(fig),
-        "router/eval/transition_self_frac": float(np.trace(trans) / max(trans.sum(), 1)),
-        "router/eval/transition_density": float((trans > 0).mean()),
+        "routing/transition_heatmap": wandb.Image(fig),
+        "routing/transition_self_frac": float(np.trace(trans) / max(trans.sum(), 1)),
+        "routing/transition_density": float((trans > 0).mean()),
     }
     plt.close(fig)
     wandb.log(logs)
@@ -146,7 +146,7 @@ def log_type_transition_heatmap(
     logs = {
         "step": step,
         "routing/type_transition_heatmap": wandb.Image(fig),
-        "routing/type_self_frac": float(np.trace(trans) / max(trans.sum(), 1)),
+        # "routing/type_self_frac": float(np.trace(trans) / max(trans.sum(), 1)),
     }
     plt.close(fig)
     wandb.log(logs)

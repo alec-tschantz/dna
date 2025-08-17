@@ -30,6 +30,11 @@ from .plots.modular import analyze_token_path_specialization, plot_token_path_sp
 from .plots.histograms import log_router_histograms
 from .plots.transitions import log_expert_transition_heatmap, log_type_transition_heatmap
 from .plots.temp_sweep import log_temperature_sweep_grid
+from .plots.co_usage import log_expert_co_usage_graph
+from .plots.capacity_dashboard import log_capacity_saturation_dashboard
+from .plots.phase_portrait import log_expert_phase_portrait
+
+
 def log_checkpoint(
     *,
     run_name: str,
@@ -354,6 +359,47 @@ def run_eval_suite(
         r_scales=(0.7, 1.0, 1.3),
         s_scales=(0.7, 1.0, 1.3),
         batch_tokens=8192,
+    )
+
+     # --- NEW: Expert co-usage curved network (same-token, same-hop) ---
+    key, cousage_key = jax.random.split(key)
+    log_expert_co_usage_graph(
+        model,
+        vis_batch,
+        key=cousage_key,
+        gumbel_tau=0.0,
+        router_temp=float(eval_kwargs["router_temp"][0]),
+        select_temp=float(eval_kwargs["select_temp"][0]),
+        step=step,
+        top_experts=24,        # tweak as desired
+        min_edge_frac=0.04,    # drop very thin edges
+    )
+
+    # --- NEW: Capacity pressure dashboard (drop fractions, totals, utilization) ---
+    key, cap_key = jax.random.split(key)
+    log_capacity_saturation_dashboard(
+        model,
+        vis_batch,
+        key=cap_key,
+        gumbel_tau=0.0,
+        router_temp=float(eval_kwargs["router_temp"][0]),
+        select_temp=float(eval_kwargs["select_temp"][0]),
+        step=step,
+        capacity=int(getattr(cfg, "capacity", 1)),  # uses your cfg.capacity
+        top_experts=36,
+    )
+
+    # --- NEW: Phase portrait (kept-rate vs top-1 confidence, size by usage) ---
+    key, portrait_key = jax.random.split(key)
+    log_expert_phase_portrait(
+        model,
+        vis_batch,
+        key=portrait_key,
+        gumbel_tau=0.0,
+        router_temp=float(eval_kwargs["router_temp"][0]),
+        select_temp=float(eval_kwargs["select_temp"][0]),
+        step=step,
+        top_experts=42,
     )
 
     # Text generation (unchanged)

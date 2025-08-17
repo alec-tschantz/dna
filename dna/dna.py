@@ -125,6 +125,8 @@ class DNA(eqx.Module):
         gumbel_tau: float,
         router_temp: float,
         select_temp: Optional[float],
+        return_stats: bool,
+
     ) -> Tuple[Float[Array, "T d"], Dict[str, Any]]:
         k_route, k_exec = jax.random.split(key)
         mask_full, probs_full, logits_clean, logits_sel = router(
@@ -182,9 +184,13 @@ class DNA(eqx.Module):
         h_next = h + combine - rho * h
         h_next = jnp.where(token_mask[:, None], h_next, h)
 
-        stats = self._stats(
-            kept=kept, probs=probs_full, mask=mask_full, rho=rho, token_mask=token_mask
-        )
+        stats = {}
+        if return_stats:
+            stats = self._stats(
+                kept=kept, probs=probs_full, mask=mask_full, rho=rho, token_mask=token_mask
+            )
+      
+
         return h_next, stats
 
     @eqx.filter_jit
@@ -198,6 +204,8 @@ class DNA(eqx.Module):
         gumbel_tau: float = 1.0,
         router_temp: float = 1.0,
         select_temp: Optional[float] = None,
+        return_stats: bool = False,
+
     ) -> Tuple[Float[Array, "T V"], Tuple[Dict[str, Any], ...]]:
         T = ids.shape[0]
         token_mask: Bool[Array, "T"] = (
@@ -227,6 +235,7 @@ class DNA(eqx.Module):
                 gumbel_tau=gumbel_tau,
                 router_temp=router_temp,
                 select_temp=select_temp,
+                return_stats=return_stats,
             )
             stats_all.append(st)
 

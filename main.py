@@ -188,6 +188,7 @@ def compute_loss(
     *,
     inference: bool,
     model_kwargs: Dict[str, jax.Array],
+    return_stats: bool = False
 ):
     ids = jnp.asarray(batch["input_ids"])
     mask = jnp.asarray(batch["attention_mask"])
@@ -195,7 +196,7 @@ def compute_loss(
     keys = jax.random.split(key, B)
 
     def forward(x, m, k):
-        logits, stats = model(x, key=k, inference=inference, mask=m, **model_kwargs)
+        logits, stats = model(x, key=k, inference=inference, mask=m, **model_kwargs, return_stats=return_stats)
         return logits, stats
 
     logits, stats = jax.vmap(forward, in_axes=(0, 0, 0))(ids, mask, keys)
@@ -215,7 +216,7 @@ def compute_loss(
 def train_step(model, opt, opt_state, batch, *, key, model_kwargs):
     (loss, (logits, labels, mask, stats)), grads = eqx.filter_value_and_grad(
         compute_loss, has_aux=True
-    )(model, batch, key, inference=False, model_kwargs=model_kwargs)
+    )(model, batch, key, inference=False, model_kwargs=model_kwargs, return_stats=False)
     updates, opt_state = opt.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
     predictions = jnp.argmax(logits, axis=-1)
@@ -227,12 +228,12 @@ def train_step(model, opt, opt_state, batch, *, key, model_kwargs):
 
 @eqx.filter_jit
 def eval_step(model, batch, *, key, model_kwargs):
-    loss, (logits, labels, mask, _) = compute_loss(
-        model, batch, key, inference=True, model_kwargs=model_kwargs
+    loss, (logits, labels, mask, stats) = compute_loss(
+        model, batch, key, inference=True, model_kwargs=model_kwargs, return_stats=True
     )
     denom = jnp.maximum(mask.sum(), 1)
     acc = ((jnp.argmax(logits, -1) == labels) & (mask > 0)).sum() / denom
-    return loss, acc
+    return loss, acc, stats
 
 
 def lr_schedule(step, warmup, steps, lr_peak):

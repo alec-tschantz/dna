@@ -131,7 +131,7 @@ def plot_token_flow_rich(
     plt.close(fig)
 
 
-def log_routing_visuals_if_available(
+def log_routing_visuals(
     model,
     batch: Dict[str, Any],
     *,
@@ -160,8 +160,8 @@ def log_routing_visuals_if_available(
 
     if batch_stats is not None:
         plot_heatmap(batch_stats, step)
-        plot_token_flow_rich(
-            example_stats, batch_stats, tok, step=step, max_tokens=max_tokens_grid
-        )
+        # plot_token_flow_rich(
+        #     example_stats, batch_stats, tok, step=step, max_tokens=max_tokens_grid
+        # )
 
     return batch_stats, example_stats

@@ -23,18 +23,18 @@ from .utils import (
     routing_metrics_from_stats,
     extra_routing_metrics,
 )
-from .plots.routing_visuals import log_routing_visuals_if_available
+from .plots.routing_visuals import log_routing_visuals
 from .plots.flow_arrows import log_token_expert_flow_arrows
 from .plots.color_grid import log_token_expert_color_grid
-from .plots.sankey import log_routing_sankey_if_available
+from .plots.sankey import log_routing_sankey
 from .plots.diversity import analyze_path_diversity, plot_path_diversity_dashboard
-from .plots.modular import analyze_token_path_specialization, plot_token_path_specialization, log_token_path_sankey
+from .plots.path_analysis import analyze_token_path_specialization, plot_token_path_specialization, log_token_path_sankey
 from .plots.histograms import log_router_histograms
-from .plots.transitions import log_expert_transition_heatmap, log_type_transition_heatmap
-from .plots.temp_sweep import log_temperature_sweep_grid
+from .plots.transitions import log_expert_transition_heatmap
 from .plots.co_usage import log_expert_co_usage_graph
 from .plots.capacity_dashboard import log_capacity_saturation_dashboard
 from .plots.phase_portrait import log_expert_phase_portrait
+from .plots.full_path_analysis import log_full_path_analysis
 
 
 def log_checkpoint(
@@ -177,7 +177,6 @@ def log_train_step(
         )
         logs.update(extra_routing_metrics(stats_host, prefix="router/train"))
 
-    # --- Console ---
     print(
         f"  [Train] Step: {step} | "
         f"Loss: {float(loss):.4f} | "
@@ -185,7 +184,6 @@ def log_train_step(
         f"LR: {logs['train/lr']:.5f} | "
         f"T/s: {tok_per_sec:,.0f}"
     )
-
     wandb.log(logs, step=step, commit=False)
 
 
@@ -221,7 +219,6 @@ def run_eval_suite(
     
     eval_logs = {"eval/loss": float(val_loss), "eval/acc": float(val_acc)}
     
-    # Log eval routing stats if available
     if has_routing(model) and isinstance(eval_stats, (tuple, list)) and len(eval_stats) > 0:
         stats_host = jax.tree_util.tree_map(jax.device_get, eval_stats)
         eval_logs.update(
@@ -232,17 +229,14 @@ def run_eval_suite(
             )
         )
         eval_logs.update(extra_routing_metrics(stats_host, prefix="router/eval"))
-
-        # NEW: histograms/distributions
         log_router_histograms(stats_host, step=step, prefix="routing")
 
     wandb.log(eval_logs, step=step, commit=False)
     print(f"  [Eval] Loss: {float(val_loss):.4f} | Acc: {float(val_acc):.4f}")
 
-    # Existing visuals
     key, vis_key = jax.random.split(key)
-    vis_batch = sample_batch_fn(val_stream, min(16, cfg.batch_size))
-    log_routing_visuals_if_available(
+    vis_batch = sample_batch_fn(val_stream, cfg.batch_size)
+    log_routing_visuals(
         model,
         vis_batch,
         key=vis_key,
@@ -281,7 +275,7 @@ def run_eval_suite(
         alpha_by_conf=True,
     )
 
-    _ = log_routing_sankey_if_available(
+    _ = log_routing_sankey(
         model,
         vis_batch,
         key=vis_key,
@@ -323,7 +317,22 @@ def run_eval_suite(
         plot_token_path_specialization(spec, step)
         log_token_path_sankey(spec, step)
 
-    # NEW: expert transition heatmaps (expert→expert, type→type)
+
+    key, fpa_key = jax.random.split(key)
+    log_full_path_analysis(
+        model, vis_batch, tok,
+        key=fpa_key,
+        gumbel_tau=0.0,
+        router_temp=float(eval_kwargs["router_temp"][0]),
+        select_temp=float(eval_kwargs["select_temp"][0]),
+        step=step,
+        max_paths=24,         
+        min_token_count=4,     
+        top_by_lift=40,
+        top_by_freq=40,
+    )
+
+
     key, tkey1 = jax.random.split(key)
     log_expert_transition_heatmap(
         model,
@@ -335,35 +344,7 @@ def run_eval_suite(
         step=step,
         top_experts=24,
     )
-    key, tkey2 = jax.random.split(key)
-    log_type_transition_heatmap(
-        model,
-        vis_batch,
-        key=tkey2,
-        gumbel_tau=0.0,
-        router_temp=float(eval_kwargs["router_temp"][0]),
-        select_temp=float(eval_kwargs["select_temp"][0]),
-        step=step,
-    )
 
-    # NEW: tiny temperature sweep grid (quick)
-    key = log_temperature_sweep_grid(
-        model=model,
-        eval_step_fn=eval_step_fn,
-        val_stream=val_stream,
-        key=key,
-        tok=tok,
-        cfg=cfg,
-        base_router_temp=float(eval_kwargs["router_temp"][0]),
-        base_select_temp=float(eval_kwargs["select_temp"][0]),
-        sample_batch_fn=sample_batch_fn,
-        step=step,
-        r_scales=(0.7, 1.0, 1.3),
-        s_scales=(0.7, 1.0, 1.3),
-        batch_tokens=8192,
-    )
-
-     # --- NEW: Expert co-usage curved network (same-token, same-hop) ---
     key, cousage_key = jax.random.split(key)
     log_expert_co_usage_graph(
         model,
@@ -373,11 +354,10 @@ def run_eval_suite(
         router_temp=float(eval_kwargs["router_temp"][0]),
         select_temp=float(eval_kwargs["select_temp"][0]),
         step=step,
-        top_experts=24,        # tweak as desired
-        min_edge_frac=0.04,    # drop very thin edges
+        top_experts=24,        
+        min_edge_frac=0.04, 
     )
 
-    # --- NEW: Capacity pressure dashboard (drop fractions, totals, utilization) ---
     key, cap_key = jax.random.split(key)
     log_capacity_saturation_dashboard(
         model,
@@ -387,11 +367,10 @@ def run_eval_suite(
         router_temp=float(eval_kwargs["router_temp"][0]),
         select_temp=float(eval_kwargs["select_temp"][0]),
         step=step,
-        capacity=int(getattr(cfg, "capacity", 1)),  # uses your cfg.capacity
+        capacity=int(getattr(cfg, "capacity", 1)),  
         top_experts=36,
     )
 
-    # --- NEW: Phase portrait (kept-rate vs top-1 confidence, size by usage) ---
     key, portrait_key = jax.random.split(key)
     log_expert_phase_portrait(
         model,
@@ -404,7 +383,6 @@ def run_eval_suite(
         top_experts=42,
     )
 
-    # Text generation (unchanged)
     key, gen_key = jax.random.split(key)
     prompts = [
         "Once upon a time, ",

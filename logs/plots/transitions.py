@@ -85,68 +85,10 @@ def log_expert_transition_heatmap(
         "current hop expert id",
     )
     logs = {
-        "step": step,
         "routing/transition_heatmap": wandb.Image(fig),
-        "routing/transition_self_frac": float(np.trace(trans) / max(trans.sum(), 1)),
-        "routing/transition_density": float((trans > 0).mean()),
+        # "routing/transition_self_frac": float(np.trace(trans) / max(trans.sum(), 1)),
+        # "routing/transition_density": float((trans > 0).mean()),
     }
     plt.close(fig)
     wandb.log(logs, step=step, commit=False)
 
-
-def log_type_transition_heatmap(
-    model,
-    batch: Dict[str, Any],
-    *,
-    key,
-    gumbel_tau: float,
-    router_temp: float,
-    select_temp: float,
-    step: int,
-):
-    """Logs type→type transitions (e.g., Attention→FeedForward)."""
-    if not has_routing(model):
-        return
-
-    top1, mask, meta = _collect_top1_indices_all(
-        model,
-        batch,
-        key=key,
-        gumbel_tau=gumbel_tau,
-        router_temp=router_temp,
-        select_temp=select_temp,
-    )
-    if top1 is None or meta is None:
-        return
-
-    type_ids = np.asarray(meta["expert_type_ids"])   # (E,)
-    labels = list(meta["id_to_type"])                # list of unique type names
-    Tn = len(labels)
-    H = int(top1.shape[0])
-    valid = mask.astype(bool)
-
-    trans = np.zeros((Tn, Tn), dtype=np.int64)
-    for h in range(H - 1):
-        a = type_ids[top1[h][valid]]
-        b = type_ids[top1[h + 1][valid]]
-        np.add.at(trans, (a, b), 1)
-
-    fig = _make_heatmap(
-        trans,
-        f"Type→Type transitions • step {step}",
-        "next hop type id",
-        "current hop type id",
-    )
-    ax = fig.axes[0]
-    ax.set_xticks(range(Tn)); ax.set_yticks(range(Tn))
-    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
-    ax.set_yticklabels(labels, fontsize=8)
-    fig.tight_layout()
-
-    logs = {
-        "step": step,
-        "routing/type_transition_heatmap": wandb.Image(fig),
-        # "routing/type_self_frac": float(np.trace(trans) / max(trans.sum(), 1)),
-    }
-    plt.close(fig)
-    wandb.log(logs, step=step, commit=False)

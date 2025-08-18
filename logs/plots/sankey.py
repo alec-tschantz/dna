@@ -15,7 +15,7 @@ from .utils import (
 )
 
 
-def log_routing_sankey_if_available(
+def log_routing_sankey(
     model,
     batch: Dict[str, Any],
     *,

@@ -106,31 +106,31 @@ def log_router_histograms(stats_host, *, step: int, prefix: str = "routing"):
         # Histograms
         fig_rho = _matplot_hist(rho, "ρ distribution (per token)", "ρ")
         fig_ent = _matplot_hist(ent, "Routing entropy (per token)", "Entropy")
-        fig_eff = _matplot_hist(effk, "Effective top-k (per token)", "k_eff")
+        # fig_eff = _matplot_hist(effk, "Effective top-k (per token)", "k_eff")
 
         logs[f"{prefix}/rho_hist"] = wandb.Image(fig_rho)
         logs[f"{prefix}/entropy_hist"] = wandb.Image(fig_ent)
-        logs[f"{prefix}/efftopk_hist"] = wandb.Image(fig_eff)
+        # logs[f"{prefix}/efftopk_hist"] = wandb.Image(fig_eff)
 
-        # Scalars
-        if rho.size:
-            logs.update({
-                f"{prefix}/rho_p10": float(np.percentile(rho, 10)),
-                f"{prefix}/rho_p50": float(np.percentile(rho, 50)),
-                f"{prefix}/rho_p90": float(np.percentile(rho, 90)),
-                f"{prefix}/frac_rho_zero": float((rho <= 1e-9).mean()),
-            })
-        if ent.size:
-            logs.update({
-                f"{prefix}/entropy_mean_token": float(ent.mean()),
-                f"{prefix}/entropy_p90_token": float(np.percentile(ent, 90)),
-            })
-        if effk.size:
-            logs.update({
-                f"{prefix}/efftopk_mean_token": float(effk.mean()),
-            })
+        # # Scalars
+        # if rho.size:
+        #     logs.update({
+        #         f"{prefix}/rho_p10": float(np.percentile(rho, 10)),
+        #         f"{prefix}/rho_p50": float(np.percentile(rho, 50)),
+        #         f"{prefix}/rho_p90": float(np.percentile(rho, 90)),
+        #         f"{prefix}/frac_rho_zero": float((rho <= 1e-9).mean()),
+        #     })
+        # if ent.size:
+        #     logs.update({
+        #         f"{prefix}/entropy_mean_token": float(ent.mean()),
+        #         f"{prefix}/entropy_p90_token": float(np.percentile(ent, 90)),
+        #     })
+        # if effk.size:
+        #     logs.update({
+        #         f"{prefix}/efftopk_mean_token": float(effk.mean()),
+        #     })
 
-        plt.close(fig_rho); plt.close(fig_ent); plt.close(fig_eff)
+        plt.close(fig_rho); plt.close(fig_ent); 
 
     # --- Per-expert: load bars & importance summary ---
     if per_expert:
@@ -139,10 +139,10 @@ def log_router_histograms(stats_host, *, step: int, prefix: str = "routing"):
 
         fig_load = _matplot_bars(load, "Expert load (summed)", "expert id", "tokens kept")
         logs[f"{prefix}/expert_load_bars"] = wandb.Image(fig_load)
-        logs[f"{prefix}/expert_load_mean"] = float(load.mean())
-        logs[f"{prefix}/expert_load_gini"] = _gini(load)
-        if imp.size:
-            logs[f"{prefix}/importance_gini"] = _gini(imp)
+        # logs[f"{prefix}/expert_load_mean"] = float(load.mean())
+        # logs[f"{prefix}/expert_load_gini"] = _gini(load)
+        # if imp.size:
+            # logs[f"{prefix}/importance_gini"] = _gini(imp)
         plt.close(fig_load)
 
     wandb.log(logs, step=step, commit=False)

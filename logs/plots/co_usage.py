@@ -75,6 +75,8 @@ def _draw_graph(ax, pos, node_sizes, node_colors, edges, title: str):
                 color="white", weight="bold", zorder=4)
     ax.set_aspect("equal"); ax.set_axis_off()
     ax.set_title(title, fontsize=12, weight="bold")
+    ax.set_xlim(-1.15, 1.15); ax.set_ylim(-1.15, 1.15)
+
 
 # ---------------------------
 # Selection/keeping rebuilds

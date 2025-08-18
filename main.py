@@ -253,10 +253,10 @@ def main():
     cfg: Config = tyro.cli(Config)
 
     run_name = (
-        f"{cfg.model_type}-{cfg.dataset_name.split('/')[-1]}"
+        f"s{cfg.seed}-{cfg.model_type}-{cfg.dataset_name.split('/')[-1]}"
         f"-h{cfg.n_hops}-k{cfg.topk}-c{cfg.capacity}-r{cfg.router_type}-wd{cfg.wd}"
-        f"-d{cfg.d_model}-n{cfg.n_att_modules}-n{cfg.n_ff_modules}-i{cfg.n_id_modules}"
-        f"-b{cfg.backbone}-s{cfg.seed}-l{cfg.lr_peak}-g{cfg.gumbel_tau}-c{cfg.norm_after_capacity}"
+        f"-d{cfg.d_model}-n{cfg.n_att_modules}-n{cfg.n_ff_modules}-i{cfg.n_id_modules}-b{cfg.backbone}"
+        f"-wd{cfg.wd}-l{cfg.lr_peak}-g{cfg.gumbel_tau}"
     )
     wandb.init(project=cfg.wandb_project, name=run_name, config=asdict(cfg))
 
@@ -347,6 +347,8 @@ def main():
             )
 
         wandb.log({"global_step": step}, step=step, commit=True)
+
+    wandb.finish()
         
 
 if __name__ == "__main__":

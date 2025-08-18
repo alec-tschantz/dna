@@ -205,5 +205,5 @@ def log_capacity_saturation_dashboard(
 
     fig.suptitle("Capacity Pressure Dashboard (approx from probs + eff_topk)", y=0.98,
                  fontsize=13, weight="bold")
-    wandb.log({"routing/dashboard": wandb.Image(fig), "step": step})
+    wandb.log({"routing/dashboard": wandb.Image(fig)}, step=step, commit=False)
     plt.close(fig)

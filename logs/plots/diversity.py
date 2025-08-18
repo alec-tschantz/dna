@@ -178,5 +178,5 @@ def plot_path_diversity_dashboard(div: Dict[str, Any], step: int):
     axD.set_title("Path composition (expert color)")
 
     # plt.tight_layout()
-    wandb.log({"routing/path_diversity": wandb.Image(fig), "step": step})
+    wandb.log({"routing/path_diversity": wandb.Image(fig)}, step=step, commit=False)
     plt.close(fig)

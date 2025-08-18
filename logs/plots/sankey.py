@@ -144,7 +144,7 @@ def log_routing_sankey_if_available(
         height=520,
         margin=dict(l=10, r=10, t=50, b=10),
     )
-    wandb.log({"routing/sankey": fig_sankey, "step": step})
+    wandb.log({"routing/sankey": fig_sankey}, step=step, commit=False)
 
     if flows:
         ncols = min(3, max(1, len(flows)))
@@ -160,7 +160,7 @@ def log_routing_sankey_if_available(
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         for j in range(len(flows), len(axes)):
             axes[j].axis("off")
-        wandb.log({"routing/transition_heatmap": wandb.Image(fig_hm), "step": step})
+        wandb.log({"routing/transition_heatmap": wandb.Image(fig_hm)}, step=step, commit=False)
         plt.close(fig_hm)
 
     return fig_sankey

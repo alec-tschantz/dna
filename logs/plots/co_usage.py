@@ -259,5 +259,5 @@ def log_expert_co_usage_graph(
     fig.text(0.01, 0.01, f"global kept/selected ratio (approx): {kept_ratio:.2f}",
              fontsize=9, color="#444")
 
-    wandb.log({"routing/expert_co_usage": wandb.Image(fig), "step": step})
+    wandb.log({"routing/expert_co_usage": wandb.Image(fig)}, step=step, commit=False)
     plt.close(fig)

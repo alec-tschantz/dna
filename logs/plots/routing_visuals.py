@@ -37,7 +37,7 @@ def plot_heatmap(batch_stats: Dict[str, Any], step: int) -> None:
     ax.set_yticks(range(imp.shape[1]))
     ax.set_yticklabels(labels)
 
-    wandb.log({"routing/heatmap": wandb.Image(fig), "step": step})
+    wandb.log({"routing/heatmap": wandb.Image(fig)}, step=step, commit=False)
     plt.close(fig)
 
 
@@ -127,7 +127,7 @@ def plot_token_flow_rich(
     ax.set_xticks([])
     ax.set_title(f"{title} • step {step}\npreview: {preview}", pad=10)
 
-    wandb.log({"routing/token_flow_rich": wandb.Image(fig), "step": step})
+    wandb.log({"routing/token_flow_rich": wandb.Image(fig)}, step=step, commit=False)
     plt.close(fig)
 
 

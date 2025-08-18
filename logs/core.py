@@ -3,6 +3,8 @@ import time
 from pathlib import Path
 from datetime import datetime
 import json
+from rich.pretty import pprint as rpprint
+
 
 import equinox as eqx
 import jax
@@ -105,9 +107,8 @@ def log_initial_stats(
         ),
     ]
 
-    from rich.pretty import pprint as rpprint
     rpprint(vars(cfg))
-    rpprint(eqx.filter(model, eqx.is_array))
+    # rpprint(eqx.filter(model, eqx.is_array))
 
     print_ascii_dna()
     print(ansi_box("Dataset & Model Summary", lines, width=66))
@@ -120,8 +121,9 @@ def log_initial_stats(
             "init/seq_len_min": lmin,
             "init/seq_len_max": lmax,
             "init/pad_mean": pmean,
-            "step": 0,
-        }
+        },
+        step=0,
+        commit=False,
     )
 
 
@@ -184,7 +186,7 @@ def log_train_step(
         f"T/s: {tok_per_sec:,.0f}"
     )
 
-    wandb.log(logs)
+    wandb.log(logs, step=step, commit=False)
 
 
 
@@ -217,7 +219,7 @@ def run_eval_suite(
         model, eval_batch, key=eval_key, model_kwargs=eval_kwargs
     )
     
-    eval_logs = {"eval/loss": float(val_loss), "eval/acc": float(val_acc), "step": step}
+    eval_logs = {"eval/loss": float(val_loss), "eval/acc": float(val_acc)}
     
     # Log eval routing stats if available
     if has_routing(model) and isinstance(eval_stats, (tuple, list)) and len(eval_stats) > 0:
@@ -232,9 +234,9 @@ def run_eval_suite(
         eval_logs.update(extra_routing_metrics(stats_host, prefix="router/eval"))
 
         # NEW: histograms/distributions
-        log_router_histograms(stats_host, step=step, prefix="router/eval")
+        log_router_histograms(stats_host, step=step, prefix="routing")
 
-    wandb.log(eval_logs)
+    wandb.log(eval_logs, step=step, commit=False)
     print(f"  [Eval] Loss: {float(val_loss):.4f} | Acc: {float(val_acc):.4f}")
 
     # Existing visuals

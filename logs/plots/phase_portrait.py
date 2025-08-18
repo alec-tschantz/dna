@@ -208,5 +208,5 @@ def log_expert_phase_portrait(
 
     fig.suptitle("Routing Effectiveness vs Confidence (approx from probs + eff_topk)",
                  y=0.98, fontsize=13, weight="bold")
-    wandb.log({"routing/expert_phase": wandb.Image(fig), "step": step})
+    wandb.log({"routing/expert_phase": wandb.Image(fig)}, step=step, commit=False)
     plt.close(fig)

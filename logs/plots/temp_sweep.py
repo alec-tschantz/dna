@@ -74,13 +74,12 @@ def log_temperature_sweep_grid(
 
     wandb.log(
         {
-            "step": step,
             "routing/temp_sweep_heatmap": wandb.Image(fig),
             # "router/eval/temp_sweep_table": table,
             # "routingtemp_sweep/best_loss": best_loss,
             # "routing/temp_sweep/best_router_temp": best_router,
             # "routing/temp_sweep/best_select_temp": best_select,
-        }
+        }, step=step, commit=False
     )
     plt.close(fig)
     return key

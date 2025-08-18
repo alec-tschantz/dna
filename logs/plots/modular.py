@@ -309,7 +309,7 @@ def plot_token_path_specialization(spec: Dict[str, Any], step: int):
         y=0.98,
     )
 
-    wandb.log({"routing/token_path_specialization": wandb.Image(fig), "step": step})
+    wandb.log({"routing/token_path_specialization": wandb.Image(fig)}, step=step, commit=False)
     plt.close(fig)
 
 
@@ -352,4 +352,4 @@ def log_token_path_sankey(spec: Dict[str, Any], step: int):
         height=480,
         margin=dict(l=10, r=10, t=50, b=10),
     )
-    wandb.log({"routing/token_path_sankey": fig, "step": step})
+    wandb.log({"routing/token_path_sankey": fig}, step=step, commit=False)

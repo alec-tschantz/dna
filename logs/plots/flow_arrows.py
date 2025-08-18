@@ -417,5 +417,5 @@ def log_token_expert_flow_arrows(
     except Exception:
         pass
 
-    wandb.log({"routing/token_expert_flow_arrows": wandb.Image(fig), "step": step})
+    wandb.log({"routing/token_expert_flow_arrows": wandb.Image(fig)}, step=step)
     plt.close(fig)

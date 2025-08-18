@@ -37,11 +37,6 @@ class Config:
     dropout: float = 0.0
     rope_base: float = 10_000.0
 
-    # routing temperatures
-    router_temp: float = 1.0
-    select_temp: float = 1.0
-    gumbel_tau: float = 0.0
-
     # module pool (routed)
     n_att_modules: int = 4
     n_ff_modules: int = 4
@@ -63,6 +58,12 @@ class Config:
     wd: float = 0.01  
     clip: float = 1.0
     seed: int = 0
+
+    # routing temperatures
+    router_temp: float = 1.0
+    select_temp: float = 1.0
+    gumbel_tau: float = 0.0
+
 
     # logging/eval
     wandb_project: str = "dna-slurm-v2"
@@ -345,6 +346,8 @@ def main():
                 lr_value=float(schedule_fn(step)),
             )
 
+        wandb.log({"global_step": step}, step=step, commit=True)
+        
 
 if __name__ == "__main__":
     main()

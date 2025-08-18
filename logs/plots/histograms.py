@@ -145,7 +145,7 @@ def log_router_histograms(stats_host, *, step: int, prefix: str = "routing"):
             logs[f"{prefix}/importance_gini"] = _gini(imp)
         plt.close(fig_load)
 
-    wandb.log(logs)
+    wandb.log(logs, step=step, commit=False)
 
 
 def _gini(x: np.ndarray) -> float:

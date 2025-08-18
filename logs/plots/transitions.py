@@ -91,7 +91,7 @@ def log_expert_transition_heatmap(
         "routing/transition_density": float((trans > 0).mean()),
     }
     plt.close(fig)
-    wandb.log(logs)
+    wandb.log(logs, step=step, commit=False)
 
 
 def log_type_transition_heatmap(
@@ -149,4 +149,4 @@ def log_type_transition_heatmap(
         # "routing/type_self_frac": float(np.trace(trans) / max(trans.sum(), 1)),
     }
     plt.close(fig)
-    wandb.log(logs)
+    wandb.log(logs, step=step, commit=False)

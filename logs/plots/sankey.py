@@ -160,7 +160,9 @@ def log_routing_sankey(
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         for j in range(len(flows), len(axes)):
             axes[j].axis("off")
-        wandb.log({"routing/transition_heatmap": wandb.Image(fig_hm)}, step=step, commit=False)
+        wandb.log(
+            {"routing/transition_heatmap": wandb.Image(fig_hm)}, step=step, commit=False
+        )
         plt.close(fig_hm)
 
     return fig_sankey

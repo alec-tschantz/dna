@@ -14,7 +14,13 @@ from transformers import AutoTokenizer
 from dna import DNA, Dense, Attention, FeedForward, Identity
 from dna.routing import LinearRouter, CosineRouter, SequenceRouter
 from dna.dataloader import load_dataset_stream, sample_batch
-from logs import log_initial_stats, log_train_step, run_eval_suite, log_checkpoint
+from logs import (
+    log_initial_stats,
+    log_train_step,
+    log_module_and_router_diagnostics,
+    run_eval_suite,
+    log_checkpoint,
+)
 
 
 # ------------------------------ config ------------------------------ #
@@ -55,7 +61,7 @@ class Config:
     steps: int = 20_000
     warmup: int = 1_000
     lr_peak: float = 3e-4
-    wd: float = 0.01  
+    wd: float = 0.01
     clip: float = 1.0
     seed: int = 0
 
@@ -64,11 +70,11 @@ class Config:
     select_temp: float = 1.0
     gumbel_tau: float = 0.0
 
-
     # logging/eval
     wandb_project: str = "dna-slurm-v2"
     eval_every: int = 200
     log_every: int = 10
+    stats_every: int = 100
     n_examples: int = 5
     gen_len: int = 200
     eval_samples: int = 8192
@@ -189,7 +195,7 @@ def compute_loss(
     *,
     inference: bool,
     model_kwargs: Dict[str, jax.Array],
-    return_stats: bool = False
+    return_stats: bool = False,
 ):
     ids = jnp.asarray(batch["input_ids"])
     mask = jnp.asarray(batch["attention_mask"])
@@ -197,7 +203,14 @@ def compute_loss(
     keys = jax.random.split(key, B)
 
     def forward(x, m, k):
-        logits, stats = model(x, key=k, inference=inference, mask=m, **model_kwargs, return_stats=return_stats)
+        logits, stats = model(
+            x,
+            key=k,
+            inference=inference,
+            mask=m,
+            **model_kwargs,
+            return_stats=return_stats,
+        )
         return logits, stats
 
     logits, stats = jax.vmap(forward, in_axes=(0, 0, 0))(ids, mask, keys)
@@ -214,17 +227,29 @@ def compute_loss(
 
 
 @eqx.filter_jit
-def train_step(model, opt, opt_state, batch, *, key, model_kwargs):
+def train_step(
+    model, opt, opt_state, batch, *, key, model_kwargs, return_stats: bool = False
+):
     (loss, (logits, labels, mask, stats)), grads = eqx.filter_value_and_grad(
         compute_loss, has_aux=True
-    )(model, batch, key, inference=False, model_kwargs=model_kwargs, return_stats=False)
+    )(
+        model,
+        batch,
+        key,
+        inference=False,
+        model_kwargs=model_kwargs,
+        return_stats=return_stats,
+    )
+
     updates, opt_state = opt.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
+
     predictions = jnp.argmax(logits, axis=-1)
     valid = mask > 0
     acc = ((predictions == labels) & valid).sum() / jnp.maximum(valid.sum(), 1)
     gnorm = optax.global_norm(grads)
-    return model, opt_state, loss, acc, stats, gnorm
+
+    return model, opt_state, loss, acc, stats, gnorm, (grads if return_stats else None)
 
 
 @eqx.filter_jit
@@ -307,9 +332,16 @@ def main():
     for step in range(cfg.steps + 1):
         batch = sample_batch(train_stream, cfg.batch_size)
         key, step_key = jax.random.split(key)
+        want_stats = step % cfg.stats_every == 0
         t0 = time.perf_counter()
-        model, opt_state, loss, acc, stats, gnorm = train_step(
-            model, opt, opt_state, batch, key=step_key, model_kwargs=model_kwargs
+        model, opt_state, loss, acc, stats, gnorm, grads = train_step(
+            model,
+            opt,
+            opt_state,
+            batch,
+            key=step_key,
+            model_kwargs=model_kwargs,
+            return_stats=want_stats,
         )
         if step % cfg.log_every == 0:
             log_train_step(
@@ -321,9 +353,14 @@ def main():
                 acc=acc,
                 gnorm=gnorm,
                 step_time_ms=(time.perf_counter() - t0) * 1000.0,
-                stats=stats,
                 model_kwargs=model_kwargs,
             )
+
+        if step % cfg.stats_every == 0 and step > 0:
+            log_module_and_router_diagnostics(
+                model=model, grads=grads, stats_tuple=stats, step=step, prefix="stats"
+            )
+
         if step % cfg.eval_every == 0 and step > 0:
             key = run_eval_suite(
                 step=step,
@@ -349,7 +386,7 @@ def main():
         wandb.log({"global_step": step}, step=step, commit=True)
 
     wandb.finish()
-        
+
 
 if __name__ == "__main__":
     main()

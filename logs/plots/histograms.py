@@ -16,16 +16,20 @@ def _flatten_per_token(stats_host) -> Dict[str, np.ndarray]:
     for hop in stats_host:
         if not hop:
             continue
-        rho = np.asarray(hop["rho"])          # (B, T) or (T,)
-        ent = np.asarray(hop["entropy"])      # (B, T) or (T,)
-        effk = np.asarray(hop["eff_topk"])    # (B, T) or (T,)
-        msk = np.asarray(hop["token_mask"])   # (B, T) or (T,)
+        rho = np.asarray(hop["rho"])  # (B, T) or (T,)
+        ent = np.asarray(hop["entropy"])  # (B, T) or (T,)
+        effk = np.asarray(hop["eff_topk"])  # (B, T) or (T,)
+        msk = np.asarray(hop["token_mask"])  # (B, T) or (T,)
 
         # Broadcast to 2D for uniform handling.
-        if rho.ndim == 1:   rho = rho[None, :]
-        if ent.ndim == 1:   ent = ent[None, :]
-        if effk.ndim == 1:  effk = effk[None, :]
-        if msk.ndim == 1:   msk = msk[None, :]
+        if rho.ndim == 1:
+            rho = rho[None, :]
+        if ent.ndim == 1:
+            ent = ent[None, :]
+        if effk.ndim == 1:
+            effk = effk[None, :]
+        if msk.ndim == 1:
+            msk = msk[None, :]
 
         valid = msk.astype(bool)
         rhos.append(rho[valid])
@@ -48,11 +52,13 @@ def _aggregate_per_expert(stats_host) -> Dict[str, np.ndarray]:
     for hop in stats_host:
         if not hop:
             continue
-        load = np.asarray(hop["load"])            # (B, E) or (E,)
-        imp = np.asarray(hop["importance"])       # (B, E) or (E,)
+        load = np.asarray(hop["load"])  # (B, E) or (E,)
+        imp = np.asarray(hop["importance"])  # (B, E) or (E,)
 
-        if load.ndim == 1: load = load[None, :]
-        if imp.ndim == 1:  imp = imp[None, :]
+        if load.ndim == 1:
+            load = load[None, :]
+        if imp.ndim == 1:
+            imp = imp[None, :]
 
         loads.append(load)
         importances.append(imp)
@@ -60,8 +66,8 @@ def _aggregate_per_expert(stats_host) -> Dict[str, np.ndarray]:
     if not loads:
         return {}
 
-    loads = np.concatenate(loads, axis=0)          # (B*, E)
-    importances = np.concatenate(importances, 0)   # (B*, E)
+    loads = np.concatenate(loads, axis=0)  # (B*, E)
+    importances = np.concatenate(importances, 0)  # (B*, E)
     return {"load": loads, "importance": importances}
 
 
@@ -130,19 +136,22 @@ def log_router_histograms(stats_host, *, step: int, prefix: str = "routing"):
         #         f"{prefix}/efftopk_mean_token": float(effk.mean()),
         #     })
 
-        plt.close(fig_rho); plt.close(fig_ent); 
+        plt.close(fig_rho)
+        plt.close(fig_ent)
 
     # --- Per-expert: load bars & importance summary ---
     if per_expert:
-        load = per_expert["load"].sum(axis=0)          # (E,)
-        imp = per_expert["importance"].sum(axis=0)     # (E,)
+        load = per_expert["load"].sum(axis=0)  # (E,)
+        imp = per_expert["importance"].sum(axis=0)  # (E,)
 
-        fig_load = _matplot_bars(load, "Expert load (summed)", "expert id", "tokens kept")
+        fig_load = _matplot_bars(
+            load, "Expert load (summed)", "expert id", "tokens kept"
+        )
         logs[f"{prefix}/expert_load_bars"] = wandb.Image(fig_load)
         # logs[f"{prefix}/expert_load_mean"] = float(load.mean())
         # logs[f"{prefix}/expert_load_gini"] = _gini(load)
         # if imp.size:
-            # logs[f"{prefix}/importance_gini"] = _gini(imp)
+        # logs[f"{prefix}/importance_gini"] = _gini(imp)
         plt.close(fig_load)
 
     wandb.log(logs, step=step, commit=False)

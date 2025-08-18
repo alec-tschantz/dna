@@ -13,6 +13,7 @@ from .utils import _collect_top1_indices_all, _mpl_safe
 
 # ---------- analysis ----------
 
+
 def analyze_full_path_distribution(
     model,
     batch: Dict[str, Any],
@@ -22,9 +23,9 @@ def analyze_full_path_distribution(
     gumbel_tau: float,
     router_temp: float,
     select_temp: float,
-    max_paths: int = 20,          # keep this many most-common paths
-    min_token_count: int = 4,     # ignore globally-ultra-rare tokens
-    top_by_lift: int = 40,        # compute more than we show (UI trims)
+    max_paths: int = 20,  # keep this many most-common paths
+    min_token_count: int = 4,  # ignore globally-ultra-rare tokens
+    top_by_lift: int = 40,  # compute more than we show (UI trims)
     top_by_freq: int = 40,
 ) -> Optional[Dict[str, Any]]:
     """
@@ -71,7 +72,9 @@ def analyze_full_path_distribution(
     total_valid = len(paths)
 
     # entropy & effective #paths
-    probs_all = np.array([c / total_valid for c in path_counts.values()], dtype=np.float64)
+    probs_all = np.array(
+        [c / total_valid for c in path_counts.values()], dtype=np.float64
+    )
     entropy = float(-(probs_all * np.log(probs_all + 1e-12)).sum())
     eff_paths = float(np.exp(entropy))
 
@@ -101,7 +104,9 @@ def analyze_full_path_distribution(
     for i in range(len(kept_paths)):
         cnts = per_path_token_counts[i]
         total_p = max(sum(cnts.values()), 1)
-        items: List[Tuple[int, int, float, float]] = []  # (tid, c_in_path, lift, p_in_path)
+        items: List[Tuple[int, int, float, float]] = (
+            []
+        )  # (tid, c_in_path, lift, p_in_path)
         for tid, c_in_path in cnts.items():
             if global_token_counts[tid] < min_token_count:
                 continue
@@ -120,7 +125,9 @@ def analyze_full_path_distribution(
                 out.append((_decode(tid), int(c), float(lift), float(pin), int(tid)))
             return out
 
-        per_path_token_lists.append({"top_lift": _pack(top_lift), "top_freq": _pack(top_freq)})
+        per_path_token_lists.append(
+            {"top_lift": _pack(top_lift), "top_freq": _pack(top_freq)}
+        )
 
     return dict(
         H=H,
@@ -137,13 +144,16 @@ def analyze_full_path_distribution(
 
 # ---------- card-only plotting (paged) ----------
 
+
 def _short(s: str, maxlen: int = 18) -> str:
     s = _mpl_safe((s or "·").replace("\n", "\\n"))
     return s if len(s) <= maxlen else (s[: maxlen - 1] + "…")
 
+
 def _chunk(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i : i + n]
+
 
 def _suggest_layout(n_paths: int) -> Tuple[int, int]:
     """
@@ -158,6 +168,7 @@ def _suggest_layout(n_paths: int) -> Tuple[int, int]:
     # many paths → 4 columns, paginate every 24
     return 4, 24
 
+
 def _lines_per_card(ncols: int) -> Tuple[int, int]:
     """
     Choose how many lines to show for (top_lift, top_freq) per card, based on columns.
@@ -167,6 +178,7 @@ def _lines_per_card(ncols: int) -> Tuple[int, int]:
     if ncols == 3:
         return 12, 10
     return 9, 7  # ncols >= 4
+
 
 def _render_cards_page(
     *,
@@ -188,7 +200,7 @@ def _render_cards_page(
 ):
     n = len(paths)
     rows = int(np.ceil(n / ncols))
-    fig_h = max(8.0, 2.0 + rows * 2.4)    # taller with more rows
+    fig_h = max(8.0, 2.0 + rows * 2.4)  # taller with more rows
     fig_w = 18.0 if ncols <= 3 else 20.0  # a bit wider for 4 cols
 
     fig = plt.figure(figsize=(fig_w, fig_h), dpi=160)
@@ -200,12 +212,25 @@ def _render_cards_page(
         f"Shown {n} paths • coverage {coverage*100:.1f}% • hops {H} • tokens {N_total:,} • "
         f"entropy {entropy:.3f} • eff#paths {eff_paths:.1f} • page {page_num}"
     )
-    ax.text(0.0, 1.02, header, transform=ax.transAxes, fontsize=13, weight="bold", va="bottom")
+    ax.text(
+        0.0,
+        1.02,
+        header,
+        transform=ax.transAxes,
+        fontsize=13,
+        weight="bold",
+        va="bottom",
+    )
 
     # Grid placement
     col_w = 1.0 / ncols
     row_h = 1.0 / max(rows, 1)
-    box = dict(boxstyle="round,pad=0.45", facecolor="#f8fafc", edgecolor="#d9e2ec", linewidth=1.0)
+    box = dict(
+        boxstyle="round,pad=0.45",
+        facecolor="#f8fafc",
+        edgecolor="#d9e2ec",
+        linewidth=1.0,
+    )
 
     def fmt_block(title: str, items, k: int) -> str:
         lines = [title + ":"]
@@ -222,21 +247,27 @@ def _render_cards_page(
         sig = "→".join(map(str, paths[i]))
         head = f"P{i+1} • {counts[i]} ({shares[i]*100:.1f}%)\npath: [{sig}]"
         body = (
-            fmt_block("Top by lift", lists[i]["top_lift"], k_lift_show) + "\n" +
-            fmt_block("Most frequent", lists[i]["top_freq"], k_freq_show)
+            fmt_block("Top by lift", lists[i]["top_lift"], k_lift_show)
+            + "\n"
+            + fmt_block("Most frequent", lists[i]["top_freq"], k_freq_show)
         )
         ax.text(
-            x, y + row_h - 0.02,
+            x,
+            y + row_h - 0.02,
             head + "\n" + body,
             transform=ax.transAxes,
-            va="top", ha="left",
+            va="top",
+            ha="left",
             fontsize=9,
             family=None,  # default font, more compact than monospace
             bbox=box,
         )
 
-    wandb.log({f"{wandb_key}/page_{page_num:02d}": wandb.Image(fig)}, step=step, commit=False)
+    wandb.log(
+        {f"{wandb_key}/page_{page_num:02d}": wandb.Image(fig)}, step=step, commit=False
+    )
     plt.close(fig)
+
 
 def plot_full_path_cards_paged(
     spec: Dict[str, Any],
@@ -260,7 +291,12 @@ def plot_full_path_cards_paged(
 
     # Optionally cap total paths to show
     if max_paths_show is not None:
-        paths, counts, shares, lists = paths[:max_paths_show], counts[:max_paths_show], shares[:max_paths_show], lists[:max_paths_show]
+        paths, counts, shares, lists = (
+            paths[:max_paths_show],
+            counts[:max_paths_show],
+            shares[:max_paths_show],
+            lists[:max_paths_show],
+        )
 
     # Layout & paging
     ncols, max_per_page = _suggest_layout(len(paths))
@@ -291,6 +327,7 @@ def plot_full_path_cards_paged(
 
 # ---------- public entry ----------
 
+
 def log_full_path_analysis(
     model,
     batch: Dict[str, Any],
@@ -314,7 +351,9 @@ def log_full_path_analysis(
     Analyze then log a card-only, paged path report (no heatmaps/bars).
     """
     spec = analyze_full_path_distribution(
-        model, batch, tok,
+        model,
+        batch,
+        tok,
         key=key,
         gumbel_tau=gumbel_tau,
         router_temp=router_temp,
@@ -327,7 +366,8 @@ def log_full_path_analysis(
     if spec is None:
         return
     plot_full_path_cards_paged(
-        spec, step,
+        spec,
+        step,
         wandb_key=wandb_key,
         max_paths_show=max_paths_show,
     )

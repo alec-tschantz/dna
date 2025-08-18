@@ -19,16 +19,24 @@ from .utils import (
     ansi_box,
     l2_tree_norm,
     router_l2_norm,
+    l2_norm,
+    l2_per_first_dim,
+    safe_get,
     has_routing,
     routing_metrics_from_stats,
     extra_routing_metrics,
+    router_health_from_stats,
 )
 from .plots.routing_visuals import log_routing_visuals
 from .plots.flow_arrows import log_token_expert_flow_arrows
 from .plots.color_grid import log_token_expert_color_grid
 from .plots.sankey import log_routing_sankey
 from .plots.diversity import analyze_path_diversity, plot_path_diversity_dashboard
-from .plots.path_analysis import analyze_token_path_specialization, plot_token_path_specialization, log_token_path_sankey
+from .plots.path_analysis import (
+    analyze_token_path_specialization,
+    plot_token_path_specialization,
+    log_token_path_sankey,
+)
 from .plots.histograms import log_router_histograms
 from .plots.transitions import log_expert_transition_heatmap
 from .plots.co_usage import log_expert_co_usage_graph
@@ -137,7 +145,6 @@ def log_train_step(
     acc,
     gnorm,
     step_time_ms: float,
-    stats,
     model_kwargs: Dict[str, jax.Array],
 ):
     """Log core training metrics, with optional router metrics if available."""
@@ -152,31 +159,6 @@ def log_train_step(
         "train/weights_global_norm": float(l2_tree_norm(model)),
     }
 
-    if has_routing(model) and isinstance(stats, (tuple, list)) and len(stats) > 0:
-        stats_host = jax.tree_util.tree_map(jax.device_get, stats)
-        logs.update(
-            {
-                "router/norm": float(router_l2_norm(model)),
-                "router/temp/router": float(
-                    model_kwargs.get("router_temp", jnp.array([0.0]))[0]
-                ),
-                "router/temp/select": float(
-                    model_kwargs.get("select_temp", jnp.array([0.0]))[0]
-                ),
-                "router/temp/gumbel": float(
-                    model_kwargs.get("gumbel_tau", jnp.array([0.0]))[0]
-                ),
-            }
-        )
-        logs.update(
-            routing_metrics_from_stats(
-                stats_host,
-                prefix="router/train",
-                capacity=getattr(cfg, "capacity", None),
-            )
-        )
-        logs.update(extra_routing_metrics(stats_host, prefix="router/train"))
-
     print(
         f"  [Train] Step: {step} | "
         f"Loss: {float(loss):.4f} | "
@@ -186,6 +168,107 @@ def log_train_step(
     )
     wandb.log(logs, step=step, commit=False)
 
+
+def log_module_and_router_diagnostics(
+    *,
+    model,
+    grads=None,
+    stats_tuple: Optional[
+        Tuple[Dict[str, Any], ...]
+    ] = None,  # optional recent routing stats
+    step: Optional[int] = None,
+    prefix: str = "diag",
+) -> None:
+    """
+    Logs:
+      - {prefix}/expert/<Type>/<orig_id>/w_norm
+      - {prefix}/expert/<Type>/<orig_id>/g_norm      (if grads provided)
+      - {prefix}/router/h<hop>/w_norm
+      - {prefix}/router/h<hop>/g_norm               (if grads provided)
+      - {prefix}/embed/w_norm, {prefix}/ln_out/w_norm
+      - {prefix}/backbone/l<idx>/w_norm (+ g_norm`if grads)
+      - a few router health scalars if stats_tuple provided
+    """
+    logs: Dict[str, float] = {}
+
+    # --- Embedding / RMSNorm ---
+    if hasattr(model, "embed") and hasattr(model.embed, "weight"):
+        logs[f"{prefix}/embed/w_norm"] = l2_norm(model.embed)
+    if hasattr(model, "ln_out"):
+        logs[f"{prefix}/ln_out/w_norm"] = l2_norm(model.ln_out)
+    if grads is not None:
+        g_emb = safe_get(grads, "embed")
+        if g_emb is not None:
+            logs[f"{prefix}/embed/g_norm"] = l2_norm(g_emb)
+        g_ln = safe_get(grads, "ln_out")
+        if g_ln is not None:
+            logs[f"{prefix}/ln_out/g_norm"] = l2_norm(g_ln)
+
+    # --- Backbone layers ---
+    try:
+        for li, mod in enumerate(getattr(model, "backbone", ())):
+            logs[f"{prefix}/backbone/l{li}/w_norm"] = l2_norm(mod)
+            if grads is not None:
+                gmod = (
+                    safe_get(grads, "backbone")[li]
+                    if safe_get(grads, "backbone") is not None
+                    else None
+                )
+                if gmod is not None:
+                    logs[f"{prefix}/backbone/l{li}/g_norm"] = l2_norm(gmod)
+    except Exception:
+        pass
+
+    # --- Expert groups (your grouped modules) ---
+    try:
+        for gi, g in enumerate(model.groups):
+            # Identify type for nicer names
+            mod_type = type(g["static"]).__name__
+            idxs = np.asarray(
+                jax.device_get(g["idx"])
+            ).tolist()  # original expert ids in this group
+            # Per-expert weight norm
+            w_per = l2_per_first_dim(g["params"])
+            for k, orig_id in enumerate(idxs):
+                logs[f"{prefix}/expert/{mod_type}/{int(orig_id)}/w_norm"] = float(
+                    w_per[k]
+                )
+
+            # Grad norms per expert
+            if grads is not None:
+                ggrp = safe_get(grads, "groups")
+                if ggrp is not None and len(ggrp) > gi and ggrp[gi] is not None:
+                    gparams = safe_get(ggrp[gi], "params")
+                    if gparams is not None:
+                        g_per = l2_per_first_dim(gparams)
+                        for k, orig_id in enumerate(idxs):
+                            logs[
+                                f"{prefix}/expert/{mod_type}/{int(orig_id)}/g_norm"
+                            ] = float(g_per[k])
+    except Exception:
+        pass
+
+    # --- Routers (per hop) ---
+    try:
+        for h, r in enumerate(getattr(model, "routers", ())):
+            logs[f"{prefix}/router/h{h}/w_norm"] = l2_norm(r)
+            if grads is not None:
+                grs = safe_get(grads, "routers")
+                if grs is not None and len(grs) > h and grs[h] is not None:
+                    logs[f"{prefix}/router/h{h}/g_norm"] = l2_norm(grs[h])
+    except Exception:
+        pass
+
+    # --- Optional: quick "health" from recent forward stats ---
+    if stats_tuple is not None:
+        logs.update(router_health_from_stats(stats_tuple))
+
+    # One more: total model/grad norm for sanity
+    logs[f"{prefix}/model/w_norm_total"] = l2_norm(eqx.filter(model, eqx.is_array))
+    if grads is not None:
+        logs[f"{prefix}/model/g_norm_total"] = l2_norm(grads)
+
+    wandb.log(logs, step=step, commit=False)
 
 
 def run_eval_suite(
@@ -216,10 +299,14 @@ def run_eval_suite(
     val_loss, val_acc, eval_stats = eval_step_fn(
         model, eval_batch, key=eval_key, model_kwargs=eval_kwargs
     )
-    
+
     eval_logs = {"eval/loss": float(val_loss), "eval/acc": float(val_acc)}
-    
-    if has_routing(model) and isinstance(eval_stats, (tuple, list)) and len(eval_stats) > 0:
+
+    if (
+        has_routing(model)
+        and isinstance(eval_stats, (tuple, list))
+        and len(eval_stats) > 0
+    ):
         stats_host = jax.tree_util.tree_map(jax.device_get, eval_stats)
         eval_logs.update(
             routing_metrics_from_stats(
@@ -317,21 +404,21 @@ def run_eval_suite(
         plot_token_path_specialization(spec, step)
         log_token_path_sankey(spec, step)
 
-
     key, fpa_key = jax.random.split(key)
     log_full_path_analysis(
-        model, vis_batch, tok,
+        model,
+        vis_batch,
+        tok,
         key=fpa_key,
         gumbel_tau=0.0,
         router_temp=float(eval_kwargs["router_temp"][0]),
         select_temp=float(eval_kwargs["select_temp"][0]),
         step=step,
-        max_paths=24,         
-        min_token_count=4,     
+        max_paths=24,
+        min_token_count=4,
         top_by_lift=40,
         top_by_freq=40,
     )
-
 
     key, tkey1 = jax.random.split(key)
     log_expert_transition_heatmap(
@@ -354,8 +441,8 @@ def run_eval_suite(
         router_temp=float(eval_kwargs["router_temp"][0]),
         select_temp=float(eval_kwargs["select_temp"][0]),
         step=step,
-        top_experts=24,        
-        min_edge_frac=0.04, 
+        top_experts=24,
+        min_edge_frac=0.04,
     )
 
     key, cap_key = jax.random.split(key)
@@ -367,7 +454,7 @@ def run_eval_suite(
         router_temp=float(eval_kwargs["router_temp"][0]),
         select_temp=float(eval_kwargs["select_temp"][0]),
         step=step,
-        capacity=int(getattr(cfg, "capacity", 1)),  
+        capacity=int(getattr(cfg, "capacity", 1)),
         top_experts=36,
     )
 

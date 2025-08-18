@@ -12,13 +12,15 @@ import wandb
 from .utils import (
     has_routing,
     _expert_color_table,
-    evaluate_for_visuals,      # meta + light batch stats
-    _forward_batched_for_stats # full per-hop batched stats
+    evaluate_for_visuals,  # meta + light batch stats
+    _forward_batched_for_stats,  # full per-hop batched stats
 )
+
 
 def _flatten_valid(mask_bt: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Return linear indices (B,T) where token is valid."""
     return np.where(mask_bt.astype(bool))
+
 
 def _aggregate_cooc(
     selected_bte: np.ndarray,
@@ -28,7 +30,7 @@ def _aggregate_cooc(
     """Return (E,E) co-occur matrices for selected and kept."""
     b_idx, t_idx = valid_bt
     Xsel = selected_bte[b_idx, t_idx, :].astype(np.float32)  # (N,E)
-    Xkep = kept_bte[b_idx, t_idx, :].astype(np.float32)      # (N,E)
+    Xkep = kept_bte[b_idx, t_idx, :].astype(np.float32)  # (N,E)
     co_sel = Xsel.T @ Xsel
     co_kep = Xkep.T @ Xkep
     np.fill_diagonal(co_sel, 0.0)
@@ -36,22 +38,28 @@ def _aggregate_cooc(
     usage = Xsel.sum(axis=0)  # how often expert selected
     return co_sel, co_kep, usage
 
-def _circle_layout(n: int, radius: float = 1.0, start_angle: float = np.pi / 2) -> np.ndarray:
+
+def _circle_layout(
+    n: int, radius: float = 1.0, start_angle: float = np.pi / 2
+) -> np.ndarray:
     if n == 0:
         return np.zeros((0, 2), dtype=np.float32)
-    ang = start_angle + np.linspace(0, 2*np.pi, n, endpoint=False)
-    return np.stack([radius*np.cos(ang), radius*np.sin(ang)], axis=-1)
+    ang = start_angle + np.linspace(0, 2 * np.pi, n, endpoint=False)
+    return np.stack([radius * np.cos(ang), radius * np.sin(ang)], axis=-1)
+
 
 def _bezier_arc(p0, p1, bend: float = 0.3):
     c = np.array([0.0, 0.0])
-    v0 = (p0 - c); v1 = (p1 - c)
+    v0 = p0 - c
+    v1 = p1 - c
     m = (p0 + p1) / 2.0
-    n = (v0/np.linalg.norm(v0) + v1/np.linalg.norm(v1))
+    n = v0 / np.linalg.norm(v0) + v1 / np.linalg.norm(v1)
     if np.linalg.norm(n) < 1e-6:
         n = (p0 - p1)[::-1] * np.array([1, -1])
     n = n / (np.linalg.norm(n) + 1e-9)
     ctrl = m + bend * n
     return np.array([p0, ctrl, ctrl, p1], dtype=np.float32)
+
 
 def _draw_graph(ax, pos, node_sizes, node_colors, edges, title: str):
     # edges: list of (i, j, weight, kept_weight)
@@ -63,29 +71,52 @@ def _draw_graph(ax, pos, node_sizes, node_colors, edges, title: str):
         bez = _bezier_arc(p0, p1, bend=0.28)
         width = 0.6 + 5.4 * (w / (maxw + 1e-9))
         keep_alpha = 0.2 + 0.75 * (k / (w + 1e-9))
-        path = MplPath(bez, [MplPath.MOVETO, MplPath.CURVE4, MplPath.CURVE4, MplPath.CURVE4])
-        ax.add_patch(PathPatch(path, lw=width, facecolor="none", edgecolor="black", alpha=0.12))
-        ax.add_patch(PathPatch(path, lw=max(0.8, 0.6*width), facecolor="none", edgecolor=(0,0,0,keep_alpha)))
+        path = MplPath(
+            bez, [MplPath.MOVETO, MplPath.CURVE4, MplPath.CURVE4, MplPath.CURVE4]
+        )
+        ax.add_patch(
+            PathPatch(path, lw=width, facecolor="none", edgecolor="black", alpha=0.12)
+        )
+        ax.add_patch(
+            PathPatch(
+                path,
+                lw=max(0.8, 0.6 * width),
+                facecolor="none",
+                edgecolor=(0, 0, 0, keep_alpha),
+            )
+        )
     # nodes
     for i, (xy, sz, col) in enumerate(zip(pos, node_sizes, node_colors)):
         r = 0.03 + 0.06 * sz
         circ = Circle(xy, r, facecolor=col, edgecolor="white", linewidth=1.0, zorder=3)
         ax.add_patch(circ)
-        ax.text(xy[0], xy[1], str(i), ha="center", va="center", fontsize=7.5,
-                color="white", weight="bold", zorder=4)
-    ax.set_aspect("equal"); ax.set_axis_off()
+        ax.text(
+            xy[0],
+            xy[1],
+            str(i),
+            ha="center",
+            va="center",
+            fontsize=7.5,
+            color="white",
+            weight="bold",
+            zorder=4,
+        )
+    ax.set_aspect("equal")
+    ax.set_axis_off()
     ax.set_title(title, fontsize=12, weight="bold")
-    ax.set_xlim(-1.15, 1.15); ax.set_ylim(-1.15, 1.15)
+    ax.set_xlim(-1.15, 1.15)
+    ax.set_ylim(-1.15, 1.15)
 
 
 # ---------------------------
 # Selection/keeping rebuilds
 # ---------------------------
 
+
 def _build_selected_from_probs(
-    probs_bte: np.ndarray,          # (B,T,E)
-    effk_bt: np.ndarray,            # (B,T) effective top-k per token
-    token_mask_bt: np.ndarray,      # (B,T) bool
+    probs_bte: np.ndarray,  # (B,T,E)
+    effk_bt: np.ndarray,  # (B,T) effective top-k per token
+    token_mask_bt: np.ndarray,  # (B,T) bool
 ) -> np.ndarray:
     """Rebuild selection mask per token from routing_probs and eff_topk."""
     B, T, E = probs_bte.shape
@@ -104,11 +135,12 @@ def _build_selected_from_probs(
             selected[b, t, idx] = True
     return selected
 
+
 def _approx_kept_from_capacity(
-    selected_bte: np.ndarray,       # (B,T,E) bool
-    scores_bte: np.ndarray,         # (B,T,E) float (use probs as proxy)
-    token_mask_bt: np.ndarray,      # (B,T) bool
-    capacity: Optional[int],        # tokens per expert per sequence
+    selected_bte: np.ndarray,  # (B,T,E) bool
+    scores_bte: np.ndarray,  # (B,T,E) float (use probs as proxy)
+    token_mask_bt: np.ndarray,  # (B,T) bool
+    capacity: Optional[int],  # tokens per expert per sequence
 ) -> np.ndarray:
     """Approximate capacity filter: for each expert & batch item, keep top-C tokens by score."""
     B, T, E = selected_bte.shape
@@ -129,9 +161,11 @@ def _approx_kept_from_capacity(
                 kept[b, pos[top], e] = True
     return kept
 
+
 # ---------------------------
 # Public logger
 # ---------------------------
+
 
 def log_expert_co_usage_graph(
     model,
@@ -170,8 +204,13 @@ def log_expert_co_usage_graph(
     B = int(ids.shape[0])
     fkeys = jax.random.split(jax.random.fold_in(key, 9871), B)
     stats_all = _forward_batched_for_stats(
-        model, ids, mask, fkeys,
-        gumbel_tau=gumbel_tau, router_temp=router_temp, select_temp=select_temp
+        model,
+        ids,
+        mask,
+        fkeys,
+        gumbel_tau=gumbel_tau,
+        router_temp=router_temp,
+        select_temp=select_temp,
     )
     if not isinstance(stats_all, (tuple, list)) or len(stats_all) == 0:
         return
@@ -184,7 +223,7 @@ def log_expert_co_usage_graph(
     capacity = int(getattr(model, "capacity", 0) or 0)
 
     for hop in stats_all:
-        token_mask_bt = np.asarray(hop["token_mask"]).astype(bool)      # (B,T)
+        token_mask_bt = np.asarray(hop["token_mask"]).astype(bool)  # (B,T)
         probs_bte = np.asarray(hop["routing_probs"], dtype=np.float32)  # (B,T,E)
 
         # eff_topk might be (B,T) after vmap; if not present, fallback to k from router
@@ -204,7 +243,9 @@ def log_expert_co_usage_graph(
         # Rebuild selected (B,T,E)
         selected_bte = _build_selected_from_probs(probs_bte, effk_bt, token_mask_bt)
         # Approximate kept (capacity)
-        kept_bte = _approx_kept_from_capacity(selected_bte, probs_bte, token_mask_bt, capacity)
+        kept_bte = _approx_kept_from_capacity(
+            selected_bte, probs_bte, token_mask_bt, capacity
+        )
 
         valid_bt = _flatten_valid(token_mask_bt)
         if valid_bt[0].size == 0:
@@ -215,7 +256,7 @@ def log_expert_co_usage_graph(
         usage += use
 
     # Keep top experts by usage for readability
-    keep = np.argsort(usage)[::-1][:min(top_experts, E)]
+    keep = np.argsort(usage)[::-1][: min(top_experts, E)]
     K = keep.size
     co_sel = co_sel[np.ix_(keep, keep)]
     co_kep = co_kep[np.ix_(keep, keep)]
@@ -258,8 +299,13 @@ def log_expert_co_usage_graph(
     )
 
     kept_ratio = (co_kep.sum() / max(co_sel.sum(), 1.0)) if co_sel.size else 0.0
-    fig.text(0.01, 0.01, f"global kept/selected ratio (approx): {kept_ratio:.2f}",
-             fontsize=9, color="#444")
+    fig.text(
+        0.01,
+        0.01,
+        f"global kept/selected ratio (approx): {kept_ratio:.2f}",
+        fontsize=9,
+        color="#444",
+    )
 
     wandb.log({"routing/expert_co_usage": wandb.Image(fig)}, step=step, commit=False)
     plt.close(fig)

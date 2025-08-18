@@ -11,9 +11,9 @@ from .utils import has_routing, _forward_batched_for_stats, _expert_color_table
 
 
 def _build_selected_from_probs(
-    probs_bte: np.ndarray,          # (B,T,E)
-    effk_bt: np.ndarray,            # (B,T)
-    token_mask_bt: np.ndarray,      # (B,T) bool
+    probs_bte: np.ndarray,  # (B,T,E)
+    effk_bt: np.ndarray,  # (B,T)
+    token_mask_bt: np.ndarray,  # (B,T) bool
 ) -> np.ndarray:
     """Rebuild selection mask per token from routing_probs and eff_topk."""
     B, T, E = probs_bte.shape
@@ -33,10 +33,10 @@ def _build_selected_from_probs(
 
 
 def _approx_kept_from_capacity(
-    selected_bte: np.ndarray,       # (B,T,E) bool
-    scores_bte: np.ndarray,         # (B,T,E) float (use probs as proxy)
-    token_mask_bt: np.ndarray,      # (B,T) bool
-    capacity: Optional[int],        # tokens per expert per batch item
+    selected_bte: np.ndarray,  # (B,T,E) bool
+    scores_bte: np.ndarray,  # (B,T,E) float (use probs as proxy)
+    token_mask_bt: np.ndarray,  # (B,T) bool
+    capacity: Optional[int],  # tokens per expert per batch item
 ) -> np.ndarray:
     """Approximate capacity: for each (b,e), keep top-C tokens by score among selected."""
     B, T, E = selected_bte.shape
@@ -78,8 +78,13 @@ def log_expert_phase_portrait(
     B = int(ids.shape[0])
     fkeys = jax.random.split(jax.random.fold_in(key, 7771), B)
     stats_all = _forward_batched_for_stats(
-        model, ids, mask, fkeys,
-        gumbel_tau=gumbel_tau, router_temp=router_temp, select_temp=select_temp
+        model,
+        ids,
+        mask,
+        fkeys,
+        gumbel_tau=gumbel_tau,
+        router_temp=router_temp,
+        select_temp=select_temp,
     )
     if not isinstance(stats_all, (tuple, list)) or len(stats_all) == 0:
         return
@@ -100,8 +105,8 @@ def log_expert_phase_portrait(
     capacity = int(getattr(model, "capacity", 0) or 0)
 
     for hop in stats_all:
-        token_mask_bt = np.asarray(hop["token_mask"]).astype(bool)     # (B,T)
-        p_bte = np.asarray(hop["routing_probs"]).astype(np.float32)    # (B,T,E) or (T,E)
+        token_mask_bt = np.asarray(hop["token_mask"]).astype(bool)  # (B,T)
+        p_bte = np.asarray(hop["routing_probs"]).astype(np.float32)  # (B,T,E) or (T,E)
         if p_bte.ndim == 2:
             p_bte = p_bte[None, ...]
         # eff_topk might be (B,T). If missing, fall back to router.k
@@ -118,24 +123,26 @@ def log_expert_phase_portrait(
                 effk_bt = effk_bt[None, :]
 
         # Rebuild selection and approximate kept
-        M_bte = _build_selected_from_probs(p_bte, effk_bt, token_mask_bt)          # selected
-        K_bte = _approx_kept_from_capacity(M_bte, p_bte, token_mask_bt, capacity)  # kept (approx)
+        M_bte = _build_selected_from_probs(p_bte, effk_bt, token_mask_bt)  # selected
+        K_bte = _approx_kept_from_capacity(
+            M_bte, p_bte, token_mask_bt, capacity
+        )  # kept (approx)
 
         # Flatten valid positions
         b, t = np.where(token_mask_bt)
         if b.size == 0:
             continue
-        P = p_bte[b, t, :]        # (N,E)
-        M = M_bte[b, t, :]        # (N,E)
-        K = K_bte[b, t, :]        # (N,E)
+        P = p_bte[b, t, :]  # (N,E)
+        M = M_bte[b, t, :]  # (N,E)
+        K = K_bte[b, t, :]  # (N,E)
 
         selected += M.sum(axis=0)
         kept += K.sum(axis=0)
 
         # Top-1 expert per token (by routing_probs)
-        idx = np.argmax(P, axis=-1)                 # (N,)
-        vals = P[np.arange(P.shape[0]), idx]        # (N,)
-        cnt = np.bincount(idx, minlength=E)         # (E,)
+        idx = np.argmax(P, axis=-1)  # (N,)
+        vals = P[np.arange(P.shape[0]), idx]  # (N,)
+        cnt = np.bincount(idx, minlength=E)  # (E,)
         top1_count += cnt
         add = np.zeros((E,), dtype=np.float64)
         np.add.at(add, idx, vals.astype(np.float64))
@@ -147,7 +154,7 @@ def log_expert_phase_portrait(
         mean_top1_prob = np.where(top1_count > 0, top1_prob_sum / top1_count, 0.0)
 
     # Pick top experts by usage
-    keep = np.argsort(usage)[::-1][:min(top_experts, E)]
+    keep = np.argsort(usage)[::-1][: min(top_experts, E)]
     K = keep.size
     x = kept_rate[keep]
     y = mean_top1_prob[keep]
@@ -160,6 +167,7 @@ def log_expert_phase_portrait(
     # Colors by type if available
     try:
         from .utils import _expert_meta
+
         meta = _expert_meta(model)
     except Exception:
         meta = None
@@ -176,22 +184,39 @@ def log_expert_phase_portrait(
 
     # Figure
     import matplotlib.gridspec as gridspec
+
     fig = plt.figure(figsize=(10.5, 7.5), dpi=170)
-    gs = gridspec.GridSpec(2, 2, height_ratios=[1.0, 0.5], width_ratios=[1.0, 1.0],
-                           hspace=0.25, wspace=0.20)
+    gs = gridspec.GridSpec(
+        2,
+        2,
+        height_ratios=[1.0, 0.5],
+        width_ratios=[1.0, 1.0],
+        hspace=0.25,
+        wspace=0.20,
+    )
 
     ax = fig.add_subplot(gs[0, :])
     ax.scatter(x, y, s=sizes, c=cols, edgecolors="white", linewidths=0.8)
     ax.set_xlabel("kept rate (= kept / selected)")
     ax.set_ylabel("mean top-1 probability (when expert wins)")
-    ax.set_title(f"Expert Phase Portrait • top {K}/{E} • step {step}", fontsize=12, weight="bold")
+    ax.set_title(
+        f"Expert Phase Portrait • top {K}/{E} • step {step}", fontsize=12, weight="bold"
+    )
     ax.grid(alpha=0.25)
 
     # Annotate a few large-usage experts
-    top_show = np.argsort(s)[::-1][:min(10, K)]
+    top_show = np.argsort(s)[::-1][: min(10, K)]
     for i in top_show:
-        ax.text(x[i], y[i], str(keep[i]), fontsize=8, weight="bold",
-                color="#222", ha="center", va="center")
+        ax.text(
+            x[i],
+            y[i],
+            str(keep[i]),
+            fontsize=8,
+            weight="bold",
+            color="#222",
+            ha="center",
+            va="center",
+        )
 
     # Marginal histograms
     ax2 = fig.add_subplot(gs[1, 0])
@@ -206,7 +231,11 @@ def log_expert_phase_portrait(
     ax3.set_xlabel("mean top-1 prob")
     ax3.set_ylabel("experts")
 
-    fig.suptitle("Routing Effectiveness vs Confidence (approx from probs + eff_topk)",
-                 y=0.98, fontsize=13, weight="bold")
+    fig.suptitle(
+        "Routing Effectiveness vs Confidence (approx from probs + eff_topk)",
+        y=0.98,
+        fontsize=13,
+        weight="bold",
+    )
     wandb.log({"routing/expert_phase": wandb.Image(fig)}, step=step, commit=False)
     plt.close(fig)

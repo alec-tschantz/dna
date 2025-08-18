@@ -20,9 +20,9 @@ def _sum_over_bt(x_bte: np.ndarray, valid_bt: np.ndarray) -> np.ndarray:
 
 
 def _build_selected_from_probs(
-    probs_bte: np.ndarray,          # (B,T,E)
-    effk_bt: np.ndarray,            # (B,T)
-    token_mask_bt: np.ndarray,      # (B,T) bool
+    probs_bte: np.ndarray,  # (B,T,E)
+    effk_bt: np.ndarray,  # (B,T)
+    token_mask_bt: np.ndarray,  # (B,T) bool
 ) -> np.ndarray:
     """Rebuild selection mask per token from routing_probs and eff_topk."""
     B, T, E = probs_bte.shape
@@ -42,10 +42,10 @@ def _build_selected_from_probs(
 
 
 def _approx_kept_from_capacity(
-    selected_bte: np.ndarray,       # (B,T,E) bool
-    scores_bte: np.ndarray,         # (B,T,E) float (use probs as proxy)
-    token_mask_bt: np.ndarray,      # (B,T) bool
-    capacity: Optional[int],        # tokens per expert per sequence
+    selected_bte: np.ndarray,  # (B,T,E) bool
+    scores_bte: np.ndarray,  # (B,T,E) float (use probs as proxy)
+    token_mask_bt: np.ndarray,  # (B,T) bool
+    capacity: Optional[int],  # tokens per expert per sequence
 ) -> np.ndarray:
     """Approximate capacity filter: for each expert & batch item, keep top-C tokens by score."""
     B, T, E = selected_bte.shape
@@ -87,8 +87,13 @@ def log_capacity_saturation_dashboard(
     B = int(ids.shape[0])
     fkeys = jax.random.split(jax.random.fold_in(key, 331), B)
     stats_all = _forward_batched_for_stats(
-        model, ids, mask, fkeys,
-        gumbel_tau=gumbel_tau, router_temp=router_temp, select_temp=select_temp
+        model,
+        ids,
+        mask,
+        fkeys,
+        gumbel_tau=gumbel_tau,
+        router_temp=router_temp,
+        select_temp=select_temp,
     )
     if not isinstance(stats_all, (tuple, list)) or len(stats_all) == 0:
         return
@@ -96,7 +101,7 @@ def log_capacity_saturation_dashboard(
     # Determine E, H from routing_probs
     first = stats_all[0]
     probs0 = np.asarray(first["routing_probs"])
-    if probs0.ndim == 2:   # (T,E) -> (B,T,E) safety
+    if probs0.ndim == 2:  # (T,E) -> (B,T,E) safety
         probs0 = probs0[None, ...]
     E = int(probs0.shape[-1])
     H = len(stats_all)
@@ -108,8 +113,8 @@ def log_capacity_saturation_dashboard(
     usage_total = np.zeros((E,), dtype=np.float64)
 
     for h, hop in enumerate(stats_all):
-        token_mask_bt = np.asarray(hop["token_mask"]).astype(bool)           # (B,T)
-        probs_bte = np.asarray(hop["routing_probs"], dtype=np.float32)       # (B,T,E)
+        token_mask_bt = np.asarray(hop["token_mask"]).astype(bool)  # (B,T)
+        probs_bte = np.asarray(hop["routing_probs"], dtype=np.float32)  # (B,T,E)
         if probs_bte.ndim == 2:
             probs_bte = probs_bte[None, ...]
         eff = hop.get("eff_topk", None)
@@ -127,10 +132,12 @@ def log_capacity_saturation_dashboard(
 
         # Rebuild selected and approx kept
         selected_bte = _build_selected_from_probs(probs_bte, effk_bt, token_mask_bt)
-        kept_bte = _approx_kept_from_capacity(selected_bte, probs_bte, token_mask_bt, capacity)
+        kept_bte = _approx_kept_from_capacity(
+            selected_bte, probs_bte, token_mask_bt, capacity
+        )
 
         sel_e = _sum_over_bt(selected_bte, token_mask_bt)  # (E,)
-        kep_e = _sum_over_bt(kept_bte, token_mask_bt)      # (E,)
+        kep_e = _sum_over_bt(kept_bte, token_mask_bt)  # (E,)
         dro_e = np.clip(sel_e - kep_e, 0.0, None)
 
         kept_tot_H[h] = float(kep_e.sum())
@@ -145,9 +152,9 @@ def log_capacity_saturation_dashboard(
 
     # Sort experts by total usage and keep top K
     order = np.argsort(usage_total)[::-1]
-    keep_idx = order[:min(top_experts, E)]
+    keep_idx = order[: min(top_experts, E)]
     K = keep_idx.size
-    df_sub = drop_frac_EH[keep_idx, :]   # (K,H)
+    df_sub = drop_frac_EH[keep_idx, :]  # (K,H)
 
     # Colors per expert (legend-friendly). If you have true type ids, pass them here.
     meta_for_colors = {
@@ -155,23 +162,31 @@ def log_capacity_saturation_dashboard(
         "expert_type_ids": np.zeros((K,), dtype=np.int32),
         "id_to_type": ["Expert"],
     }
-    _ = _expert_color_table(meta_for_colors)  # we don't strictly need colors for this dashboard
+    _ = _expert_color_table(
+        meta_for_colors
+    )  # we don't strictly need colors for this dashboard
 
     # --- Figure layout ---
     import matplotlib.gridspec as gridspec
+
     fig = plt.figure(figsize=(12.5, 9.5), dpi=160)
     gs = gridspec.GridSpec(
-        3, 2,
+        3,
+        2,
         height_ratios=[2.0, 1.0, 1.0],
         width_ratios=[1.4, 1.0],
-        hspace=0.32, wspace=0.28
+        hspace=0.32,
+        wspace=0.28,
     )
 
     # Heatmap: drop fraction per expert × hop
     ax0 = fig.add_subplot(gs[0, :])
     im = ax0.imshow(df_sub, aspect="auto", interpolation="nearest", vmin=0.0, vmax=1.0)
-    ax0.set_title(f"Capacity Drop Fraction per Expert × Hop • top {K}/{E} • step {step}",
-                  fontsize=12, weight="bold")
+    ax0.set_title(
+        f"Capacity Drop Fraction per Expert × Hop • top {K}/{E} • step {step}",
+        fontsize=12,
+        weight="bold",
+    )
     ax0.set_xlabel("Hop")
     ax0.set_ylabel("Expert (usage-sorted)")
     cbar = plt.colorbar(im, ax=ax0, shrink=0.9)
@@ -203,7 +218,11 @@ def log_capacity_saturation_dashboard(
     ax3.set_xlabel("drop fraction")
     ax3.set_ylabel("experts×hops")
 
-    fig.suptitle("Capacity Pressure Dashboard (approx from probs + eff_topk)", y=0.98,
-                 fontsize=13, weight="bold")
+    fig.suptitle(
+        "Capacity Pressure Dashboard (approx from probs + eff_topk)",
+        y=0.98,
+        fontsize=13,
+        weight="bold",
+    )
     wandb.log({"routing/dashboard": wandb.Image(fig)}, step=step, commit=False)
     plt.close(fig)

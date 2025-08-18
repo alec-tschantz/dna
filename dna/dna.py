@@ -126,7 +126,6 @@ class DNA(eqx.Module):
         router_temp: float,
         select_temp: Optional[float],
         return_stats: bool,
-
     ) -> Tuple[Float[Array, "T d"], Dict[str, Any]]:
         k_route, k_exec = jax.random.split(key)
         mask_full, probs_full, logits_clean, logits_sel = router(
@@ -178,7 +177,7 @@ class DNA(eqx.Module):
         if self.norm_after_capacity:
             denom = combine_w.sum(axis=1, keepdims=True)
             combine_w = combine_w / jnp.clip(denom, 1e-9, None)
-        
+
         rho = combine_w.sum(axis=1, keepdims=True)
         combine = jnp.einsum("ecd,ect,et->td", expert_out, slot, combine_w.T)
         h_next = h + combine - rho * h
@@ -187,9 +186,12 @@ class DNA(eqx.Module):
         stats = {}
         if return_stats:
             stats = self._stats(
-                kept=kept, probs=probs_full, mask=mask_full, rho=rho, token_mask=token_mask
+                kept=kept,
+                probs=probs_full,
+                mask=mask_full,
+                rho=rho,
+                token_mask=token_mask,
             )
-      
 
         return h_next, stats
 
@@ -205,7 +207,6 @@ class DNA(eqx.Module):
         router_temp: float = 1.0,
         select_temp: Optional[float] = None,
         return_stats: bool = False,
-
     ) -> Tuple[Float[Array, "T V"], Tuple[Dict[str, Any], ...]]:
         T = ids.shape[0]
         token_mask: Bool[Array, "T"] = (

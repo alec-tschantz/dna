@@ -27,7 +27,6 @@ def has_routing(model) -> bool:
     return hasattr(model, "routers") and getattr(model, "routers") is not None
 
 
-
 def _mpl_safe(s: str) -> str:
     """Make a string safe for Matplotlib text rendering."""
     if s is None:

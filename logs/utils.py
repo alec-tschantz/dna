@@ -22,6 +22,8 @@ import wandb
 
 from dna import generate, Attention, FeedForward, Identity
 
+ArrayLike = Any
+
 
 def print_ascii_dna() -> None:
     D = [
@@ -71,6 +73,7 @@ def print_ascii_dna() -> None:
     width = max(66, min(140, max(len(s) for s in shaded) + 4))  # nice box width
     print(ansi_box("DNA", shaded, width=width))
 
+
 def count_params(tree) -> int:
     leaves = jax.tree_util.tree_leaves(eqx.filter(tree, eqx.is_array))
     return int(sum(x.size for x in leaves))
@@ -92,7 +95,6 @@ def router_l2_norm(model) -> float:
         sq = sum(jnp.sum(jnp.square(x)) for x in leaves)
         return float(jnp.sqrt(sq + 1e-12))
     return 0.0
-
 
 
 def batch_seq_stats(mask: jnp.ndarray, seq_len: int) -> Tuple[float, int, int, float]:
@@ -132,7 +134,6 @@ def ansi_box(title: str, body_lines: list[str], width: int = 88) -> str:
     return "\n".join(lines)
 
 
-
 def extra_routing_metrics(stats_host, prefix: str) -> Dict[str, float]:
     """Extra routing metrics."""
     if not isinstance(stats_host, (tuple, list)) or len(stats_host) == 0:
@@ -170,7 +171,6 @@ def extra_routing_metrics(stats_host, prefix: str) -> Dict[str, float]:
         f"{prefix}/rho_p10": p10,
         f"{prefix}/rho_p90": p90,
     }
-
 
 
 def routing_metrics_from_stats(
@@ -237,3 +237,84 @@ def routing_metrics_from_stats(
         f"{prefix}/importance_mean": _mean("importance_mean"),
     }
 
+
+def l2_norm(pytree) -> float:
+    leaves = [
+        jnp.asarray(x) for x in jax.tree_util.tree_leaves(pytree) if x is not None
+    ]
+    if not leaves:
+        return 0.0
+    ss = jnp.sum(jnp.stack([jnp.sum(jnp.square(x)) for x in leaves]))
+    return float(jnp.sqrt(ss))
+
+
+def l2_per_first_dim(params_tree) -> np.ndarray:
+    """
+    Given a pytree whose leaves are arrays with leading dimension = #modules in the group,
+    return an array of shape (M,) with the per-module L2 norm accumulated across all leaves.
+    """
+    leaves = [
+        np.asarray(jax.device_get(x))
+        for x in jax.tree_util.tree_leaves(params_tree)
+        if x is not None
+    ]
+    if not leaves:
+        return np.zeros((0,), dtype=np.float32)
+    per_leaf = [
+        np.sqrt(np.sum(np.square(x), axis=tuple(range(1, x.ndim)))) for x in leaves
+    ]
+    sqsum = None
+    for v in per_leaf:
+        if sqsum is None:
+            sqsum = np.square(v, dtype=np.float64)
+        else:
+            sqsum += np.square(v, dtype=np.float64)
+    return np.sqrt(sqsum + 1e-12)
+
+
+def safe_get(tree, *path):
+    """Get nested attribute/key path from an Equinox module or dict-like grads."""
+    cur = tree
+    for p in path:
+        try:
+            cur = getattr(cur, p)
+        except AttributeError:
+            try:
+                cur = cur[p]
+            except Exception:
+                return None
+    return cur
+
+
+def router_health_from_stats(
+    stats_tuple: Tuple[Dict[str, Any], ...],
+) -> Dict[str, float]:
+    """Cheap health summary from the last stats tuple you produced in a recent step."""
+    logs: Dict[str, float] = {}
+    if not isinstance(stats_tuple, (tuple, list)) or len(stats_tuple) == 0:
+        return logs
+    # Aggregate across hops
+    kept_total = 0
+    selected_total = 0
+    dead_experts = 0
+    cap_hits = 0
+    hops = 0
+    for st in stats_tuple:
+        try:
+            kept_total += int(np.asarray(st["kept_edges"]))
+            selected_total += int(np.asarray(st["selected_edges"]))
+            load = np.asarray(st["load"])  # (E,)
+            dead_experts += int(np.sum(load == 0))
+            # "capacity hits" proxy: experts that kept >= capacity (if eff_topk known per token, this is a rough signal)
+            cap_hits += int(
+                np.sum(load >= np.max(load))
+            )  # very rough; you can replace with a better flag if you log it
+            hops += 1
+        except Exception:
+            pass
+    if selected_total > 0:
+        logs["router/kept_frac"] = kept_total / max(selected_total, 1)
+    if hops > 0:
+        logs["router/dead_experts_per_hop"] = dead_experts / hops
+        logs["router/cap_hit_experts_per_hop"] = cap_hits / hops
+    return logs

@@ -62,7 +62,7 @@ class Dense(eqx.Module):
         key,
         inference: bool,
         mask: Optional[jnp.ndarray] = None,
-        return_stats: bool = False, 
+        return_stats: bool = False,
         **kwargs,
     ):
         # ---- token mask setup ----

@@ -71,7 +71,7 @@ def log_expert_transition_heatmap(
     # Transition counts across hops (h -> h+1), aggregated over batch+tokens
     trans = np.zeros((E, E), dtype=np.int64)
     for h in range(H - 1):
-        a = top1[h][valid]      # (N,)
+        a = top1[h][valid]  # (N,)
         b = top1[h + 1][valid]  # (N,)
         np.add.at(trans, (a, b), 1)
 
@@ -91,4 +91,3 @@ def log_expert_transition_heatmap(
     }
     plt.close(fig)
     wandb.log(logs, step=step, commit=False)
-

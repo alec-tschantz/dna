@@ -188,6 +188,7 @@ def log_token_expert_color_grid(
     except Exception:
         pass
 
-    wandb.log({"routing/token_expert_color_grid": wandb.Image(fig)}, step=step, commit=False)
+    wandb.log(
+        {"routing/token_expert_color_grid": wandb.Image(fig)}, step=step, commit=False
+    )
     plt.close(fig)
-

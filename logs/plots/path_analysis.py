@@ -309,7 +309,9 @@ def plot_token_path_specialization(spec: Dict[str, Any], step: int):
         y=0.98,
     )
 
-    wandb.log({"routing/token_path_specialization": wandb.Image(fig)}, step=step, commit=False)
+    wandb.log(
+        {"routing/token_path_specialization": wandb.Image(fig)}, step=step, commit=False
+    )
     plt.close(fig)
 
 

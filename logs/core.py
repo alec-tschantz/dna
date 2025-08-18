@@ -43,6 +43,7 @@ from .plots.co_usage import log_expert_co_usage_graph
 from .plots.capacity_dashboard import log_capacity_saturation_dashboard
 from .plots.phase_portrait import log_expert_phase_portrait
 from .plots.full_path_analysis import log_full_path_analysis
+from .plots.attn_token_examples import log_attention_token_examples
 
 
 def log_checkpoint(
@@ -470,13 +471,28 @@ def run_eval_suite(
         top_experts=42,
     )
 
+    key, attn_key = jax.random.split(key)
+    log_attention_token_examples(
+        model,
+        vis_batch,
+        tok,
+        key=attn_key,
+        gumbel_tau=0.0,
+        router_temp=float(eval_kwargs["router_temp"][0]),
+        select_temp=float(eval_kwargs["select_temp"][0]),
+        step=step,
+        min_token_global=2,  # drop globally ultra-rare, optional
+        per_module_limit=120,  # collect more; renderer will trim per-card by layout
+        wandb_key="routing/attn_cards",
+    )
+
     key, gen_key = jax.random.split(key)
     prompts = [
-        "Once upon a time, ",
-        "The little robot ",
-        "In the magical forest, ",
-        "One sunny morning, ",
-        "The brave knight ",
+        "The end of the world was near",
+        "It was a sunny day and the snowman was melting",
+        "The lady said many mean things to the little boy",
+        "If you give an apple to a monkey",
+        "The king had a jungle and it was full",
     ]
     temps = {
         "router_temp": float(eval_kwargs["router_temp"][0]),

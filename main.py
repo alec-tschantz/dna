@@ -44,8 +44,8 @@ class Config:
     rope_base: float = 10_000.0
 
     # module pool (routed)
-    n_att_modules: int = 4
-    n_ff_modules: int = 4
+    n_att_modules: int = 6
+    n_ff_modules: int = 6
     n_id_modules: int = 0
 
     # backbone
@@ -58,7 +58,7 @@ class Config:
     seq_len: int = 256
 
     # training
-    steps: int = 20_000
+    steps: int = 40_000
     warmup: int = 1_000
     lr_peak: float = 3e-4
     wd: float = 0.01
@@ -71,7 +71,7 @@ class Config:
     gumbel_tau: float = 0.0
 
     # logging/eval
-    wandb_project: str = "dna-slurm-v2"
+    wandb_project: str = "dna-slurm-v4"
     eval_every: int = 200
     log_every: int = 10
     stats_every: int = 100
@@ -279,7 +279,7 @@ def main():
 
     run_name = (
         f"s{cfg.seed}-{cfg.model_type}-{cfg.dataset_name.split('/')[-1]}"
-        f"-h{cfg.n_hops}-k{cfg.topk}-c{cfg.capacity}-r{cfg.router_type}-wd{cfg.wd}"
+        f"-h{cfg.n_hops}-k{cfg.topk}-c{cfg.capacity}-r{cfg.router_type}"
         f"-d{cfg.d_model}-n{cfg.n_att_modules}-n{cfg.n_ff_modules}-i{cfg.n_id_modules}-b{cfg.backbone}"
         f"-wd{cfg.wd}-l{cfg.lr_peak}-g{cfg.gumbel_tau}-d{cfg.dropout}"
     )

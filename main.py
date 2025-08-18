@@ -43,7 +43,6 @@ class Config:
     dropout: float = 0.0
     rope_base: float = 10_000.0
 
-    # module pool (routed)
     n_att_modules: int = 6
     n_ff_modules: int = 6
     n_id_modules: int = 0
@@ -58,12 +57,13 @@ class Config:
     seq_len: int = 256
 
     # training
-    steps: int = 40_000
+    steps: int = 40_000               
     warmup: int = 1_000
     lr_peak: float = 3e-4
     wd: float = 0.01
     clip: float = 1.0
     seed: int = 0
+    grad_accum: int = 4                 
 
     # routing temperatures
     router_temp: float = 1.0
@@ -253,6 +253,26 @@ def train_step(
 
 
 @eqx.filter_jit
+def micro_grad(
+    model, batch, *, key, model_kwargs, return_stats: bool = False
+):
+    (loss, (logits, labels, mask, stats)), grads = eqx.filter_value_and_grad(
+        compute_loss, has_aux=True
+    )(
+        model,
+        batch,
+        key,
+        inference=False,
+        model_kwargs=model_kwargs,
+        return_stats=return_stats,
+    )
+    predictions = jnp.argmax(logits, axis=-1)
+    valid = mask > 0
+    acc = ((predictions == labels) & valid).sum() / jnp.maximum(valid.sum(), 1)
+    return grads, loss, acc, (stats if return_stats else None)
+
+
+@eqx.filter_jit
 def eval_step(model, batch, *, key, model_kwargs):
     loss, (logits, labels, mask, stats) = compute_loss(
         model, batch, key, inference=True, model_kwargs=model_kwargs, return_stats=True
@@ -271,6 +291,18 @@ def lr_schedule(step, warmup, steps, lr_peak):
     return jnp.where(step >= warmup, lr_peak * cos, lr).astype(jnp.float32)
 
 
+def _tree_add(a, b):
+    if a is None:
+        return b
+    return jax.tree_util.tree_map(
+        lambda x, y: x if y is None else (y if x is None else x + y),
+        a, b
+    )
+
+def _tree_scale(a, s: float):
+    return jax.tree_util.tree_map(lambda x: None if x is None else x * s, a)
+
+
 # ------------------------------ main ------------------------------ #
 
 
@@ -282,6 +314,7 @@ def main():
         f"-h{cfg.n_hops}-k{cfg.topk}-c{cfg.capacity}-r{cfg.router_type}"
         f"-d{cfg.d_model}-n{cfg.n_att_modules}-n{cfg.n_ff_modules}-i{cfg.n_id_modules}-b{cfg.backbone}"
         f"-wd{cfg.wd}-l{cfg.lr_peak}-g{cfg.gumbel_tau}-d{cfg.dropout}"
+        f"-ga{cfg.grad_accum}"
     )
     wandb.init(project=cfg.wandb_project, name=run_name, config=asdict(cfg))
 
@@ -330,19 +363,57 @@ def main():
     opt_state = opt.init(eqx.filter(model, eqx.is_array))
 
     for step in range(cfg.steps + 1):
-        batch = sample_batch(train_stream, cfg.batch_size)
-        key, step_key = jax.random.split(key)
         want_stats = step % cfg.stats_every == 0
         t0 = time.perf_counter()
-        model, opt_state, loss, acc, stats, gnorm, grads = train_step(
-            model,
-            opt,
-            opt_state,
-            batch,
-            key=step_key,
-            model_kwargs=model_kwargs,
-            return_stats=want_stats,
-        )
+
+        if cfg.grad_accum == 1:
+            batch = sample_batch(train_stream, cfg.batch_size)
+            key, step_key = jax.random.split(key)
+            model, opt_state, loss, acc, stats, gnorm, grads = train_step(
+                model,
+                opt,
+                opt_state,
+                batch,
+                key=step_key,
+                model_kwargs=model_kwargs,
+                return_stats=want_stats,
+            )
+        else:
+            grads_accum = None
+            loss_accum = 0.0
+            acc_accum = 0.0
+            stats = None
+
+            micro_gnorm = 0.0 
+
+            for micro in range(cfg.grad_accum):
+                batch = sample_batch(train_stream, cfg.batch_size)
+                key, step_key = jax.random.split(key)
+                return_stats = want_stats and (micro == cfg.grad_accum - 1)
+                grads, micro_loss, micro_acc, micro_stats = micro_grad(
+                    model,
+                    batch,
+                    key=step_key,
+                    model_kwargs=model_kwargs,
+                    return_stats=return_stats,
+                )
+
+                grads_accum = _tree_add(grads_accum, grads)
+                loss_accum += float(micro_loss)
+                acc_accum += float(micro_acc)
+                if return_stats:
+                    stats = micro_stats
+
+            avg_grads = _tree_scale(grads_accum, 1.0 / float(cfg.grad_accum))
+            updates, opt_state = opt.update(avg_grads, opt_state, model)
+            model = eqx.apply_updates(model, updates)
+
+            loss = jnp.array(loss_accum / float(cfg.grad_accum))
+            acc = jnp.array(acc_accum / float(cfg.grad_accum))
+            gnorm = optax.global_norm(avg_grads)
+            grads = avg_grads if want_stats else None
+            # -----------------------------------------
+
         if step % cfg.log_every == 0:
             log_train_step(
                 step=step,

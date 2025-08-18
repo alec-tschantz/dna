@@ -108,7 +108,7 @@ class DNA(eqx.Module):
         total_experts = len(modules)
         router_keys = jax.random.split(k_routers, n_hops)
         self.routers = tuple(
-            router_cls(d_model, total_experts, topk, norm_probs, key=k)
+            router_cls(d_model, total_experts, topk, dropout, norm_probs, key=k)
             for k in router_keys
         )
         self.norm_after_capacity = norm_after_capacity

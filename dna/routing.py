@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import jax.nn as jnn
 import equinox as eqx
 
-from dna.modules import RMSNorm
+from dna.modules import RMSNorm, Dropout
 
 
 # ---------- utils ----------
@@ -88,12 +88,17 @@ def _mixing_probs(
 
 class LinearRouter(eqx.Module):
     proj: eqx.nn.Linear
+    dropout: Dropout
+
     k: int = eqx.field(static=True)
     norm_probs: bool = eqx.field(static=True)
 
-    def __init__(self, d_model: int, n_exp: int, k: int, norm_probs: bool, *, key):
+    def __init__(
+        self, d_model: int, n_exp: int, k: int, dropout: float, norm_probs: bool, *, key
+    ):
         self.k = int(k)
         self.proj = eqx.nn.Linear(d_model, n_exp, use_bias=False, key=key)
+        self.dropout = Dropout(dropout)
         self.norm_probs = norm_probs
 
     def __call__(
@@ -107,7 +112,11 @@ class LinearRouter(eqx.Module):
         select_temp: Optional[float] = None,
         token_mask: Optional[jnp.ndarray] = None,
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        logits_clean = jax.vmap(self.proj)(h)  # (T, E) — clean, unmasked
+
+        key, sub = jax.random.split(key)
+        h = self.dropout(h, key=sub, inference=inference)
+        logits_clean = jax.vmap(self.proj)(h)  # (T, E)
+
         logits_sel, mask_full = _select_mask_and_logits(
             logits_clean,
             router_temp=router_temp,
@@ -130,12 +139,15 @@ class LinearRouter(eqx.Module):
 
 class CosineRouter(eqx.Module):
     prototypes: jnp.ndarray  # (E, P, d)
+    dropout: Dropout
     scale: float = eqx.field(static=True)
     norm_probs: bool = eqx.field(static=True)
     k: int = eqx.field(static=True)
     P: int = eqx.field(static=True)
 
-    def __init__(self, d_model: int, n_exp: int, k: int, norm_probs: bool, *, key):
+    def __init__(
+        self, d_model: int, n_exp: int, k: int, dropout: float, norm_probs: bool, *, key
+    ):
         self.k = int(k)
         self.P = 2
         self.scale = 10.0
@@ -143,6 +155,7 @@ class CosineRouter(eqx.Module):
         self.prototypes = jax.random.normal(key, (n_exp, self.P, d_model)) * (
             1.0 / jnp.sqrt(d_model)
         )
+        self.dropout = Dropout(dropout)
 
     def __call__(
         self,
@@ -155,6 +168,10 @@ class CosineRouter(eqx.Module):
         select_temp: Optional[float] = None,
         token_mask: Optional[jnp.ndarray] = None,
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+
+        key, sub = jax.random.split(key)
+        h = self.dropout(h, key=sub, inference=inference)
+
         eps = 1e-6
         h_norm = h / (jnp.linalg.norm(h, axis=-1, keepdims=True) + eps)  # (T, d)
         p_norm = self.prototypes / (
@@ -190,10 +207,13 @@ class SequenceRouter(eqx.Module):
     h0: jnp.ndarray
     h_norm: RMSNorm
     x_norm: RMSNorm
+    dropout: Dropout
     k: int = eqx.field(static=True)
     norm_probs: bool = eqx.field(static=True)
 
-    def __init__(self, d_model: int, n_exp: int, k: int, norm_probs: bool, *, key):
+    def __init__(
+        self, d_model: int, n_exp: int, k: int, dropout: float, norm_probs: bool, *, key
+    ):
         self.k = int(k)
         k_in, k_rec, k_out, _ = jax.random.split(key, 4)
         self.w_in = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k_in)
@@ -201,6 +221,8 @@ class SequenceRouter(eqx.Module):
         self.proj = eqx.nn.Linear(d_model, n_exp, use_bias=False, key=k_out)
         self.h_norm = RMSNorm(d_model)
         self.x_norm = RMSNorm(d_model)
+        self.dropout = Dropout(dropout)
+
         self.h0 = jnp.zeros((d_model,), dtype=jnp.float32)
         self.norm_probs = norm_probs
 
@@ -218,6 +240,9 @@ class SequenceRouter(eqx.Module):
         T = h.shape[0]
         if token_mask is None:
             token_mask = jnp.ones((T,), dtype=bool)
+
+        key, sub = jax.random.split(key)
+        h = self.dropout(h, key=sub, inference=inference)
 
         def step(s_prev, inputs):
             x_t, m_t = inputs

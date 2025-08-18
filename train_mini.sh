@@ -18,7 +18,7 @@ python main.py \
   --topk 2 \
   --capacity 32 \
   --mlp_mult 4 \
-  --dropout 0.0 \
+  --dropout 0.1 \
   --rope_base 10000.0 \
   \
   --router_temp 1.0 \

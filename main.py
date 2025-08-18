@@ -281,7 +281,7 @@ def main():
         f"s{cfg.seed}-{cfg.model_type}-{cfg.dataset_name.split('/')[-1]}"
         f"-h{cfg.n_hops}-k{cfg.topk}-c{cfg.capacity}-r{cfg.router_type}-wd{cfg.wd}"
         f"-d{cfg.d_model}-n{cfg.n_att_modules}-n{cfg.n_ff_modules}-i{cfg.n_id_modules}-b{cfg.backbone}"
-        f"-wd{cfg.wd}-l{cfg.lr_peak}-g{cfg.gumbel_tau}"
+        f"-wd{cfg.wd}-l{cfg.lr_peak}-g{cfg.gumbel_tau}-d{cfg.dropout}"
     )
     wandb.init(project=cfg.wandb_project, name=run_name, config=asdict(cfg))
 

@@ -5,21 +5,20 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dna"
 version = "0.1.0"
-description = "Distributed Neural Architectures (DNA) - JAX/Equinox"
+description = "Distributed Neural Architectures (DNA)"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Alexander Tschantz" }]
 dependencies = [
-  "jax",
+  "jax[cuda12]",
   "jaxlib",
   "equinox",
   "jaxtyping",
   "typeguard",
   "optax",
   "tyro",
-  "wandb",
+  "wandb[mediapy]",
   "mediapy",
-  "pytest",
   "datasets",
   "transformers",
   "numpy",
@@ -30,10 +29,3 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["dna*"]
-
-[tool.pytest.ini_options]
-addopts = "-ra"
-testpaths = ["tests", "."]
-filterwarnings = [
-  "ignore:.*PytestAssertRewriteWarning.*"
-]

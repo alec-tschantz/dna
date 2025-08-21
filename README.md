@@ -7,5 +7,5 @@ Implementation of [Towards Distributed Neural Architectures](https://arxiv.org/a
 source env/bin/activate
 pip install -e .
 
-sbatch job.sh
+sbatch train_slurm.sh
 ```

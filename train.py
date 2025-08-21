@@ -41,11 +41,11 @@ f32 = jnp.float32
 class Config:
     # model
     vocab_size: int = 50_257
-    d_model: int = 512
+    d_model: int = 1024
     n_heads: int = 16
     n_hops: int = 8
     topk: int = 1
-    dropout: float = 0.1
+    dropout: float = 0.2
     rope_base: float = 10_000.0
 
     n_attn_modules: int = 8
@@ -53,7 +53,7 @@ class Config:
     n_id_modules = 8
 
     # data
-    batch_size: int = 256
+    batch_size: int = 128
     seq_len: int = 256
     dataset_name: str = "roneneldan/TinyStories"
     dataset_config: Optional[str] = None
@@ -62,7 +62,7 @@ class Config:
     steps: int = 20_000
     warmup: int = 1_000
     lr_peak: float = 3e-4
-    wd: float = 1e-3
+    wd: float = 0.1
     clip: float = 1.0
     seed: int = 0
 
@@ -72,7 +72,7 @@ class Config:
 
     # logging/eval
     wandb_project: str = "dna-tiny-stories"
-    eval_every: int = 500
+    eval_every: int = 200
     log_every: int = 10
     gen_len: int = 200
     eval_samples: int = 512

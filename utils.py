@@ -73,6 +73,18 @@ def lr_schedule(step, warmup, steps, lr_peak):
     return jnp.where(step >= warmup, lr_peak * cos, lr).astype(f32)
 
 
+def save_ckpt(
+    *, run_name: str, cfg: Config, step: int, params, opt_state, lr_value: float
+):
+    out = Path(cfg.ckpt_dir) / run_name
+    out.mkdir(parents=True, exist_ok=True)
+    eqx.tree_serialise_leaves(out / f"params_{step}.eqx", params)
+    eqx.tree_serialise_leaves(out / f"opt_{step}.eqx", opt_state)
+    with open(out / f"config_{step}.json", "w") as f:
+        json.dump({**asdict(cfg), "step": step, "lr": float(lr_value)}, f, indent=2)
+    print(f"[ckpt] saved at step {step} -> {out}")
+
+
 def build_sample_fn(
     static, *, max_new: int, pad_id: int, eos_id: int, temperature: float
 ):
@@ -154,15 +166,3 @@ def build_sample_fn(
         return toks
 
     return _scan_sample
-
-
-def save_ckpt(
-    *, run_name: str, cfg: Config, step: int, params, opt_state, lr_value: float
-):
-    out = Path(cfg.ckpt_dir) / run_name
-    out.mkdir(parents=True, exist_ok=True)
-    eqx.tree_serialise_leaves(out / f"params_{step}.eqx", params)
-    eqx.tree_serialise_leaves(out / f"opt_{step}.eqx", opt_state)
-    with open(out / f"config_{step}.json", "w") as f:
-        json.dump({**asdict(cfg), "step": step, "lr": float(lr_value)}, f, indent=2)
-    print(f"[ckpt] saved at step {step} -> {out}")

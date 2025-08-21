@@ -8,5 +8,7 @@ python -u train.py \
   --seq_len 64 \
   --steps 200 \
   --eval_every 50 \
+  --gen_len 20 \
   --batch_shards 1 \
   --expert_shards 1 \
+  --wandb_project "dna-mini" \

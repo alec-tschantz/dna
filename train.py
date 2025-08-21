@@ -35,16 +35,16 @@ class Config:
     # model
     vocab_size: int = 50_257
     d_model: int = 512
-    n_heads: int = 16
-    n_hops: int = 8
+    n_heads: int = 8
+    n_hops: int = 6
     topk: int = 2
-    dropout: float = 0.0
+    dropout: float = 0.2
     rope_base: float = 10_000.0
-    n_attn_modules: int = 8
-    n_ff_modules: int = 8
+    n_attn_modules: int = 6
+    n_ff_modules: int = 6
 
     # data
-    batch_size: int = 64
+    batch_size: int = 128
     seq_len: int = 256
     dataset_name: str = "roneneldan/TinyStories"
     dataset_config: Optional[str] = None
@@ -62,20 +62,19 @@ class Config:
     gumbel_tau: float = 0.0
 
     # logging/eval
-    wandb_project: str = "dna-sharded"
+    wandb_project: str = "dna-tiny-stories"
     eval_every: int = 500
     log_every: int = 10
-    n_examples: int = 3
     gen_len: int = 200
-    eval_samples: int = 1024
+    eval_samples: int = 512
 
     # checkpoints
     save_every: int = 5_000
     ckpt_dir: str = "checkpoints"
 
     # sharding
-    batch_shards: int = 2  # 'data'
-    expert_shards: int = 4  # 'expert'
+    batch_shards: int = 4  # 'data'
+    expert_shards: int = 2  # 'expert'
 
 
 # ------------------------------ mesh & sharding ------------------------------ #
@@ -212,30 +211,27 @@ def loss_and_aux(
 # ------------------------------ eval ------------------------------ #
 
 
-def _scan_sample_fn(static):
-    """Returns a pjit-compatible sampler that uses lax.scan."""
+def _scan_sample_fn(
+    static, *, max_new: int, pad_id: int, eos_id: int, temperature: float
+):
+    """Return a pjit-friendly sampler using lax.scan with static shape."""
 
     def _scan_sample(
         params,
         prompt_ids: jnp.ndarray,  # [T0]
-        max_new: int,
-        pad_id: int,
-        eos_id: int,
-        key,
-        temperature: float,
-        router_temp: jnp.ndarray,  # scalar array (f32)
-        gumbel_tau: jnp.ndarray,  # scalar array (f32)
+        key: jax.Array,
+        router_temp: jnp.ndarray,  # scalar f32
+        gumbel_tau: jnp.ndarray,  # scalar f32
     ) -> jnp.ndarray:  # [T0 + max_new]
         model = eqx.combine(params, static)
 
-        t0 = jnp.asarray(prompt_ids.shape[0], jnp.int32)
-        total_len = t0 + jnp.asarray(max_new, jnp.int32)
+        # T0 is part of the prompt_ids shape and thus static per-compile
+        t0 = prompt_ids.shape[0]
+        total_len = t0 + max_new  # max_new is STATIC via closure
 
-        # pre-allocate [T0+max_new] and write prompt
         toks = jnp.full((total_len,), pad_id, dtype=jnp.int32)
         toks = toks.at[:t0].set(prompt_ids)
 
-        # greedy if temp <= 0
         force_greedy = jnp.asarray(temperature, f32) <= 0
 
         def step(carry, _):
@@ -251,7 +247,7 @@ def _scan_sample_fn(static):
                 mask=attn_mask,
                 router_temp=router_temp,
                 gumbel_tau=gumbel_tau,
-            )  
+            )  # [T,V]
 
             vocab = logits.shape[-1]
             cur_idx = cur - jnp.asarray(1, jnp.int32)
@@ -264,22 +260,21 @@ def _scan_sample_fn(static):
                 scaled = lg / jnp.clip(jnp.asarray(temperature, f32), 1e-6, None)
                 return jax.random.categorical(rng, scaled).astype(jnp.int32)
 
-            next_tok = jax.lax.cond(
+            nxt = jax.lax.cond(
                 force_greedy,
                 lambda _: pick_greedy(last_logits),
                 lambda rng: pick_sample(rng, last_logits),
                 operand=sub,
             )
+            nxt = jax.lax.select(done, jnp.asarray(pad_id, jnp.int32), nxt)
 
-            next_tok = jax.lax.select(done, jnp.asarray(pad_id, jnp.int32), next_tok)
-
-            toks = toks.at[cur].set(next_tok)
-            new_done = done | (next_tok == eos_id)
-            return (toks, cur + 1, new_done, k), None
+            toks = toks.at[cur].set(nxt)
+            done = done | (nxt == eos_id)
+            return (toks, cur + 1, done, k), None
 
         (toks, _, _, _), _ = jax.lax.scan(
             step,
-            (toks, t0, jnp.asarray(False), key),
+            (toks, jnp.asarray(t0, jnp.int32), jnp.asarray(False), key),
             None,
             length=max_new,
         )
@@ -298,8 +293,8 @@ def eval_model(
     cfg: Config,
     model_kwargs: Dict[str, jnp.ndarray],
     key,
+    tok,  # <-- pass tokenizer in the call
 ) -> Tuple[float, float]:
-    """Average loss/acc over cfg.eval_samples tokens."""
     eval_batches = max(1, cfg.eval_samples // cfg.batch_size)
 
     def _eval_step(params, batch, key):
@@ -315,28 +310,81 @@ def eval_model(
             in_shardings=(params_in_shardings, P("data", None), P("data", None), None),
             out_shardings=None,
         )(params, batch["input_ids"], batch["attention_mask"], key)
-
-        denom = jnp.maximum(mask.sum(), 1)
-        acc = ((jnp.argmax(logits, -1) == labels) & (mask > 0)).sum() / denom
+        acc = ((jnp.argmax(logits, -1) == labels) & (mask > 0)).sum() / jnp.maximum(
+            mask.sum(), 1
+        )
         return loss, acc
 
     loss_sum, acc_sum = 0.0, 0.0
     with mesh:
+        # eval loss/acc
         for _ in range(eval_batches):
-            batch_np = sample_batch(val_stream, cfg.batch_size)
+            bnp = sample_batch(val_stream, cfg.batch_size)
             batch = {
                 "input_ids": jax.device_put(
-                    batch_np["input_ids"], NamedSharding(mesh, P("data", None))
+                    bnp["input_ids"], NamedSharding(mesh, P("data", None))
                 ),
                 "attention_mask": jax.device_put(
-                    batch_np["attention_mask"], NamedSharding(mesh, P("data", None))
+                    bnp["attention_mask"], NamedSharding(mesh, P("data", None))
                 ),
             }
             key, sub = jax.random.split(key)
             l, a = _eval_step(params, batch, sub)
             loss_sum += float(l)
             acc_sum += float(a)
-    return loss_sum / eval_batches, acc_sum / eval_batches
+
+        avg_loss = loss_sum / eval_batches
+        avg_acc = acc_sum / eval_batches
+
+        # generation (pjit + scan) with static knobs baked in
+        pad_id = int(tok.pad_token_id)
+        eos_id = int(tok.eos_token_id) if tok.eos_token_id is not None else pad_id
+        temperature = 0.8
+
+        scan_sample = _scan_sample_fn(
+            static,
+            max_new=int(cfg.gen_len),
+            pad_id=pad_id,
+            eos_id=eos_id,
+            temperature=float(temperature),
+        )
+
+        sample_pjit = pjit(
+            scan_sample,
+            in_shardings=(  # params, prompt_ids, key, router_temp, gumbel_tau
+                params_in_shardings,
+                P(),
+                P(),
+                P(),
+                P(),
+            ),
+            out_shardings=P(),
+        )
+
+        prompts = [
+            "once upon a time",
+            "the little robot",
+            "in a quiet forest",
+        ]
+
+        print("\n[eval/generate]")
+        for p in prompts:
+            prompt_ids = jnp.array(tok.encode(p), dtype=jnp.int32)
+            prompt_ids = jax.device_put(prompt_ids, NamedSharding(mesh, P()))
+            key, sub = jax.random.split(key)
+            toks = sample_pjit(
+                params,
+                prompt_ids,
+                sub,
+                model_kwargs["router_temp"],
+                model_kwargs["gumbel_tau"],
+            )
+            seq = jax.device_get(toks).tolist()
+            if eos_id in seq:
+                seq = seq[: seq.index(eos_id) + 1]
+            print(f"prompt: {p}\n→ {tok.decode(seq, skip_special_tokens=True)}\n")
+
+    return avg_loss, avg_acc
 
 
 # ------------------------------ checkpoint ------------------------------ #
@@ -506,6 +554,7 @@ def main():
                     cfg=cfg,
                     model_kwargs=model_kwargs,
                     key=k_eval,
+                    tok=tok,
                 )
                 wandb.log({"eval/loss": eval_loss, "eval/acc": eval_acc}, step=step)
                 print(f"[eval] step {step}: loss {eval_loss:.4f} | acc {eval_acc:.4f}")

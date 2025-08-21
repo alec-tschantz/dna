@@ -19,6 +19,7 @@ source env/bin/activate
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_ALLOCATOR=platform
 export TF_CPP_MIN_LOG_LEVEL=1
+export TOKENIZERS_PARALLELISM=false
 
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 python -u train.py

@@ -21,6 +21,7 @@ dependencies = [
   "mediapy",
   "datasets",
   "transformers",
+  "huggingface_hub[hf_xet]",
   "numpy",
   "plotly",
   "rich"

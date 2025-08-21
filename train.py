@@ -1,5 +1,7 @@
 # train.py
 from __future__ import annotations
+
+import os
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -12,13 +14,15 @@ import equinox as eqx
 import optax
 import tyro
 import wandb
+from datasets import load_dataset
 from transformers import AutoTokenizer
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental import mesh_utils
 from jax.experimental.pjit import pjit
+from jax.experimental.multihost_utils import sync_global_devices
 
 from dna import DNA, Attention, FeedForward, Router
-from dataset import load_dataset_stream, sample_batch
+from dataloader import setup_tokenizer_and_streams, sample_batch
 
 f32 = jnp.float32
 
@@ -104,10 +108,21 @@ def shard_expert_params(model: DNA, mesh: Mesh) -> DNA:
     return jax.tree.map(place, model)
 
 
-def params_sharding_pytree(params):
+def _sharding_pytree(params):
     return jax.tree.map(
         lambda x: x.sharding if isinstance(x, jax.Array) else None, params
     )
+
+
+def _replicate_scalars_to_mesh(tree, mesh):
+    """Place all scalar jax.Arrays onto the mesh with full replication."""
+
+    def place(x):
+        if isinstance(x, jax.Array) and x.shape == ():  # scalar leaf
+            return jax.device_put(x, NamedSharding(mesh, P()))
+        return x
+
+    return jax.tree.map(place, tree)
 
 
 # ------------------------------ model build ------------------------------ #
@@ -197,6 +212,82 @@ def loss_and_aux(
 # ------------------------------ eval ------------------------------ #
 
 
+def _scan_sample_fn(static):
+    """Returns a pjit-compatible sampler that uses lax.scan."""
+
+    def _scan_sample(
+        params,
+        prompt_ids: jnp.ndarray,  # [T0]
+        max_new: int,
+        pad_id: int,
+        eos_id: int,
+        key,
+        temperature: float,
+        router_temp: jnp.ndarray,  # scalar array (f32)
+        gumbel_tau: jnp.ndarray,  # scalar array (f32)
+    ) -> jnp.ndarray:  # [T0 + max_new]
+        model = eqx.combine(params, static)
+
+        t0 = jnp.asarray(prompt_ids.shape[0], jnp.int32)
+        total_len = t0 + jnp.asarray(max_new, jnp.int32)
+
+        # pre-allocate [T0+max_new] and write prompt
+        toks = jnp.full((total_len,), pad_id, dtype=jnp.int32)
+        toks = toks.at[:t0].set(prompt_ids)
+
+        # greedy if temp <= 0
+        force_greedy = jnp.asarray(temperature, f32) <= 0
+
+        def step(carry, _):
+            toks, cur, done, k = carry
+            k, sub = jax.random.split(k)
+
+            attn_mask = jnp.arange(total_len, dtype=jnp.int32) < cur
+
+            logits = model(
+                toks,
+                key=sub,
+                inference=True,
+                mask=attn_mask,
+                router_temp=router_temp,
+                gumbel_tau=gumbel_tau,
+            )  
+
+            vocab = logits.shape[-1]
+            cur_idx = cur - jnp.asarray(1, jnp.int32)
+            last_logits = jax.lax.dynamic_slice(logits, (cur_idx, 0), (1, vocab))[0]
+
+            def pick_greedy(lg):
+                return jnp.argmax(lg, axis=-1).astype(jnp.int32)
+
+            def pick_sample(rng, lg):
+                scaled = lg / jnp.clip(jnp.asarray(temperature, f32), 1e-6, None)
+                return jax.random.categorical(rng, scaled).astype(jnp.int32)
+
+            next_tok = jax.lax.cond(
+                force_greedy,
+                lambda _: pick_greedy(last_logits),
+                lambda rng: pick_sample(rng, last_logits),
+                operand=sub,
+            )
+
+            next_tok = jax.lax.select(done, jnp.asarray(pad_id, jnp.int32), next_tok)
+
+            toks = toks.at[cur].set(next_tok)
+            new_done = done | (next_tok == eos_id)
+            return (toks, cur + 1, new_done, k), None
+
+        (toks, _, _, _), _ = jax.lax.scan(
+            step,
+            (toks, t0, jnp.asarray(False), key),
+            None,
+            length=max_new,
+        )
+        return toks
+
+    return _scan_sample
+
+
 def eval_model(
     params,
     static,
@@ -224,9 +315,9 @@ def eval_model(
             in_shardings=(params_in_shardings, P("data", None), P("data", None), None),
             out_shardings=None,
         )(params, batch["input_ids"], batch["attention_mask"], key)
-        acc = ((jnp.argmax(logits, -1) == labels) & (mask > 0)).sum() / jnp.maximum(
-            mask.sum(), 1
-        )
+
+        denom = jnp.maximum(mask.sum(), 1)
+        acc = ((jnp.argmax(logits, -1) == labels) & (mask > 0)).sum() / denom
         return loss, acc
 
     loss_sum, acc_sum = 0.0, 0.0
@@ -281,24 +372,11 @@ def main():
         {d.platform for d in mesh.devices.flat},
     )
 
-    # tokenizer & data
-    tok = AutoTokenizer.from_pretrained("gpt2")
-    tok.pad_token = tok.eos_token
-    train_stream = load_dataset_stream(
-        cfg.dataset_name,
-        tok,
-        cfg.seq_len,
-        split="train",
-        config=cfg.dataset_config,
-        seed=cfg.seed,
-    )
-    val_stream = load_dataset_stream(
-        cfg.dataset_name,
-        tok,
-        cfg.seq_len,
-        split="validation",
-        config=cfg.dataset_config,
-        seed=cfg.seed + 1,
+    # data
+    tok, train_stream, val_stream = setup_tokenizer_and_streams(
+        dataset_name=cfg.dataset_name,
+        dataset_config=cfg.dataset_config,
+        seq_len=cfg.seq_len,
     )
 
     # model
@@ -309,7 +387,7 @@ def main():
 
     # params/static & shardings
     params, static = eqx.partition(model, eqx.is_inexact_array)
-    params_in_shardings = params_sharding_pytree(params)
+    params_in_shardings = _sharding_pytree(params)
 
     # optax
     schedule = lambda step: lr_schedule(step, cfg.warmup, cfg.steps, cfg.lr_peak)
@@ -319,9 +397,12 @@ def main():
             learning_rate=schedule, b1=0.9, b2=0.95, eps=1e-8, weight_decay=cfg.wd
         ),
     )
-    opt_state = opt.init(params)
 
-    # router kwargs as arrays (to avoid retraces)
+    with mesh:
+        opt_state = opt.init(params)
+        opt_state = _replicate_scalars_to_mesh(opt_state, mesh)
+    opt_state_in_shardings = _sharding_pytree(opt_state)
+
     model_kwargs = {
         "router_temp": jnp.array(cfg.router_temp, dtype=f32),
         "gumbel_tau": jnp.array(cfg.gumbel_tau, dtype=f32),
@@ -344,9 +425,8 @@ def main():
         pr = eqx.apply_updates(pr, updates)
 
         # metrics
-        acc = ((jnp.argmax(logits, -1) == labels) & (mask > 0)).sum() / jnp.maximum(
-            mask.sum(), 1
-        )
+        denom = jnp.maximum(mask.sum(), 1)
+        acc = ((jnp.argmax(logits, -1) == labels) & (mask > 0)).sum() / denom
         gnorm = optax.global_norm(grads)
         wnorm = optax.global_norm(pr)
         return pr, os, loss, acc, gnorm, wnorm
@@ -354,19 +434,25 @@ def main():
     step_pjit = pjit(
         _train_step,
         in_shardings=(
-            params_in_shardings,
-            None,
-            P("data", None),
-            P("data", None),
-            None,
+            params_in_shardings,  # params
+            opt_state_in_shardings,  # opt_state
+            P("data", None),  # ids
+            P("data", None),  # mask
+            None,  # rng key
         ),
-        out_shardings=(params_in_shardings, None, P(), P(), P(), P()),
+        out_shardings=(
+            params_in_shardings,  # updated params
+            opt_state_in_shardings,  # updated opt_state
+            P(),
+            P(),
+            P(),
+            P(),  # scalars
+        ),
     )
 
     # logging
     run_name = f"dna-att{cfg.n_attn_modules}-ff{cfg.n_ff_modules}-h{cfg.n_hops}-k{cfg.topk}-s{cfg.seed}"
     wandb.init(project=cfg.wandb_project, name=run_name, config=asdict(cfg))
-    global_tokens = 0
     t0_global = time.time()
 
     with mesh:
@@ -391,7 +477,6 @@ def main():
 
             # tokens/sec etc.
             tokens = int(batch_np["attention_mask"].sum())
-            global_tokens += tokens
             if step % cfg.log_every == 0:
                 elapsed = time.time() - t0_global
                 wandb.log(
@@ -401,7 +486,6 @@ def main():
                         "train/grad_norm": float(gnorm),
                         "train/weight_norm": float(wnorm),
                         "train/lr": float(schedule(step)),
-                        "train/tokens_per_sec": global_tokens / max(elapsed, 1e-6),
                         "train/step_ms": (time.perf_counter() - t_step) * 1000,
                     },
                     step=step,

@@ -89,7 +89,7 @@ def _mixing_probs(
 class LinearRouter(eqx.Module):
     proj: eqx.nn.Linear
     dropout: Dropout
-
+    # TODO: add layer norm
     k: int = eqx.field(static=True)
     norm_probs: bool = eqx.field(static=True)
 

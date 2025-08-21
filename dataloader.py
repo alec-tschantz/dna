@@ -36,17 +36,6 @@ def _process_example(
     return {"input_ids": ids.astype(np.int32), "attention_mask": msk.astype(np.int32)}
 
 
-def sample_batch(
-    stream: Iterator[Dict[str, np.ndarray]], batch_size: int
-) -> Dict[str, np.ndarray]:
-    ids, msk = [], []
-    for _ in range(batch_size):
-        ex = next(stream)
-        ids.append(ex["input_ids"])
-        msk.append(ex["attention_mask"])
-    return {"input_ids": np.stack(ids, 0), "attention_mask": np.stack(msk, 0)}
-
-
 # --------------------------- local snapshot helpers ---------------------------
 
 
@@ -95,7 +84,7 @@ def _prepare_local_snapshot(
     return local_dir
 
 
-# --------------------------- public API for train.py ---------------------------
+# --------------------------- public API ---------------------------
 
 
 def setup_tokenizer_and_streams(
@@ -110,19 +99,12 @@ def setup_tokenizer_and_streams(
     Iterator[Dict[str, np.ndarray]],
     Iterator[Dict[str, np.ndarray]],
 ]:
-    """
-    Returns: (tokenizer, train_stream, val_stream), all backed by local snapshots.
-    No network calls after the first successful run on rank 0.
-    """
-    # choose a stable cache root
     if cache_root is None:
-        # respect standard env if set; otherwise default under ~/.cache/huggingface
         cache_root = os.environ.get(
             "HF_HOME", os.path.expanduser("~/.cache/huggingface")
         )
     cache_root = Path(cache_root)
 
-    # 1) Tokenizer snapshot (we only need the tokenizer files; using model repo "gpt2")
     tok_local = _prepare_local_snapshot(
         repo_id="gpt2",
         repo_type="model",
@@ -137,11 +119,9 @@ def setup_tokenizer_and_streams(
         ],
     )
     tok = AutoTokenizer.from_pretrained(str(tok_local), local_files_only=True)
-    # ensure a pad token exists for batching
     if tok.pad_token is None and tok.eos_token is not None:
         tok.pad_token = tok.eos_token
 
-    # 2) Dataset snapshot (download repo locally once; then load by path, streaming=True)
     ds_local = _prepare_local_snapshot(
         repo_id=dataset_name,
         repo_type="dataset",
@@ -152,16 +132,12 @@ def setup_tokenizer_and_streams(
         allow_patterns=["*train.txt", "*valid.txt"],
     )
 
-    # Load *by path* so Datasets uses the local loader script and avoids network HEADs.
     train_ds = load_dataset(str(ds_local), split="train", streaming=True)
-    # Some datasets don't define validation; for TinyStories there is one.
     try:
         val_ds = load_dataset(str(ds_local), split="validation", streaming=True)
     except Exception:
-        # fallback: reuse train stream for "validation" if split missing
         val_ds = load_dataset(str(ds_local), split="train", streaming=True)
 
-    # Turn HF streaming dataset into tokenized generators
     def to_stream(hfds):
         for ex in hfds:
             txt = ex.get(text_key, "")
@@ -172,3 +148,14 @@ def setup_tokenizer_and_streams(
     val_stream = to_stream(val_ds)
 
     return tok, train_stream, val_stream
+
+
+def sample_batch(
+    stream: Iterator[Dict[str, np.ndarray]], batch_size: int
+) -> Dict[str, np.ndarray]:
+    ids, msk = [], []
+    for _ in range(batch_size):
+        ex = next(stream)
+        ids.append(ex["input_ids"])
+        msk.append(ex["attention_mask"])
+    return {"input_ids": np.stack(ids, 0), "attention_mask": np.stack(msk, 0)}

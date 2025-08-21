@@ -41,16 +41,16 @@ f32 = jnp.float32
 class Config:
     # model
     vocab_size: int = 50_257
-    d_model: int = 1024
-    n_heads: int = 16
+    d_model: int = 512
+    n_heads: int = 8
     n_hops: int = 8
-    topk: int = 1
-    dropout: float = 0.2
+    topk: int = 2
+    dropout: float = 0.1
     rope_base: float = 10_000.0
 
     n_attn_modules: int = 8
     n_ff_modules: int = 8
-    n_id_modules = 8
+    n_id_modules = 2
 
     # data
     batch_size: int = 128

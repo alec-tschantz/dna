@@ -1,6 +1,7 @@
 .DS_Store
 wandb/
 checkpoints/
+logs/
 
 
 # Byte-compiled / optimized / DLL files

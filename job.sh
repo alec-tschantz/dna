@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J dna
 #SBATCH -o /home/alex.tschantz/dna/logs/job.%A.out
-#SBATCH -e /home/alex.tschantz/dna/logs/job.%A.err
+#SBATCH -e /home/alex.tschantz/dna/logs/job.%A.out
 
 # ---- request exactly 1 node with 8 GPUs ----
 #SBATCH --nodes=1

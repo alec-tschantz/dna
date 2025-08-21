@@ -18,7 +18,7 @@ f32 = jnp.float32  # accumulations / logits / softmax
 
 
 # ---------------------------------------------------------------------
-# small utils
+#  utils
 # ---------------------------------------------------------------------
 def rope_cos_sin(
     T: int, dim: int, base: float = 10_000.0
@@ -39,7 +39,7 @@ def _rotate_half(x: Float[Array, "... dim"]) -> Float[Array, "... dim"]:
 
 
 # ---------------------------------------------------------------------
-# core layers (bias-free)
+# core layers
 # ---------------------------------------------------------------------
 class Linear(eqx.Module):
     weight: Float[Array, "in out"]
@@ -97,23 +97,23 @@ class Dropout(eqx.Module):
 
 
 # ---------------------------------------------------------------------
-# experts: unified signature: (x, mask, *, key, inference, pos=None)
+# experts: (x, mask, *, key, inference)
 # ---------------------------------------------------------------------
 class Expert(eqx.Module):
     def __call__(
         self,
         x: Float[Array, "T D"],
         mask: Optional[Bool[Array, "T"]],
+        pos: Optional[tuple[Float[Array, "T d_h"], Float[Array, "T d_h"]]],
         *,
         key,
         inference: bool,
-        pos: Optional[Tuple[Float[Array, "T dh"], Float[Array, "T dh"]]] = None,
     ) -> Float[Array, "T D"]:
         raise NotImplementedError
 
 
 class Identity(Expert):
-    def __call__(self, x, mask, *, key, inference, pos=None):
+    def __call__(self, x, mask, pos, *, key, inference):
         return x
 
 
@@ -132,7 +132,7 @@ class FeedForward(Expert):
         self.down = Linear(d_model * mult, d_model, key=k3)
         self.drop = Dropout(dropout)
 
-    def __call__(self, x, mask, *, key, inference, pos=None):
+    def __call__(self, x, mask, pos, *, key, inference):
         k1, k2 = jax.random.split(key)
         h = self.ln(x)
         a = self.gate(h).astype(f32)
@@ -163,8 +163,7 @@ class Attention(Expert):
         self.out = Linear(d_model, d_model, key=k2)
         self.drop = Dropout(dropout)
 
-    def __call__(self, x, mask, *, key, inference, pos):
-        assert pos is not None, "Attention requires RoPE (cos, sin)."
+    def __call__(self, x, mask, pos, *, key, inference):
         cos, sin = pos
         T, D = x.shape
         k1, k2 = jax.random.split(key)
@@ -229,7 +228,7 @@ def _maybe_gumbel(x: Float[Array, "..."], *, key, inference: bool, tau: float):
     return x + tau * g
 
 
-class LinearRouter(eqx.Module):
+class Router(eqx.Module):
     ln: RMSNorm
     proj: Linear
     drop: Dropout
@@ -288,39 +287,37 @@ def _sig(mod: eqx.Module) -> Tuple[str, str, str]:
 
 def _stack_params(mods: List[eqx.Module]):
     params = [eqx.filter(m, eqx.is_array) for m in mods]
-    static = eqx.filter(mods[0], lambda x: not eqx.is_array(x))  # template (no arrays)
-    stacked = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *params)  # [E_g, ...]
+    static = eqx.filter(mods[0], lambda x: not eqx.is_array(x))
+    stacked = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *params)
     return stacked, static
 
 
 class GroupStack(eqx.Module):
-    idx: Int[
-        Array, "E"
-    ]  # which experts these are (kept as non-inexact -> static in partition)
-    params: Any  # pytree with leading E axis (arrays)
-    proto: Any  # non-array template module
+    idx: Int[Array, "E"]
+    params: Any
+    proto: Any
 
     def run(
         self,
         x: Float[Array, "T D"],
-        sel_eT: Bool[Array, "E T"],
+        mask: Bool[Array, "E T"],
         pos: Optional[Tuple[Float[Array, "T dh"], Float[Array, "T dh"]]],
         *,
         key,
         inference: bool,
     ) -> Float[Array, "E T D"]:
-        E = int(sel_eT.shape[0])
+        E = int(mask.shape[0])
         keys = jax.random.split(key, E)
 
         def _one(p, s, k):
             mod: Expert = eqx.combine(p, self.proto)
-            return mod(x, s, key=k, inference=inference, pos=pos)  # [T,D]
+            return mod(x, s, pos, key=k, inference=inference)  # [T,D]
 
-        return jax.vmap(_one)(self.params, sel_eT, keys)  # [E,T,D]
+        return jax.vmap(_one)(self.params, mask, keys)  # [E,T,D]
 
 
 # ---------------------------------------------------------------------
-# DNA model (T-only __call__; vmap over batch outside)
+# DNA model
 # ---------------------------------------------------------------------
 class DNA(eqx.Module):
     embed: Embedding
@@ -328,7 +325,7 @@ class DNA(eqx.Module):
     ln_out: RMSNorm
     backbone: Tuple[Expert, ...]
     groups: Tuple[GroupStack, ...]
-    routers: Tuple[LinearRouter, ...]
+    routers: Tuple[Router, ...]
     n_heads: int = eqx.field(static=True)
     rope_base: float = eqx.field(static=True)
     vocab: int = eqx.field(static=True)
@@ -338,7 +335,7 @@ class DNA(eqx.Module):
         self,
         *,
         modules: Tuple[Expert, ...],
-        routers: Tuple[LinearRouter, ...],
+        routers: Tuple[Router, ...],
         vocab: int,
         d_model: int,
         n_heads: int,
@@ -357,7 +354,6 @@ class DNA(eqx.Module):
         self.drop = Dropout(dropout)
         self.ln_out = RMSNorm(d_model)
 
-        # group experts with identical array structure so we can stack + vmap
         buckets: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         for idx, m in enumerate(modules):
             sig = _sig(m)
@@ -383,7 +379,7 @@ class DNA(eqx.Module):
     def _hop(
         self,
         h: Float[Array, "T D"],
-        router: LinearRouter,
+        router: Router,
         pos: Tuple[Float[Array, "T dh"], Float[Array, "T dh"]],
         *,
         key,
@@ -392,7 +388,7 @@ class DNA(eqx.Module):
         router_temp: float,
         gumbel_tau: float,
     ) -> Float[Array, "T D"]:
-        # route tokens → selected experts, compute only where needed, then combine
+
         kr, ke = jax.random.split(key)
         hard_TE, probs_TE = router(
             h,
@@ -402,6 +398,7 @@ class DNA(eqx.Module):
             router_temp=router_temp,
             gumbel_tau=gumbel_tau,
         )
+
         T, D = h.shape
         delta = jnp.zeros((T, D), dtype=f32)
         start = 0
@@ -461,5 +458,5 @@ class DNA(eqx.Module):
             )
 
         h = jax.vmap(self.ln_out)(h)
-        logits = jnp.matmul(h.astype(f32), self.embed.weight.astype(f32).T)  # tied head
+        logits = jnp.matmul(h.astype(f32), self.embed.weight.astype(f32).T)
         return logits  # [T,V] f32

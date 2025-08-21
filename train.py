@@ -42,14 +42,15 @@ class Config:
     # model
     vocab_size: int = 50_257
     d_model: int = 512
-    n_heads: int = 8
-    n_hops: int = 12
-    topk: int = 2
-    dropout: float = 0.2
+    n_heads: int = 16
+    n_hops: int = 8
+    topk: int = 1
+    dropout: float = 0.1
     rope_base: float = 10_000.0
-    n_attn_modules: int = 12
-    n_ff_modules: int = 12
-    n_id_modules = 12
+
+    n_attn_modules: int = 8
+    n_ff_modules: int = 8
+    n_id_modules = 8
 
     # data
     batch_size: int = 128
@@ -81,8 +82,8 @@ class Config:
     ckpt_dir: str = "checkpoints"
 
     # sharding
-    batch_shards: int = 2  # 'data'
-    expert_shards: int = 4  # 'expert'
+    batch_shards: int = 4  # 'data'
+    expert_shards: int = 2  # 'expert'
 
 
 # ------------------------------ model build ------------------------------ #
@@ -150,7 +151,6 @@ def loss_and_aux(
 
     logits = jax.vmap(f)(ids, msk, keys)  # [B,T,V]
 
-    # next-token loss
     logits_shift = logits[:, :-1]
     labels_shift = ids[:, 1:]
     mask_shift = msk[:, 1:]
@@ -308,6 +308,7 @@ def eval_model(
             "once upon a time",
             "the little robot",
             "in a quiet forest",
+            "the dog was on fire",
         ]
         pad_id = int(tok.pad_token_id)
         eos_id = int(tok.eos_token_id) if tok.eos_token_id is not None else pad_id
@@ -330,7 +331,7 @@ def eval_model(
             sub,
             jnp.asarray(cfg.router_temp, f32),
             jnp.asarray(cfg.gumbel_tau, f32),
-        )  # [B, T0 + gen_len]
+        )
 
         toks = jax.device_get(toks)
         print("\n[eval/generate]")
@@ -424,7 +425,8 @@ def main():
     )
 
     # logging
-    run_name = f"dna-att{cfg.n_attn_modules}-ff{cfg.n_ff_modules}-h{cfg.n_hops}-k{cfg.topk}-s{cfg.seed}"
+    run_name = f"dna-att{cfg.n_attn_modules}-ff{cfg.n_ff_modules}-id{cfg.id_modules}"
+    run_name += f"-h{cfg.n_hops}-k{cfg.topk}-bs{cfg.batch_size}-s{cfg.seed}"
     wandb.init(project=cfg.wandb_project, name=run_name, config=asdict(cfg))
     t0_global = time.time()
 

@@ -21,7 +21,7 @@ from jax.experimental import mesh_utils
 from jax.experimental.pjit import pjit
 from jax.experimental.multihost_utils import sync_global_devices
 
-from dna import DNA, Attention, FeedForward, Router
+from model import DNA, Attention, FeedForward, Router
 from dataloader import setup_tokenizer_and_streams, sample_batch
 
 f32 = jnp.float32
@@ -36,12 +36,12 @@ class Config:
     vocab_size: int = 50_257
     d_model: int = 512
     n_heads: int = 8
-    n_hops: int = 6
+    n_hops: int = 12
     topk: int = 2
     dropout: float = 0.2
     rope_base: float = 10_000.0
-    n_attn_modules: int = 6
-    n_ff_modules: int = 6
+    n_attn_modules: int = 12
+    n_ff_modules: int = 12
 
     # data
     batch_size: int = 128
@@ -73,8 +73,8 @@ class Config:
     ckpt_dir: str = "checkpoints"
 
     # sharding
-    batch_shards: int = 4  # 'data'
-    expert_shards: int = 2  # 'expert'
+    batch_shards: int = 2  # 'data'
+    expert_shards: int = 4  # 'expert'
 
 
 # ------------------------------ mesh & sharding ------------------------------ #
@@ -293,7 +293,7 @@ def eval_model(
     cfg: Config,
     model_kwargs: Dict[str, jnp.ndarray],
     key,
-    tok,  # <-- pass tokenizer in the call
+    tok,  
 ) -> Tuple[float, float]:
     eval_batches = max(1, cfg.eval_samples // cfg.batch_size)
 
@@ -317,7 +317,6 @@ def eval_model(
 
     loss_sum, acc_sum = 0.0, 0.0
     with mesh:
-        # eval loss/acc
         for _ in range(eval_batches):
             bnp = sample_batch(val_stream, cfg.batch_size)
             batch = {

@@ -53,7 +53,7 @@ class Config:
     n_id_modules = 8
 
     # data
-    batch_size: int = 128
+    batch_size: int = 256
     seq_len: int = 256
     dataset_name: str = "roneneldan/TinyStories"
     dataset_config: Optional[str] = None
@@ -425,7 +425,7 @@ def main():
     )
 
     # logging
-    run_name = f"dna-att{cfg.n_attn_modules}-ff{cfg.n_ff_modules}-id{cfg.id_modules}"
+    run_name = f"dna-att{cfg.n_attn_modules}-ff{cfg.n_ff_modules}-id{cfg.n_id_modules}"
     run_name += f"-h{cfg.n_hops}-k{cfg.topk}-bs{cfg.batch_size}-s{cfg.seed}"
     wandb.init(project=cfg.wandb_project, name=run_name, config=asdict(cfg))
     t0_global = time.time()

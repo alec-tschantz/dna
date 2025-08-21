@@ -209,7 +209,7 @@ class Attention(Expert):
 
 
 # ---------------------------------------------------------------------
-# router (no renorm). returns (mask [T,E], probs [T,E])
+# router -> (mask [T,E], probs [T,E])
 # ---------------------------------------------------------------------
 def _topk_mask(logits: Float[Array, "T E"], k: int) -> Bool[Array, "T E"]:
     _, idx = jax.lax.top_k(logits, int(k))
@@ -220,12 +220,19 @@ def _topk_mask(logits: Float[Array, "T E"], k: int) -> Bool[Array, "T E"]:
     )
 
 
-def _maybe_gumbel(x: Float[Array, "..."], *, key, inference: bool, tau: float):
-    if inference or tau <= 0.0:
+def _maybe_gumbel(x, *, key, inference: bool, tau):
+    if inference:
         return x
-    u = jax.random.uniform(key, x.shape, minval=1e-6, maxval=1.0 - 1e-6)
-    g = -jnp.log(-jnp.log(u))
-    return x + tau * g
+
+    def no_noise(_):
+        return x
+
+    def add_noise(_):
+        u = jax.random.uniform(key, x.shape, minval=1e-6, maxval=1.0 - 1e-6)
+        g = -jnp.log(-jnp.log(u))
+        return x + tau * g
+
+    return jax.lax.cond(tau > 0.0, add_noise, no_noise, operand=None)
 
 
 class Router(eqx.Module):
@@ -297,7 +304,7 @@ class GroupStack(eqx.Module):
     params: Any
     proto: Any
 
-    def run(
+    def __call__(
         self,
         x: Float[Array, "T D"],
         mask: Bool[Array, "E T"],
@@ -380,7 +387,7 @@ class DNA(eqx.Module):
         self,
         h: Float[Array, "T D"],
         router: Router,
-        pos: Tuple[Float[Array, "T dh"], Float[Array, "T dh"]],
+        pos: tuple[Float[Array, "T dh"], Float[Array, "T dh"]],
         *,
         key,
         inference: bool,
@@ -390,7 +397,8 @@ class DNA(eqx.Module):
     ) -> Float[Array, "T D"]:
 
         kr, ke = jax.random.split(key)
-        hard_TE, probs_TE = router(
+
+        hard_te, probs_te = router(
             h,
             mask,
             key=kr,
@@ -401,19 +409,27 @@ class DNA(eqx.Module):
 
         T, D = h.shape
         delta = jnp.zeros((T, D), dtype=f32)
-        start = 0
-        for gi, g in enumerate(self.groups):
-            Eg = int(g.idx.shape[0])
-            sub = jax.random.fold_in(ke, gi)
-            hard_g = hard_TE[:, start : start + Eg]  # [T,Eg]
-            prob_g = probs_TE[:, start : start + Eg]  # [T,Eg]
-            start += Eg
 
-            sel_eT = (hard_g & mask[:, None]).T  # [Eg,T]
-            out_eTD = g.run(h, sel_eT, pos, key=sub, inference=inference).astype(f32)
-            w_eT1 = jnp.where(hard_g, prob_g, 0.0).T[..., None]  # [Eg,T,1]
+        for gi, grp in enumerate(self.groups):
+            subkey = jax.random.fold_in(ke, gi)
+
+            cols = grp.idx  # [e_g]
+            hard_g = jnp.take(hard_te, cols, axis=1)  # [t,e_g]
+            prob_g = jnp.take(probs_te, cols, axis=1)  # [t,e_g]
+
+            # per-expert token mask (valid & selected)
+            sel_et = (hard_g & mask[:, None]).T  # [e_g,t]
+
+            # run experts in this group only on masked tokens; returns [e_g,t,d]
+            out_etd = grp(h, sel_et, pos, key=subkey, inference=inference)
+            out_etd = out_etd.astype(f32)
+
+            # weights per (expert, token); zero for non-selected
+            w_et1 = jnp.where(hard_g, prob_g, 0.0).T[..., None]  # [e_g,t,1]
+
+            # Eq. (3): accumulate sum_e ρ_e * (M_e(h) - h)
             delta = delta + jnp.sum(
-                w_eT1 * (out_eTD - h[None, ...].astype(f32)), axis=0
+                w_et1 * (out_etd - h[None, ...].astype(f32)), axis=0
             )
 
         y = (h.astype(f32) + delta).astype(bf16)

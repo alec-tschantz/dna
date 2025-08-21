@@ -21,4 +21,4 @@ export XLA_PYTHON_CLIENT_ALLOCATOR=platform
 export TF_CPP_MIN_LOG_LEVEL=1
 
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
-python -u test.py
+python -u train.py

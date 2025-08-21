@@ -114,24 +114,24 @@ def build_model_and_routers(
 class Args:
     # data / shapes
     batch_size: int = 64
-    seq_len: int = 128
-    vocab: int = 32000
+    seq_len: int = 256
+    vocab: int = 50_257
 
     # model
-    d_model: int = 256
-    n_heads: int = 8
-    n_hops: int = 8
+    d_model: int = 512
+    n_heads: int = 16
+    n_hops: int = 12
     topk: int = 2
     dropout: float = 0.0
     rope_base: float = 10_000.0
 
     # experts
-    n_attn: int = 8
-    n_ff: int = 8
+    n_attn: int = 12
+    n_ff: int = 12
 
     # mesh
-    batch_shards: int = 4  # 'data' axis
-    expert_shards: int = 2  # 'expert' axis
+    batch_shards: int = 2  # 'data' axis
+    expert_shards: int = 4  # 'expert' axis
 
     seed: int = 0
 

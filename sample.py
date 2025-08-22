@@ -5,8 +5,10 @@ from typing import Tuple
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Int
+import equinox as eqx
 
 
+@eqx.filter_jit
 def sample_tokens(
     model,
     prompt_ids: Int[Array, "B T0"],
@@ -18,10 +20,6 @@ def sample_tokens(
     pad_id: int = 50256,
     eos_id: int = 50256,
 ) -> Int[Array, "B T_total"]:
-    """
-    Generate tokens using temperature sampling (no device parallelism).
-    Returns tokens of shape [B, T0 + max_new].
-    """
     B, T0 = prompt_ids.shape
     total_len = T0 + max_new
 
@@ -32,8 +30,8 @@ def sample_tokens(
     )
 
     # Positions and done flags
-    current_pos = prompt_lens.astype(jnp.int32)          # [B]
-    is_done     = jnp.zeros_like(prompt_lens, dtype=bool)  # [B]
+    current_pos = prompt_lens.astype(jnp.int32)  # [B]
+    is_done = jnp.zeros_like(prompt_lens, dtype=bool)  # [B]
 
     positions = jnp.arange(total_len, dtype=jnp.int32)[None, :]
 
@@ -42,16 +40,18 @@ def sample_tokens(
         key, subkey = jax.random.split(key)
 
         # Mask is True for tokens < current_pos (causal prefix per batch element)
-        attn_mask = positions < current_pos[:, None]      # [B, T_total]
+        attn_mask = positions < current_pos[:, None]  # [B, T_total]
 
         # Forward pass for each sequence in the batch
         # model: (tok_seq[T_total], mask[T_total]) -> logits[T_total, V]
         keys = jax.random.split(subkey, B)
-        logits = jax.vmap(lambda ts, m, k: model(ts, m, key=k, inference=True))(tokens, attn_mask, keys)  # [B, T_total, V]
+        logits = jax.vmap(lambda ts, m, k: model(ts, m, key=k, inference=True))(
+            tokens, attn_mask, keys
+        )  # [B, T_total, V]
 
         # Get logits at the last valid position (pos-1, guarded for pos=0)
-        last_idx = jnp.maximum(current_pos, 1) - 1                       # [B]
-        last_logits = logits[jnp.arange(B), last_idx]                    # [B, V]
+        last_idx = jnp.maximum(current_pos, 1) - 1  # [B]
+        last_logits = logits[jnp.arange(B), last_idx]  # [B, V]
 
         # Sample or greedy based on temperature (compile-time boolean)
         def _sample(ops):
@@ -79,7 +79,7 @@ def sample_tokens(
 
         # Update positions and done flags
         new_done = is_done | (next_tokens == eos_id)
-        new_pos  = jnp.where(new_done, current_pos, current_pos + 1)
+        new_pos = jnp.where(new_done, current_pos, current_pos + 1)
 
         return (tokens, new_pos, new_done, key), None
 

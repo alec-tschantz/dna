@@ -10,8 +10,8 @@ from jaxtyping import Array, Float, Int, Bool
 
 
 # ----------------- dtypes -----------------
-bf16 = jnp.bfloat16   # activations + stored weights
-f32  = jnp.float32    # compute/accumulation & logits
+bf16 = jnp.bfloat16  # activations + stored weights
+f32 = jnp.float32  # compute/accumulation & logits
 
 
 # ---------------------------------------------------------------------
@@ -22,7 +22,9 @@ class Linear(eqx.Module):
 
     def __init__(self, in_dim: int, out_dim: int, *, key):
         # GPT-style init: N(0, 0.02) truncated to +/-2 sigmas, stored as bf16
-        w = jax.random.truncated_normal(key, lower=-2.0, upper=2.0, shape=(in_dim, out_dim))
+        w = jax.random.truncated_normal(
+            key, lower=-2.0, upper=2.0, shape=(in_dim, out_dim)
+        )
         self.weight = (w * 0.02).astype(bf16)
 
     def __call__(self, x: Float[Array, "... in"]) -> Float[Array, "... out"]:
@@ -54,7 +56,7 @@ class RMSNorm(eqx.Module):
     def __call__(self, x: Float[Array, "... D"]) -> Float[Array, "... D"]:
         x32 = x.astype(f32)
         var = jnp.mean(x32 * x32, axis=-1, keepdims=True)
-        y = x32 * jax.lax.rsqrt(var + self.eps)          # fp32 norm
+        y = x32 * jax.lax.rsqrt(var + self.eps)  # fp32 norm
         return (y.astype(bf16) * self.weight).astype(bf16)
 
 
@@ -64,7 +66,9 @@ class Dropout(eqx.Module):
     def __init__(self, rate: float = 0.0):
         self.rate = float(rate)
 
-    def __call__(self, x: Float[Array, "..."], *, key, inference: bool) -> Float[Array, "..."]:
+    def __call__(
+        self, x: Float[Array, "..."], *, key, inference: bool
+    ) -> Float[Array, "..."]:
         if inference or self.rate == 0.0:
             return x
         keep = 1.0 - self.rate
@@ -109,7 +113,7 @@ class FeedForward(eqx.Module):
     def __init__(self, d_model: int, ff_mult: int, dropout: float, *, key):
         d_ff = d_model * ff_mult
         k1, k2, k3 = jax.random.split(key, 3)
-        self.up   = Linear(d_model, d_ff, key=k1)
+        self.up = Linear(d_model, d_ff, key=k1)
         self.gate = Linear(d_model, d_ff, key=k2)
         self.down = Linear(d_ff, d_model, key=k3)
         self.drop = Dropout(dropout)
@@ -126,13 +130,13 @@ class FeedForward(eqx.Module):
         k1, k2 = jax.random.split(key)
 
         # Compute in fp32 then cast to bf16 between layers
-        gate32 = self.gate(x).astype(f32)          # (..., d_ff)
-        up32   = self.up(x).astype(f32)            # (..., d_ff)
-        h32    = jnn.silu(gate32) * up32           # (..., d_ff) fp32
-        h      = h32.astype(bf16)
-        h      = self.drop(h, key=k1, inference=inference)
-        y      = self.down(h).astype(bf16)         # (..., d_model) (down returns bf16)
-        y      = self.drop(y, key=k2, inference=inference)
+        gate32 = self.gate(x).astype(f32)  # (..., d_ff)
+        up32 = self.up(x).astype(f32)  # (..., d_ff)
+        h32 = jnn.silu(gate32) * up32  # (..., d_ff) fp32
+        h = h32.astype(bf16)
+        h = self.drop(h, key=k1, inference=inference)
+        y = self.down(h).astype(bf16)  # (..., d_model) (down returns bf16)
+        y = self.drop(y, key=k2, inference=inference)
         return y.astype(bf16)
 
 
@@ -154,10 +158,10 @@ class Attention(eqx.Module):
 
     def __call__(
         self,
-        x: Float[Array, "T D"],                 # sequence-first
+        x: Float[Array, "T D"],  # sequence-first
         cos: Float[Array, "T d_head"],
         sin: Float[Array, "T d_head"],
-        mask: Optional[Bool[Array, "T"]] = None,   # True = keep
+        mask: Optional[Bool[Array, "T"]] = None,  # True = keep
         *,
         key: Optional[jax.Array] = None,
         inference: bool = False,
@@ -170,7 +174,7 @@ class Attention(eqx.Module):
         # Project to qkv and reshape -> (T, 3, N, H)
         qkv = self.qkv(x).astype(bf16)
         qkv = qkv.reshape(T, 3, self.n_heads, self.d_head)
-        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]    # (T, N, H) TNH
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # (T, N, H) TNH
 
         # RoPE (TNH)
         q = apply_rope(q, cos, sin)
@@ -179,14 +183,16 @@ class Attention(eqx.Module):
         # Build (N, T, T) bool mask for TNH. Causality via is_causal=True.
         attn_mask = None
         if mask is not None:
-            m = (mask.astype(jnp.bool_))
-            pad2d = (m[:, None] & m[None, :])                     # (T, T) bool
+            m = mask.astype(jnp.bool_)
+            pad2d = m[:, None] & m[None, :]  # (T, T) bool
             attn_mask = jnp.broadcast_to(pad2d, (self.n_heads, T, T))  # (N, T, T)
 
         # Flash attention path: q/k/v must be bf16/f16; mask must be bool
         out = jax.nn.dot_product_attention(
-            query=q, key=k, value=v,
-            mask=attn_mask,                 # (N, T, T) or None
+            query=q,
+            key=k,
+            value=v,
+            mask=attn_mask,  # (N, T, T) or None
             is_causal=True,
             implementation="cudnn",
         )  # -> (T, N, H)
@@ -204,7 +210,9 @@ class TransformerBlock(eqx.Module):
     ln2: RMSNorm
     ff: FeedForward
 
-    def __init__(self, d_model: int, n_heads: int, ff_mult: int, dropout: float, *, key):
+    def __init__(
+        self, d_model: int, n_heads: int, ff_mult: int, dropout: float, *, key
+    ):
         k1, k2 = jax.random.split(key)
         self.ln1 = RMSNorm(d_model, eps=1e-5)
         self.attn = Attention(d_model, n_heads, dropout, key=k1)
@@ -291,7 +299,7 @@ class Transformer(eqx.Module):
         d_head = self.d_model // self.n_heads
 
         # Embedding + dropout (BF16 activations)
-        x = self.embed(ids).astype(bf16)     # (T, D)
+        x = self.embed(ids).astype(bf16)  # (T, D)
         k_drop, key = jax.random.split(key)
         x = self.drop(x, key=k_drop, inference=inference)
 
@@ -304,6 +312,6 @@ class Transformer(eqx.Module):
             x = block(x, cos, sin, mask, key=k_blk, inference=inference)
 
         # Final norm (BF16 → FP32) and tied output projection to vocab
-        x = self.ln_out(x).astype(f32)                 # (T, D) -> fp32
+        x = self.ln_out(x).astype(f32)  # (T, D) -> fp32
         logits = jnp.matmul(x, self.embed.weight.astype(f32).T)  # (T, V) fp32
         return logits  # keep fp32 for loss

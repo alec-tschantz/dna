@@ -1,14 +1,11 @@
 python -u train.py \
   --d_model 128 \
+  --n_layers 4 \
   --n_heads 4 \
-  --n_hops 2 \
-  --n_attn_modules 2 \
-  --n_ff_modules 2 \
   --batch_size 8 \
   --seq_len 64 \
-  --steps 200 \
-  --eval_every 50 \
-  --gen_len 20 \
-  --batch_shards 1 \
-  --expert_shards 1 \
+  --steps 100 \
+  --eval_every 20 \
+  --gen_max_new 10 \
+  --warmup_steps 10 \
   --wandb_project "dna-mini" \

@@ -26,7 +26,7 @@ class Linear(eqx.Module):
 
 
 class Embedding(eqx.Module):
-    weight: Float[Array, "vocab_size dim"]
+    weight: Float[Array, "V D"]
 
     def __init__(self, vocab_size: int, dim: int, *, key: jax.Array):
         w = jax.random.truncated_normal(
@@ -34,19 +34,19 @@ class Embedding(eqx.Module):
         )
         self.weight = (w * 0.02).astype(BF16)
 
-    def __call__(self, ids: Int[Array, "..."]) -> Float[Array, "... dim"]:
+    def __call__(self, ids: Int[Array, "B T"]) -> Float[Array, "B T D"]:
         return jnp.take(self.weight, ids, axis=0).astype(BF16)
 
 
 class RMSNorm(eqx.Module):
-    weight: Float[Array, "dim"]
+    weight: Float[Array, "D"]
     eps: float = eqx.field(static=True)
 
     def __init__(self, dim: int, eps: float = 1e-5):
         self.weight = jnp.ones((dim,), dtype=BF16)
         self.eps = eps
 
-    def __call__(self, x: Float[Array, "... dim"]) -> Float[Array, "... dim"]:
+    def __call__(self, x: Float[Array, "B T D"]) -> Float[Array, "B T D"]:
         x_fp32 = x.astype(FP32)
         var = jnp.mean(jnp.square(x_fp32), axis=-1, keepdims=True)
         normed = x_fp32 * jax.lax.rsqrt(var + self.eps)
@@ -73,7 +73,7 @@ class Dropout(eqx.Module):
 
 def rope_angles(
     seq_len: int, dim: int, base: float = 10000.0
-) -> Tuple[Float[Array, "seq_len dim"], Float[Array, "seq_len dim"]]:
+) -> Tuple[Float[Array, "T D"], Float[Array, "T D"]]:
     half = dim // 2
     pos = jnp.arange(seq_len, dtype=FP32)[:, None]
     idx = jnp.arange(half, dtype=FP32)[None, :]
@@ -86,22 +86,19 @@ def rope_angles(
     return cos, sin
 
 
-def _rotate_half(x: Float[Array, "... d"]):
+def _rotate_half(x: Float[Array, "... D"]):
     half = x.shape[-1] // 2
     x1, x2 = jnp.split(x, 2, axis=-1)
     return jnp.concatenate((-x2, x1), axis=-1)
 
 
 def apply_rope(
-    x: Float[Array, "... seq_len num_heads head_dim"],
-    cos: Float[Array, "seq_len head_dim"],
-    sin: Float[Array, "seq_len head_dim"],
-) -> Float[Array, "... seq_len num_heads head_dim"]:
-    orig_shape = x.shape
-    T, H = orig_shape[-3], orig_shape[-1]
-    x_flat = x.reshape(-1, T, H)
+    x: Float[Array, "B T N H"], cos: Float[Array, "T H"], sin: Float[Array, "T H"]
+) -> Float[Array, "B T N H"]:
+    B, T, N, H = x.shape
+    x_flat = x.reshape(B * N, T, H)
     x_rotated = x_flat * cos[None, :, :] + _rotate_half(x_flat) * sin[None, :, :]
-    return x_rotated.reshape(orig_shape)
+    return x_rotated.reshape(B, T, N, H)
 
 
 class FeedForward(eqx.Module):
@@ -120,11 +117,11 @@ class FeedForward(eqx.Module):
 
     def __call__(
         self,
-        x: Float[Array, "... d_model"],
+        x: Float[Array, "B T D"],
         *,
         key: Optional[jax.Array] = None,
         inference: bool = False,
-    ) -> Float[Array, "... d_model"]:
+    ) -> Float[Array, "B T D"]:
         if key is None:
             key = jax.random.PRNGKey(0)
         k1, k2 = jax.random.split(key, 2)
@@ -155,30 +152,34 @@ class Attention(eqx.Module):
 
     def __call__(
         self,
-        x: Float[Array, "... seq_len d_model"],
-        cos: Float[Array, "seq_len head_dim"],
-        sin: Float[Array, "seq_len head_dim"],
-        mask: Optional[Bool[Array, "... seq_len"]] = None,
+        x: Float[Array, "B T D"],
+        cos: Float[Array, "T H"],
+        sin: Float[Array, "T H"],
+        mask: Optional[Bool[Array, "B T"]] = None,
         *,
         key: Optional[jax.Array] = None,
         inference: bool = False,
-    ) -> Float[Array, "... seq_len d_model"]:
+    ) -> Float[Array, "B T D"]:
         if key is None:
             key = jax.random.PRNGKey(0)
         k_attn, k_out = jax.random.split(key, 2)
-        B, T, D = x.shape if x.ndim == 3 else (1, *x.shape)
+        B, T, D = x.shape
+
         qkv = self.w_qkv(x).astype(FP32)
-        qkv = qkv.reshape(*qkv.shape[:-1], 3, self.n_heads, self.head_dim)
-        q, k, v = qkv[..., 0, :, :], qkv[..., 1, :, :], qkv[..., 2, :, :]
+        qkv = qkv.reshape(B, T, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv[:, :, 0, :, :], qkv[:, :, 1, :, :], qkv[:, :, 2, :, :]
+
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
+
         attn_mask = None
         if mask is not None:
             mask_bool = mask.astype(bool)
-            pad_mask = mask_bool[..., None, :] & mask_bool[..., :, None]
+            pad_mask = mask_bool[:, None, :] & mask_bool[:, :, None]
             pad_mask = pad_mask | jnp.eye(T, dtype=bool)[None, :, :]
             pad_mask = pad_mask[:, None, :, :]
             attn_mask = pad_mask
+
         attn_out = jax.nn.dot_product_attention(
             query=q,
             key=k,
@@ -187,7 +188,8 @@ class Attention(eqx.Module):
             mask=attn_mask,
             is_causal=True,
         )
-        attn_out = attn_out.reshape(*attn_out.shape[:-2], D).astype(FP32)
+
+        attn_out = attn_out.reshape(B, T, D).astype(FP32)
         out = self.w_out(attn_out).astype(BF16)
         out = self.drop(out, key=k_out, inference=inference)
         return out.astype(BF16)

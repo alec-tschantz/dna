@@ -20,6 +20,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dna import (
     Transformer,
+    Linear,
     generate,
     load_checkpoint,
     sample_batch,
@@ -42,7 +43,7 @@ class Config:
     rope_base: float = 10000.0
     batch_size: int = 512
     seq_len: int = 256
-    steps: int = 100_000
+    steps: int = 50000
     warmup_steps: int = 2000
     lr_init: float = 1e-6
     lr_peak: float = 3e-4
@@ -288,14 +289,14 @@ def main():
         int(x.size) for x in jax.tree.leaves(params) if isinstance(x, jnp.ndarray)
     )
 
-    wd_mask = jax.tree.map(
-        lambda x: (
-            isinstance(x, jnp.ndarray)
-            and jnp.issubdtype(x.dtype, jnp.floating)
-            and x.ndim >= 2
-        ),
-        params,
-    )
+    def decay_mask_from_params(params):
+        def is_decay_leaf(x):
+            return isinstance(x, jnp.ndarray) and x.ndim >= 2
+
+        return jax.tree.map(is_decay_leaf, params)
+
+    wd_mask = decay_mask_from_params(params) if config.weight_decay > 0 else None
+
     lr_schedule = optax.warmup_cosine_decay_schedule(
         init_value=config.lr_init,
         peak_value=config.lr_peak,
@@ -305,11 +306,13 @@ def main():
     )
     optimizer = optax.chain(
         optax.clip_by_global_norm(config.grad_clip),
-        optax.adam(lr_schedule, b1=0.9, b2=0.95, eps=1e-8),
-        (
-            optax.add_decayed_weights(config.weight_decay, mask=wd_mask)
-            if config.weight_decay > 0
-            else optax.identity()
+        optax.adamw(
+            learning_rate=lr_schedule,
+            b1=0.9,
+            b2=0.95,
+            eps=1e-8,
+            weight_decay=config.weight_decay,
+            mask=wd_mask,
         ),
     )
 
@@ -395,9 +398,8 @@ def main():
             )
 
         if step % config.save_every == 0:
-            ckpt_dir = Path(config.ckpt_dir)
             save_checkpoint(
-                ckpt_dir,
+                Path(config.ckpt_dir),
                 run_name,
                 step,
                 train_state.params,

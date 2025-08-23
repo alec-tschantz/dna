@@ -9,21 +9,21 @@ description = "Distributed Neural Architectures (DNA)"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Alexander Tschantz" }]
+
 dependencies = [
   "jax[cuda12]",
   "jaxlib",
   "equinox",
   "jaxtyping",
-  "typeguard",
   "optax",
   "tyro",
   "wandb[mediapy]",
-  "mediapy",
   "datasets",
   "transformers",
   "huggingface_hub[hf_xet]",
   "numpy",
-  "plotly",
-  "rich"
 ]
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["dna*"]

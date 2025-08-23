@@ -11,6 +11,36 @@ BF16 = jnp.bfloat16
 FP32 = jnp.float32
 
 
+def rope_angles(
+    seq_len: int, dim: int, base: float = 10000.0
+) -> Tuple[Float[Array, "T D"], Float[Array, "T D"]]:
+    half = dim // 2
+    pos = jnp.arange(seq_len, dtype=FP32)[:, None]
+    idx = jnp.arange(half, dtype=FP32)[None, :]
+    theta = base ** (-idx / half)
+    angles = pos * theta
+    cos = jnp.cos(angles)
+    sin = jnp.sin(angles)
+    cos = jnp.repeat(cos, 2, axis=1)
+    sin = jnp.repeat(sin, 2, axis=1)
+    return cos, sin
+
+
+def _rotate_half(x: Float[Array, "... D"]):
+    half = x.shape[-1] // 2
+    x1, x2 = jnp.split(x, 2, axis=-1)
+    return jnp.concatenate((-x2, x1), axis=-1)
+
+
+def apply_rope(
+    x: Float[Array, "B T N H"], cos: Float[Array, "T H"], sin: Float[Array, "T H"]
+) -> Float[Array, "B T N H"]:
+    B, T, N, H = x.shape
+    x_flat = x.reshape(B * N, T, H)
+    x_rotated = x_flat * cos[None, :, :] + _rotate_half(x_flat) * sin[None, :, :]
+    return x_rotated.reshape(B, T, N, H)
+
+
 class Linear(eqx.Module):
     weight: Float[Array, "in_dim out_dim"]
 
@@ -69,36 +99,6 @@ class Dropout(eqx.Module):
         return jnp.where(
             mask, x / jnp.array(keep_prob, dtype=x.dtype), jnp.zeros_like(x)
         )
-
-
-def rope_angles(
-    seq_len: int, dim: int, base: float = 10000.0
-) -> Tuple[Float[Array, "T D"], Float[Array, "T D"]]:
-    half = dim // 2
-    pos = jnp.arange(seq_len, dtype=FP32)[:, None]
-    idx = jnp.arange(half, dtype=FP32)[None, :]
-    theta = base ** (-idx / half)
-    angles = pos * theta
-    cos = jnp.cos(angles)
-    sin = jnp.sin(angles)
-    cos = jnp.repeat(cos, 2, axis=1)
-    sin = jnp.repeat(sin, 2, axis=1)
-    return cos, sin
-
-
-def _rotate_half(x: Float[Array, "... D"]):
-    half = x.shape[-1] // 2
-    x1, x2 = jnp.split(x, 2, axis=-1)
-    return jnp.concatenate((-x2, x1), axis=-1)
-
-
-def apply_rope(
-    x: Float[Array, "B T N H"], cos: Float[Array, "T H"], sin: Float[Array, "T H"]
-) -> Float[Array, "B T N H"]:
-    B, T, N, H = x.shape
-    x_flat = x.reshape(B * N, T, H)
-    x_rotated = x_flat * cos[None, :, :] + _rotate_half(x_flat) * sin[None, :, :]
-    return x_rotated.reshape(B, T, N, H)
 
 
 class FeedForward(eqx.Module):

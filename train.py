@@ -39,6 +39,8 @@ class Config:
     # dataset
     dataset_name: str = "roneneldan/TinyStories"
     dataset_config: Optional[str] = None
+    pack_sequences: bool = False
+    tokenizer_name: str = "gpt2"
     vocab_size: int = 50257
     seq_len: int = 256
 
@@ -52,8 +54,8 @@ class Config:
 
     # optimization
     batch_size: int = 1024
-    steps: int = 2068
-    warmup_steps: int = 120
+    steps: int = 10_000
+    warmup_steps: int = 500
     lr_init: float = 1e-6
     lr_peak: float = 3e-4
     lr_end: float = 1e-5
@@ -276,12 +278,13 @@ def main():
     assert config.batch_size % num_devices == 0
     assert config.seq_len % 4 == 0
 
-    tokenizer = setup_tokenizer()
+    tokenizer = setup_tokenizer(config.tokenizer_name)
     train_stream, val_stream = setup_data_streams(
         dataset_name=config.dataset_name,
         dataset_config=config.dataset_config,
         seq_len=config.seq_len,
         tokenizer=tokenizer,
+        pack_sequences=config.pack_sequences,
     )
 
     host_key, model_key = random.split(host_key)
@@ -333,14 +336,7 @@ def main():
 
     if config.run_name is None:
         ds_name = config.dataset_name.split("/")[-1]
-        run_name = (
-            f"transformer_{config.n_layers}l_"
-            f"{config.d_model}d_"
-            f"{config.n_heads}h_"
-            f"seq{config.seq_len}_"
-            f"bs{config.batch_size}_"
-            f"{ds_name}"
-        )
+        run_name = f"transformer_{config.n_layers}l_{config.d_model}d_{config.n_heads}h_seq{config.seq_len}_bs{config.batch_size}_{ds_name}"
     else:
         run_name = config.run_name
 
@@ -395,14 +391,7 @@ def main():
             if run:
                 wandb.log(log_data, step=step)
             print(
-                f"Step {step:>6d} | "
-                f"loss {float(loss):.4f} | "
-                f"acc {float(aux['accuracy']):.4f} | "
-                f"ppl {float(aux['perplexity']):.2f}\n"
-                f"lr {lr:.3e} | "
-                f"grad_norm {float(aux['grad_norm']):.3e} | "
-                f"time {elapsed:.2f}s | "
-                f"tokens/sec {log_data['train/tokens_per_sec']:.2f}"
+                f"Step {step:>6d} | loss {float(loss):.4f} | acc {float(aux['accuracy']):.4f} | ppl {float(aux['perplexity']):.2f} | lr {lr:.3e} | grad_norm {float(aux['grad_norm']):.3e} | time {elapsed:.2f}s | tokens/sec {log_data['train/tokens_per_sec']:.2f}"
             )
 
         if step % config.eval_every == 0:
@@ -420,10 +409,7 @@ def main():
             if run:
                 wandb.log({f"eval/{k}": v for k, v in eval_metrics.items()}, step=step)
             print(
-                f"[Eval @ step {step}] "
-                f"loss {eval_metrics['loss']:.4f} | "
-                f"acc {eval_metrics['accuracy']:.4f} | "
-                f"ppl {eval_metrics['perplexity']:.2f}"
+                f"[Eval @ step {step}] loss {eval_metrics['loss']:.4f} | acc {eval_metrics['accuracy']:.4f} | ppl {eval_metrics['perplexity']:.2f}"
             )
 
         if step % config.save_every == 0:

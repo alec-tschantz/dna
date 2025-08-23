@@ -34,31 +34,41 @@ jax_config.update("jax_default_matmul_precision", "tensorfloat32")
 
 @dataclass
 class Config:
+    seed: int = 0
+
+    # dataset
+    dataset_name: str = "roneneldan/TinyStories"
+    dataset_config: Optional[str] = None
     vocab_size: int = 50257
-    d_model: int = 1024
-    n_layers: int = 16
-    n_heads: int = 16
+    seq_len: int = 256
+
+    # model
+    d_model: int = 256
+    n_layers: int = 12
+    n_heads: int = 8
     ff_mult: int = 4
     dropout: float = 0.1
     rope_base: float = 10000.0
-    batch_size: int = 512
-    seq_len: int = 256
-    steps: int = 50000
-    warmup_steps: int = 2000
+
+    # optimization
+    batch_size: int = 1024
+    steps: int = 2068
+    warmup_steps: int = 120
     lr_init: float = 1e-6
     lr_peak: float = 3e-4
     lr_end: float = 1e-5
     weight_decay: float = 0.1
     grad_clip: float = 1.0
-    dataset_name: str = "roneneldan/TinyStories"
-    dataset_config: Optional[str] = None
-    n_eval_batches: int = 16
-    eval_every: int = 500
-    log_every: int = 50
-    save_every: int = 10000
-    gen_max_new: int = 200
+
+    # eval / logging
+    n_eval_batches: int = 32
+    eval_every: int = 100
+    log_every: int = 20
+    save_every: int = 1000
+
+    gen_max_new: int = 256
     gen_temperature: float = 0.8
-    seed: int = 0
+
     ckpt_dir: str = "checkpoints"
     wandb_project: Optional[str] = None
     run_name: Optional[str] = None
@@ -258,11 +268,13 @@ def evaluate(
 
 def main():
     config = tyro.cli(Config)
-    assert config.seq_len % 4 == 0
     host_key = random.PRNGKey(config.seed)
     mesh = create_mesh()
     num_devices = mesh.devices.size
+
+    assert (config.d_model // config.n_heads) % 2 == 0
     assert config.batch_size % num_devices == 0
+    assert config.seq_len % 4 == 0
 
     tokenizer = setup_tokenizer()
     train_stream, val_stream = setup_data_streams(
@@ -398,8 +410,9 @@ def main():
             )
 
         if step % config.save_every == 0:
+            ckpt_dir = Path(config.ckpt_dir)
             save_checkpoint(
-                Path(config.ckpt_dir),
+                ckpt_dir,
                 run_name,
                 step,
                 train_state.params,

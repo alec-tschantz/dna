@@ -42,30 +42,26 @@ def apply_rope(
 
 
 class Linear(eqx.Module):
-    weight: Float[Array, "in_dim out_dim"]
+    weight: Float[Array, "in_dim out_dim"]  # FP32
 
-    def __init__(self, in_dim: int, out_dim: int, *, key: jax.Array):
-        w = jax.random.truncated_normal(
-            key, lower=-2.0, upper=2.0, shape=(in_dim, out_dim)
-        )
-        self.weight = (w * 0.02).astype(BF16)
+    def __init__(self, in_dim, out_dim, *, key):
+        w = jax.random.truncated_normal(key, -2.0, 2.0, (in_dim, out_dim)) * 0.02
+        self.weight = w.astype(FP32)
 
-    def __call__(self, x: Float[Array, "... in_dim"]) -> Float[Array, "... out_dim"]:
-        y = jnp.matmul(x.astype(FP32), self.weight.astype(FP32))
+    def __call__(self, x):
+        y = jnp.matmul(x.astype(BF16), self.weight.astype(BF16))
         return y.astype(BF16)
 
 
 class Embedding(eqx.Module):
-    weight: Float[Array, "V D"]
+    weight: Float[Array, "V D"]  # FP32
 
-    def __init__(self, vocab_size: int, dim: int, *, key: jax.Array):
-        w = jax.random.truncated_normal(
-            key, lower=-2.0, upper=2.0, shape=(vocab_size, dim)
-        )
-        self.weight = (w * 0.02).astype(BF16)
+    def __init__(self, vocab_size, dim, *, key):
+        w = jax.random.truncated_normal(key, -2.0, 2.0, (vocab_size, dim)) * 0.02
+        self.weight = w.astype(FP32)
 
-    def __call__(self, ids: Int[Array, "B T"]) -> Float[Array, "B T D"]:
-        return jnp.take(self.weight, ids, axis=0).astype(BF16)
+    def __call__(self, ids):
+        return jnp.take(self.weight.astype(BF16), ids, axis=0)
 
 
 class RMSNorm(eqx.Module):
@@ -172,14 +168,7 @@ class Attention(eqx.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        attn_mask = None
-        if mask is not None:
-            mask_bool = mask.astype(bool)
-            pad_mask = mask_bool[:, None, :] & mask_bool[:, :, None]
-            pad_mask = pad_mask | jnp.eye(T, dtype=bool)[None, :, :]
-            pad_mask = pad_mask[:, None, :, :]
-            attn_mask = pad_mask
-
+        attn_mask = None if mask is None else mask.astype(bool)[:, None, None, :]
         attn_out = jax.nn.dot_product_attention(
             query=q,
             key=k,

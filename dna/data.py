@@ -19,18 +19,8 @@ def _find_text_column(ds: IterableDataset) -> str:
     """
     # Prefer using declared features when available (doesn't consume the iterator)
     if getattr(ds, "features", None):
-        preferred = [
-            "text",
-            "content",
-            "document",
-            "passage",
-            "article",
-            "story",
-            "body",
-        ]
-        string_cols = [
-            k for k, v in ds.features.items() if getattr(v, "dtype", None) == "string"
-        ]
+        preferred = ["text", "content", "document", "passage", "article", "story", "body"]
+        string_cols = [k for k, v in ds.features.items() if getattr(v, "dtype", None) == "string"]
         for p in preferred:
             if p in string_cols:
                 return p
@@ -47,15 +37,12 @@ def _find_text_column(ds: IterableDataset) -> str:
         if isinstance(v, str):
             return k
 
-    raise ValueError(
-        f"Could not find a text column. Sample keys: {list(sample.keys())}"
-    )
+    raise ValueError(f"Could not find a text column. Sample keys: {list(sample.keys())}")
 
 
 # ---- Sequence packing buffer --------------------------------------------------
 class PackedSequenceBuffer:
     """Accumulates token ids and emits fixed-length sequences without padding."""
-
     def __init__(self, seq_len: int, pad_id: int):
         self.seq_len = seq_len
         self.pad_id = pad_id
@@ -98,7 +85,6 @@ class DataStream:
       - optional cross-document packing without padding (pack_sequences=True)
     Multi-process compatible via upstream .shard().
     """
-
     def __init__(
         self,
         dataset: IterableDataset,
@@ -119,9 +105,7 @@ class DataStream:
         self.eos_id = tokenizer.eos_token_id or self.pad_id
 
         if self.pad_id is None or self.eos_id is None:
-            raise ValueError(
-                "Tokenizer must define either pad_token_id or eos_token_id."
-            )
+            raise ValueError("Tokenizer must define either pad_token_id or eos_token_id.")
 
         if pack_sequences:
             self.pack_buffer = PackedSequenceBuffer(self.seq_len, self.pad_id)
@@ -211,9 +195,7 @@ def setup_tokenizer(
     lets other processes wait until it's ready. Ensures pad_token exists.
     """
     if cache_dir is None:
-        cache_dir = os.environ.get(
-            "HF_HOME", os.path.expanduser("~/.cache/huggingface")
-        )
+        cache_dir = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 
     cache_path = Path(cache_dir)
     tok_dir = cache_path / "tokenizers" / tokenizer_name.replace("/", "__")
@@ -222,9 +204,7 @@ def setup_tokenizer(
 
     if jax.process_index() == 0:
         if not sentinel.exists():
-            tok = AutoTokenizer.from_pretrained(
-                tokenizer_name, cache_dir=str(cache_path)
-            )
+            tok = AutoTokenizer.from_pretrained(tokenizer_name, cache_dir=str(cache_path))
             if tok.pad_token is None:
                 tok.pad_token = tok.eos_token
             tok.save_pretrained(str(tok_dir))
@@ -252,7 +232,7 @@ def _load_streaming_split(
     shuffle_buffer: int,
 ) -> IterableDataset:
     ds = load_dataset(
-        dataset_name,
+        dataset_name, 
         name=dataset_config,
         split=split,
         streaming=True,
@@ -285,40 +265,15 @@ def setup_data_streams(
     shuffle_buffer = int(os.environ.get("SHUFFLE_BUFFER", "50000"))
 
     # Try to open a validation split; fall back gracefully
-    train_ds = _load_streaming_split(
-        dataset_name, dataset_config, "train", cache_dir, seed, shuffle_buffer
-    )
+    train_ds = _load_streaming_split(dataset_name, dataset_config, "train", cache_dir, seed, shuffle_buffer)
     try:
-        val_ds = _load_streaming_split(
-            dataset_name,
-            dataset_config,
-            "validation",
-            cache_dir,
-            seed + 1,
-            shuffle_buffer,
-        )
+        val_ds = _load_streaming_split(dataset_name, dataset_config, "validation", cache_dir, seed + 1, shuffle_buffer)
     except Exception:
         try:
-            val_ds = _load_streaming_split(
-                dataset_name,
-                dataset_config,
-                "test",
-                cache_dir,
-                seed + 1,
-                shuffle_buffer,
-            )
+            val_ds = _load_streaming_split(dataset_name, dataset_config, "test", cache_dir, seed + 1, shuffle_buffer)
         except Exception:
-            print(
-                f"[data] No validation/test split for {dataset_name}; using an independent train stream for eval."
-            )
-            val_ds = _load_streaming_split(
-                dataset_name,
-                dataset_config,
-                "train",
-                cache_dir,
-                seed + 1,
-                shuffle_buffer,
-            )
+            print(f"[data] No validation/test split for {dataset_name}; using an independent train stream for eval.")
+            val_ds = _load_streaming_split(dataset_name, dataset_config, "train", cache_dir, seed + 1, shuffle_buffer)
 
     # Detect text column once (on train split)
     text_col = _find_text_column(train_ds)

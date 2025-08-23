@@ -31,7 +31,6 @@ from dna import (
 
 jax_config.update("jax_default_matmul_precision", "tensorfloat32")
 
-
 @dataclass
 class Config:
     seed: int = 0
@@ -39,19 +38,19 @@ class Config:
     # dataset
     dataset_name: str = "roneneldan/TinyStories"
     dataset_config: Optional[str] = None
-    pack_sequences: bool = False
-    tokenizer_name: str = "gpt2"
+    pack_sequences: bool = False  
+    tokenizer_name: str = "gpt2"  
     vocab_size: int = 50257
     seq_len: int = 256
 
-    # model
+    # model 
     d_model: int = 256
     n_layers: int = 12
     n_heads: int = 8
     ff_mult: int = 4
     dropout: float = 0.1
     rope_base: float = 10000.0
-
+    
     # optimization
     batch_size: int = 1024
     steps: int = 10_000
@@ -61,16 +60,16 @@ class Config:
     lr_end: float = 1e-5
     weight_decay: float = 0.1
     grad_clip: float = 1.0
-
-    # eval / logging
+    
+    # eval / logging
     n_eval_batches: int = 32
     eval_every: int = 100
     log_every: int = 20
     save_every: int = 1000
-
+    
     gen_max_new: int = 256
     gen_temperature: float = 0.8
-
+    
     ckpt_dir: str = "checkpoints"
     wandb_project: Optional[str] = None
     run_name: Optional[str] = None
@@ -88,29 +87,23 @@ class Config:
         ]
     )
 
-
 class TrainState(NamedTuple):
     params: Any
     opt_state: Any
     key: Array
 
-
 def create_mesh(num_devices: Optional[int] = None) -> Mesh:
     devs = jax.devices()
     if num_devices is not None:
-        devs = devs[:num_devices]
+        devs = devs[: num_devices]
     mesh = Mesh(mesh_utils.create_device_mesh((len(devs),), devices=devs), ("data",))
     return mesh
-
 
 def shard_batch(batch_np: Dict[str, np.ndarray], mesh: Mesh) -> Dict[str, Array]:
     data_shard = NamedSharding(mesh, P("data", None))
     ids = jax.device_put(jnp.array(batch_np["input_ids"], dtype=jnp.int32), data_shard)
-    mask = jax.device_put(
-        jnp.array(batch_np["attention_mask"], dtype=jnp.bool_), data_shard
-    )
+    mask = jax.device_put(jnp.array(batch_np["attention_mask"], dtype=jnp.bool_), data_shard)
     return {"input_ids": ids, "attention_mask": mask}
-
 
 def _loss_on_shard(
     params: Any,
@@ -126,8 +119,8 @@ def _loss_on_shard(
     logits_next = logits[:, :-1]
     target_ids = ids[:, 1:]
     mask_next = mask[:, 1:].astype(jnp.float32)
-    loss_per_token: Float[Array, "B T-1"] = (
-        optax.softmax_cross_entropy_with_integer_labels(logits_next, target_ids)
+    loss_per_token: Float[Array, "B T-1"] = optax.softmax_cross_entropy_with_integer_labels(
+        logits_next, target_ids
     )
     token_loss_sum = (loss_per_token * mask_next).sum()
     predictions = jnp.argmax(logits_next, axis=-1)
@@ -135,20 +128,11 @@ def _loss_on_shard(
     n_correct = ((predictions == target_ids) * mask_next).sum()
     return token_loss_sum, {"n_tokens": n_tokens, "n_correct": n_correct}
 
-
 def build_train_step(optim: optax.GradientTransformation, mesh: Mesh, static: Any):
     def loss_fn(params, ids, mask, key):
         return _loss_on_shard(params, static, ids, mask, key, inference=False)
-
     loss_and_grad = eqx.filter_value_and_grad(loss_fn, has_aux=True)
-    aux_pspec = {
-        "n_tokens": P(),
-        "n_correct": P(),
-        "accuracy": P(),
-        "perplexity": P(),
-        "grad_norm": P(),
-    }
-
+    aux_pspec = {"n_tokens": P(), "n_correct": P(), "accuracy": P(), "perplexity": P(), "grad_norm": P()}
     @partial(jax.jit, donate_argnums=(0, 1, 2))
     @partial(
         shard_map,
@@ -159,9 +143,7 @@ def build_train_step(optim: optax.GradientTransformation, mesh: Mesh, static: An
     def train_step(state: TrainState, ids: Int[Array, "B T"], mask: Bool[Array, "B T"]):
         key, new_key = random.split(state.key)
         shard_key = random.fold_in(key, lax.axis_index("data"))
-        (loss_sum_shard, aux_shard), grads_shard = loss_and_grad(
-            state.params, ids, mask, shard_key
-        )
+        (loss_sum_shard, aux_shard), grads_shard = loss_and_grad(state.params, ids, mask, shard_key)
         grads_sum = jax.tree.map(lambda g: lax.psum(g, "data"), grads_shard)
         loss_sum = lax.psum(loss_sum_shard, "data")
         n_tokens = lax.psum(aux_shard["n_tokens"], "data")
@@ -181,13 +163,10 @@ def build_train_step(optim: optax.GradientTransformation, mesh: Mesh, static: An
             "grad_norm": grad_norm,
         }
         return new_state, loss_mean, aux_out
-
     return train_step
-
 
 def build_eval_step(mesh: Mesh, static: Any):
     aux_pspec = {"n_tokens": P(), "n_correct": P(), "accuracy": P(), "perplexity": P()}
-
     @partial(jax.jit)
     @partial(
         shard_map,
@@ -195,13 +174,9 @@ def build_eval_step(mesh: Mesh, static: Any):
         in_specs=(P(), P("data", None), P("data", None), P()),
         out_specs=(P(), aux_pspec),
     )
-    def eval_step(
-        params: Any, ids: Int[Array, "B T"], mask: Bool[Array, "B T"], key: Array
-    ):
+    def eval_step(params: Any, ids: Int[Array, "B T"], mask: Bool[Array, "B T"], key: Array):
         shard_key = random.fold_in(key, lax.axis_index("data"))
-        loss_sum_shard, aux_shard = _loss_on_shard(
-            params, static, ids, mask, shard_key, inference=True
-        )
+        loss_sum_shard, aux_shard = _loss_on_shard(params, static, ids, mask, shard_key, inference=True)
         n_tokens = lax.psum(aux_shard["n_tokens"], "data")
         n_correct = lax.psum(aux_shard["n_correct"], "data")
         loss_sum = lax.psum(loss_sum_shard, "data")
@@ -213,9 +188,7 @@ def build_eval_step(mesh: Mesh, static: Any):
             "perplexity": jnp.exp(loss_mean),
         }
         return loss_mean, aux_out
-
     return eval_step
-
 
 def evaluate(
     params: Any,
@@ -237,9 +210,7 @@ def evaluate(
         batch = shard_batch(batch_np, mesh)
         key, subkey = random.split(key)
         subkey_dev = jax.device_put(subkey, rep)
-        loss, aux = eval_step(
-            params, batch["input_ids"], batch["attention_mask"], subkey_dev
-        )
+        loss, aux = eval_step(params, batch["input_ids"], batch["attention_mask"], subkey_dev)
         loss, aux = jax.device_get((loss, aux))
         total_loss += float(loss) * float(aux["n_tokens"])
         total_tokens += float(aux["n_tokens"])
@@ -248,25 +219,15 @@ def evaluate(
     avg_acc = total_correct / max(total_tokens, 1.0)
     key, subkey = random.split(key)
     generated = generate(
-        params,
-        static,
-        tokenizer,
-        config.eval_prompts,
-        subkey,
-        max_new=config.gen_max_new,
-        temperature=config.gen_temperature,
+        params, static, tokenizer, config.eval_prompts, subkey,
+        max_new=config.gen_max_new, temperature=config.gen_temperature
     )
     print("\n" + "=" * 80)
     print("Generated text samples:")
     for prompt, text in zip(config.eval_prompts, generated):
         print(f"Prompt: {prompt}\n→ {text}\n")
     print("=" * 80 + "\n")
-    return {
-        "loss": avg_loss,
-        "accuracy": avg_acc,
-        "perplexity": float(np.exp(avg_loss)),
-    }
-
+    return {"loss": avg_loss, "accuracy": avg_acc, "perplexity": float(np.exp(avg_loss))}
 
 def main():
     config = tyro.cli(Config)
@@ -284,9 +245,9 @@ def main():
         dataset_config=config.dataset_config,
         seq_len=config.seq_len,
         tokenizer=tokenizer,
-        pack_sequences=config.pack_sequences,
+        pack_sequences=config.pack_sequences, 
     )
-
+    
     host_key, model_key = random.split(host_key)
     model = Transformer(
         vocab_size=config.vocab_size,
@@ -300,18 +261,15 @@ def main():
     )
     eqx.tree_pprint(model)
     params, static = eqx.partition(model, eqx.is_inexact_array)
-    n_params = sum(
-        int(x.size) for x in jax.tree.leaves(params) if isinstance(x, jnp.ndarray)
-    )
-
+    n_params = sum(int(x.size) for x in jax.tree.leaves(params) if isinstance(x, jnp.ndarray))
+    
     def decay_mask_from_params(params):
         def is_decay_leaf(x):
             return isinstance(x, jnp.ndarray) and x.ndim >= 2
-
         return jax.tree.map(is_decay_leaf, params)
 
     wd_mask = decay_mask_from_params(params) if config.weight_decay > 0 else None
-
+        
     lr_schedule = optax.warmup_cosine_decay_schedule(
         init_value=config.lr_init,
         peak_value=config.lr_peak,
@@ -323,57 +281,47 @@ def main():
         optax.clip_by_global_norm(config.grad_clip),
         optax.adamw(
             learning_rate=lr_schedule,
-            b1=0.9,
-            b2=0.95,
-            eps=1e-8,
+            b1=0.9, b2=0.95, eps=1e-8,
             weight_decay=config.weight_decay,
             mask=wd_mask,
         ),
     )
-
+    
     mesh_sharding = NamedSharding(mesh, P())
     start_step = 1
-
+    
     if config.run_name is None:
         ds_name = config.dataset_name.split("/")[-1]
         run_name = f"transformer_{config.n_layers}l_{config.d_model}d_{config.n_heads}h_seq{config.seq_len}_bs{config.batch_size}_{ds_name}"
     else:
         run_name = config.run_name
-
+    
     if config.resume_from:
-        (params, static), opt_state, loaded_step = load_checkpoint(
-            Path(config.ckpt_dir), config.resume_from, model, optimizer
-        )
+        (params, static), opt_state, loaded_step = load_checkpoint(Path(config.ckpt_dir), config.resume_from, model, optimizer)
         start_step = int(loaded_step) + 1
     else:
         opt_state = optimizer.init(params)
-
+    
     params = jax.device_put(params, mesh_sharding)
     static = jax.device_put(static, mesh_sharding)
     opt_state = jax.device_put(opt_state, mesh_sharding)
     host_key, train_key = random.split(host_key)
-    train_state = TrainState(
-        params=params, opt_state=opt_state, key=jax.device_put(train_key, mesh_sharding)
-    )
-
+    train_state = TrainState(params=params, opt_state=opt_state, key=jax.device_put(train_key, mesh_sharding))
+    
     train_step = build_train_step(optimizer, mesh, static)
     eval_step = build_eval_step(mesh, static)
-
+    
     run = None
     if config.wandb_project:
-        run = wandb.init(
-            project=config.wandb_project, name=run_name, config=asdict(config)
-        )
+        run = wandb.init(project=config.wandb_project, name=run_name, config=asdict(config))
         wandb.log({"params/num_parameters": n_params}, step=0)
-
+    
     for step in range(start_step, config.steps + 1):
         t_start = time.perf_counter()
         batch_np = sample_batch(train_stream, config.batch_size)
         batch = shard_batch(batch_np, mesh)
-        train_state, loss, aux = train_step(
-            train_state, batch["input_ids"], batch["attention_mask"]
-        )
-
+        train_state, loss, aux = train_step(train_state, batch["input_ids"], batch["attention_mask"])
+        
         if step % config.log_every == 0:
             elapsed = time.perf_counter() - t_start
             tokens = float(aux["n_tokens"])
@@ -390,43 +338,21 @@ def main():
             }
             if run:
                 wandb.log(log_data, step=step)
-            print(
-                f"Step {step:>6d} | loss {float(loss):.4f} | acc {float(aux['accuracy']):.4f} | ppl {float(aux['perplexity']):.2f} | lr {lr:.3e} | grad_norm {float(aux['grad_norm']):.3e} | time {elapsed:.2f}s | tokens/sec {log_data['train/tokens_per_sec']:.2f}"
-            )
-
+            print(f"Step {step:>6d} | loss {float(loss):.4f} | acc {float(aux['accuracy']):.4f} | ppl {float(aux['perplexity']):.2f} | lr {lr:.3e} | grad_norm {float(aux['grad_norm']):.3e} | time {elapsed:.2f}s | tokens/sec {log_data['train/tokens_per_sec']:.2f}")
+        
         if step % config.eval_every == 0:
             host_key, eval_key = random.split(host_key)
-            eval_metrics = evaluate(
-                train_state.params,
-                static,
-                eval_step,
-                val_stream,
-                tokenizer,
-                config,
-                eval_key,
-                mesh,
-            )
+            eval_metrics = evaluate(train_state.params, static, eval_step, val_stream, tokenizer, config, eval_key, mesh)
             if run:
                 wandb.log({f"eval/{k}": v for k, v in eval_metrics.items()}, step=step)
-            print(
-                f"[Eval @ step {step}] loss {eval_metrics['loss']:.4f} | acc {eval_metrics['accuracy']:.4f} | ppl {eval_metrics['perplexity']:.2f}"
-            )
-
+            print(f"[Eval @ step {step}] loss {eval_metrics['loss']:.4f} | acc {eval_metrics['accuracy']:.4f} | ppl {eval_metrics['perplexity']:.2f}")
+        
         if step % config.save_every == 0:
             ckpt_dir = Path(config.ckpt_dir)
-            save_checkpoint(
-                ckpt_dir,
-                run_name,
-                step,
-                train_state.params,
-                static,
-                train_state.opt_state,
-                config,
-            )
-
+            save_checkpoint(ckpt_dir, run_name, step, train_state.params, static, train_state.opt_state, config)
+    
     if run:
         wandb.finish()
-
 
 if __name__ == "__main__":
     main()

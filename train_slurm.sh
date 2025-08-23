@@ -6,7 +6,7 @@
 # ---- request exactly 1 node with 8 GPUs ----
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:8              
+#SBATCH --gres=gpu:8             
 #SBATCH --cpus-per-task=16        
 #SBATCH --time=1-00:00:00
 

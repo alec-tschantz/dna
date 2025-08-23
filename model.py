@@ -28,7 +28,7 @@ class Linear(eqx.Module):
         self.weight = (w * 0.02).astype(bf16)
 
     def __call__(self, x: Float[Array, "... in"]) -> Float[Array, "... out"]:
-        # Compute in fp32 for stability/throughput, cast back to bf16
+        # # Compute in fp32 for stability/throughput, cast back to bf16
         y32 = jnp.matmul(x.astype(f32), self.weight.astype(f32))
         return y32.astype(bf16)
 
@@ -78,17 +78,15 @@ class Dropout(eqx.Module):
 
 
 # ----------------- rope -----------------
-def rope_cos_sin(
-    T: int, dim: int, base: float = 10_000.0
-) -> Tuple[Float[Array, "T dim"], Float[Array, "T dim"]]:
+def rope_cos_sin(T: int, dim: int, base: float = 10_000.0):
     assert dim % 2 == 0
-    pos = jnp.arange(T, dtype=f32)[:, None]
-    idx = jnp.arange(0, dim, 2, dtype=f32)[None]
+    pos = jnp.arange(T, dtype=jnp.float32)[:, None]
+    idx = jnp.arange(0, dim, 2, dtype=jnp.float32)[None]
     inv = base ** (-idx / dim)
     ang = pos * inv
     cos = jnp.repeat(jnp.cos(ang), 2, axis=1)
     sin = jnp.repeat(jnp.sin(ang), 2, axis=1)
-    return cos.astype(bf16), sin.astype(bf16)
+    return cos, sin  # keep fp32; cast inside Attention when needed
 
 
 def _rotate_half(x: Float[Array, "... h"]) -> Float[Array, "... h"]:
@@ -171,37 +169,42 @@ class Attention(eqx.Module):
         k1, k2 = jax.random.split(key)
         T, D = x.shape
 
-        # Project to qkv and reshape -> (T, 3, N, H)
-        qkv = self.qkv(x).astype(bf16)
+        # Project to qkv (keep bf16 storage but upcast for attention math)
+        qkv = self.qkv(x).astype(jnp.float32)  # <— fp32 here
         qkv = qkv.reshape(T, 3, self.n_heads, self.d_head)
-        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # (T, N, H) TNH
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # (T, N, H)
 
-        # RoPE (TNH)
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+        # RoPE in fp32 as well
+        q = apply_rope(
+            q.astype(jnp.float32), cos.astype(jnp.float32), sin.astype(jnp.float32)
+        )
+        k = apply_rope(
+            k.astype(jnp.float32), cos.astype(jnp.float32), sin.astype(jnp.float32)
+        )
+        v = v.astype(jnp.float32)
 
-        # Build (N, T, T) bool mask for TNH. Causality via is_causal=True.
+        # Build (N, T, T) boolean mask. Add a safety “at least self” guard
         attn_mask = None
         if mask is not None:
-            m = mask.astype(jnp.bool_)
-            pad2d = m[:, None] & m[None, :]  # (T, T) bool
-            attn_mask = jnp.broadcast_to(pad2d, (self.n_heads, T, T))  # (N, T, T)
+            m = mask.astype(bool)  # (T,)
+            pad2d = m[:, None] & m[None, :]  # (T, T)
+            pad2d = pad2d | jnp.eye(T, dtype=bool)  # <— guarantee non-empty rows
+            attn_mask = jnp.broadcast_to(pad2d, (self.n_heads, T, T))
 
-        # Flash attention path: q/k/v must be bf16/f16; mask must be bool
+        # Use the default (XLA) path; no fused/cuDNN kernel
         out = jax.nn.dot_product_attention(
             query=q,
             key=k,
             value=v,
-            mask=attn_mask,  # (N, T, T) or None
+            mask=attn_mask,
             is_causal=True,
-            implementation="cudnn",
-        )  # -> (T, N, H)
+            # implementation="cudnn",                     # <— key change
+        )  # (T, N, H) fp32
 
-        # Merge heads -> (T, D), proj + dropout
-        out = out.reshape(T, D).astype(bf16)
-        out = self.out(out).astype(bf16)
+        out = out.reshape(T, D).astype(jnp.float32)
+        out = self.out(out).astype(jnp.bfloat16)
         out = self.drop(out, key=k2, inference=inference)
-        return out.astype(bf16)
+        return out.astype(jnp.bfloat16)
 
 
 class TransformerBlock(eqx.Module):

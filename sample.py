@@ -15,6 +15,7 @@ from dna import Transformer, generate, setup_tokenizer
 @dataclass
 class SampleConfig:
     ckpt_dir: str = "checkpoints"
+    tokenizer_name: str = "gpt2"
     run_name: str = field(default="", help="Name of the run to load checkpoint from")
     prompts: List[str] = field(
         default_factory=lambda: [
@@ -56,7 +57,7 @@ def main():
     model_loaded = eqx.tree_deserialise_leaves(run_dir / "model.eqx", model_template)
     params, static = eqx.partition(model_loaded, eqx.is_inexact_array)
 
-    tokenizer = setup_tokenizer()
+    tokenizer = setup_tokenizer(config.tokenizer_name)
 
     key = random.PRNGKey(0)
     outputs = generate(

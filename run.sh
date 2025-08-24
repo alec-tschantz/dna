@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=16
-#SBATCH --time=1-00:00:00
+#SBATCH --time=8-00:00:00
 
 set -euo pipefail
 echo "Running on $(hostname)"
@@ -18,4 +18,4 @@ export TF_CPP_MIN_LOG_LEVEL=1
 export TOKENIZERS_PARALLELISM=false
 
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
-python -u train.py --wandb_project "fineweb-edu" --run_name "fineweb-edu"
+python -u train.py --wandb_project "fineweb-edu" --run_name "fineweb-edu-xl"

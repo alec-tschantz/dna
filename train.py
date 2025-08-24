@@ -51,7 +51,7 @@ class Config:
     dropout: float = 0.0
     rope_base: float = 10000.0
 
-    batch_size: int = 192
+    batch_size: int = 256
     steps: int = 120_000
     warmup_steps: int = 2_000
     lr_init: float = 1e-7

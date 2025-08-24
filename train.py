@@ -51,13 +51,13 @@ class Config:
     dropout: float = 0.0
     rope_base: float = 10000.0
 
-    batch_size: int = 256
+    batch_size: int = 512
     steps: int = 120_000
-    warmup_steps: int = 2_000
+    warmup_steps: int = 5_000
     lr_init: float = 1e-7
-    lr_peak: float = 3e-4
-    lr_end: float = 1e-5
-    weight_decay: float = 0.1
+    lr_peak: float = 3.5e-4
+    lr_end: float = 3e-5
+    weight_decay: float = 0.05
     grad_clip: float = 1.0
 
     n_eval_batches: int = 32
@@ -321,7 +321,7 @@ def main():
         optax.adamw(
             learning_rate=lr_schedule,
             b1=0.9,
-            b2=0.95,
+            b2=0.97,
             eps=1e-8,
             weight_decay=config.weight_decay,
             mask=wd_mask,

@@ -12,6 +12,13 @@ BF16 = jnp.bfloat16
 FP32 = jnp.float32
 
 
+def _run_block(block, x, cos, sin, mask, key, inference):
+    return block(x, cos, sin, mask, key=key, inference=inference)
+
+
+_run_block_ckpt = jax.checkpoint(_run_block, static_argnums=(6,))
+
+
 class TransformerBlock(eqx.Module):
     ln1: RMSNorm
     attn: Attention
@@ -108,7 +115,7 @@ class Transformer(eqx.Module):
         sin = sin.astype(FP32)
         for block in self.blocks:
             k_blk, key = jax.random.split(key)
-            x = block(x, cos, sin, mask, key=k_blk, inference=inference)
+            x = _run_block_ckpt(block, x, cos, sin, mask, key, inference)
         x = self.ln_out(x).astype(FP32)
         logits = x @ self.embed.weight.T.astype(FP32)
         return logits

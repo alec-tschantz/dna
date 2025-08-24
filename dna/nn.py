@@ -5,6 +5,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.nn as jnn
+from jax import lax
 from jaxtyping import Array, Bool, Float, Int
 
 BF16 = jnp.bfloat16
@@ -88,13 +89,23 @@ class Dropout(eqx.Module):
     def __call__(
         self, x: Float[Array, "..."], *, key: jax.Array, inference: bool
     ) -> Float[Array, "..."]:
-        if inference or self.rate == 0.0:
+        if self.rate == 0.0:
             return x
+
         keep_prob = 1.0 - self.rate
-        mask = jax.random.bernoulli(key, keep_prob, shape=x.shape)
-        return jnp.where(
-            mask, x / jnp.array(keep_prob, dtype=x.dtype), jnp.zeros_like(x)
-        )
+
+        def do_keep(x):
+            return x
+
+        def do_drop(x):
+            mask = jax.random.bernoulli(key, keep_prob, shape=x.shape)
+            return jnp.where(
+                mask,
+                x / jnp.asarray(keep_prob, dtype=x.dtype),
+                jnp.zeros_like(x),
+            )
+
+        return lax.cond(inference, do_keep, do_drop, x)
 
 
 class FeedForward(eqx.Module):
@@ -121,13 +132,13 @@ class FeedForward(eqx.Module):
         if key is None:
             key = jax.random.PRNGKey(0)
         k1, k2 = jax.random.split(key, 2)
-        gate_out = self.w_gate(x).astype(FP32)
-        up_out = self.w_up(x).astype(FP32)
+        gate_out = self.w_gate(x)
+        up_out = self.w_up(x)
         ff_out = jnn.silu(gate_out) * up_out
-        ff_out = self.drop(ff_out.astype(BF16), key=k1, inference=inference)
-        y = self.w_down(ff_out).astype(BF16)
+        ff_out = self.drop(ff_out, key=k1, inference=inference)
+        y = self.w_down(ff_out)
         y = self.drop(y, key=k2, inference=inference)
-        return y.astype(BF16)
+        return y
 
 
 class Attention(eqx.Module):
@@ -169,6 +180,7 @@ class Attention(eqx.Module):
         k = apply_rope(k, cos, sin)
 
         attn_mask = None if mask is None else mask.astype(bool)[:, None, None, :]
+        # TODO: use cudnn
         attn_out = jax.nn.dot_product_attention(
             query=q,
             key=k,

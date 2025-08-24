@@ -18,4 +18,4 @@ export TF_CPP_MIN_LOG_LEVEL=1
 export TOKENIZERS_PARALLELISM=false
 
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
-python -u train.py --wandb_project "transformers"
+python -u train.py --wandb_project "fineweb-edu" --run_name "fineweb-edu"

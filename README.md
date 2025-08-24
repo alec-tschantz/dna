@@ -4,8 +4,8 @@ Implementation of [Towards Distributed Neural Architectures](https://arxiv.org/a
 
 ```sh
 pip install -e .
-python train.py --run_name "tinystories"
-python sample --run_name "tinystories"
+python train.py --run_name "fineweb-edu"
+python sample --run_name "fineweb-edu"
 ```
 
 

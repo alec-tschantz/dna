@@ -11,23 +11,26 @@ from datasets import load_dataset, IterableDataset
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 
-# ---- Text column detection ----------------------------------------------------
 def _find_text_column(ds: IterableDataset) -> str:
-    """
-    Find a plausible text column.
-    Priority order by common convention, then fall back to any string column.
-    """
-    # Prefer using declared features when available (doesn't consume the iterator)
     if getattr(ds, "features", None):
-        preferred = ["text", "content", "document", "passage", "article", "story", "body"]
-        string_cols = [k for k, v in ds.features.items() if getattr(v, "dtype", None) == "string"]
+        preferred = [
+            "text",
+            "content",
+            "document",
+            "passage",
+            "article",
+            "story",
+            "body",
+        ]
+        string_cols = [
+            k for k, v in ds.features.items() if getattr(v, "dtype", None) == "string"
+        ]
         for p in preferred:
             if p in string_cols:
                 return p
         if string_cols:
             return string_cols[0]
 
-    # Fall back: sample a single item (may hit network once in streaming)
     sample = next(iter(ds))
     preferred = ["text", "content", "document", "passage", "article", "story", "body"]
     for col in preferred:
@@ -37,12 +40,14 @@ def _find_text_column(ds: IterableDataset) -> str:
         if isinstance(v, str):
             return k
 
-    raise ValueError(f"Could not find a text column. Sample keys: {list(sample.keys())}")
+    raise ValueError(
+        f"Could not find a text column. Sample keys: {list(sample.keys())}"
+    )
 
 
-# ---- Sequence packing buffer --------------------------------------------------
 class PackedSequenceBuffer:
     """Accumulates token ids and emits fixed-length sequences without padding."""
+
     def __init__(self, seq_len: int, pad_id: int):
         self.seq_len = seq_len
         self.pad_id = pad_id
@@ -76,15 +81,7 @@ class PackedSequenceBuffer:
         return {"input_ids": ids, "attention_mask": attn}
 
 
-# ---- Streaming tokenized iterator --------------------------------------------
 class DataStream:
-    """
-    Infinite iterator of tokenized sequences from a streaming IterableDataset.
-    Supports:
-      - fixed-length padded chunks (default)
-      - optional cross-document packing without padding (pack_sequences=True)
-    Multi-process compatible via upstream .shard().
-    """
     def __init__(
         self,
         dataset: IterableDataset,
@@ -105,7 +102,9 @@ class DataStream:
         self.eos_id = tokenizer.eos_token_id or self.pad_id
 
         if self.pad_id is None or self.eos_id is None:
-            raise ValueError("Tokenizer must define either pad_token_id or eos_token_id.")
+            raise ValueError(
+                "Tokenizer must define either pad_token_id or eos_token_id."
+            )
 
         if pack_sequences:
             self.pack_buffer = PackedSequenceBuffer(self.seq_len, self.pad_id)
@@ -127,7 +126,6 @@ class DataStream:
         ids = enc["input_ids"][0].astype(np.int32)
         mask = enc["attention_mask"][0].astype(np.int32)
 
-        # Optionally stop attention after first EOS (slightly cheaper loss masking)
         if self.eos_id is not None:
             eos_pos = np.where(ids == self.eos_id)[0]
             if eos_pos.size > 0:
@@ -137,7 +135,6 @@ class DataStream:
         return {"input_ids": ids, "attention_mask": mask}
 
     def _next_text(self) -> Optional[str]:
-        # Avoid tight loops; restart on StopIteration
         for _ in range(1000):
             try:
                 ex = next(self.data_iter)
@@ -146,7 +143,7 @@ class DataStream:
                     return t
             except StopIteration:
                 self._reset_iter()
-            except Exception as e:  # network hiccups etc.
+            except Exception as e:
                 print(f"[DataStream] read error: {e}")
                 time.sleep(0.1)
         return None
@@ -166,7 +163,6 @@ class DataStream:
                     if final_seq is not None:
                         return final_seq
                     raise StopIteration("No more data available.")
-                # No padding when packing; keep all tokens, add single EOS if missing
                 toks = self.tokenizer.encode(
                     text,
                     add_special_tokens=False,
@@ -178,24 +174,20 @@ class DataStream:
 
             return self.sequence_queue.popleft()
 
-        # Simple fixed-length, padded chunk
         text = self._next_text()
         if text is None:
             raise StopIteration("No more data available.")
         return self._tokenize_fixed(text)
 
 
-# ---- Public helpers (same API as before) -------------------------------------
 def setup_tokenizer(
     tokenizer_name: str = "gpt2",
     cache_dir: Optional[str] = None,
 ) -> PreTrainedTokenizerBase:
-    """
-    Loads tokenizer once on process 0, saves to a shared cache folder, and
-    lets other processes wait until it's ready. Ensures pad_token exists.
-    """
     if cache_dir is None:
-        cache_dir = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+        cache_dir = os.environ.get(
+            "HF_HOME", os.path.expanduser("~/.cache/huggingface")
+        )
 
     cache_path = Path(cache_dir)
     tok_dir = cache_path / "tokenizers" / tokenizer_name.replace("/", "__")
@@ -204,22 +196,36 @@ def setup_tokenizer(
 
     if jax.process_index() == 0:
         if not sentinel.exists():
-            tok = AutoTokenizer.from_pretrained(tokenizer_name, cache_dir=str(cache_path))
+            tok = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                cache_dir=str(cache_path),
+                use_fast=True,
+                trust_remote_code=False,
+            )
             if tok.pad_token is None:
                 tok.pad_token = tok.eos_token
+
+            tok.padding_side = "right"
+            tok.model_max_length = int(1e9)
+            tok.clean_up_tokenization_spaces = False
+
             tok.save_pretrained(str(tok_dir))
             sentinel.write_text("OK")
     else:
-        # Others wait
         t0 = time.time()
         while not sentinel.exists():
             if time.time() - t0 > 600:
                 raise TimeoutError(f"Timeout waiting for tokenizer: {tokenizer_name}")
             time.sleep(0.25)
 
-    tok = AutoTokenizer.from_pretrained(str(tok_dir), local_files_only=True)
+    tok: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
+        str(tok_dir), local_files_only=True, use_fast=True, trust_remote_code=False
+    )
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    tok.padding_side = "right"
+    tok.model_max_length = int(1e9)
+    tok.clean_up_tokenization_spaces = False
     return tok
 
 
@@ -232,18 +238,15 @@ def _load_streaming_split(
     shuffle_buffer: int,
 ) -> IterableDataset:
     ds = load_dataset(
-        dataset_name, 
+        dataset_name,
         name=dataset_config,
         split=split,
         streaming=True,
         cache_dir=cache_dir,
     )
-
-    # Shard by multi-host/process so each host sees a distinct stream
     if jax.process_count() > 1:
         ds = ds.shard(num_shards=jax.process_count(), index=jax.process_index())
 
-    # Shuffle in streaming mode (buffered)
     ds = ds.shuffle(seed=seed, buffer_size=shuffle_buffer)
     return ds
 
@@ -256,31 +259,48 @@ def setup_data_streams(
     pack_sequences: bool = False,
     cache_dir: Optional[str] = None,
 ) -> Tuple[Iterator[Dict[str, np.ndarray]], Iterator[Dict[str, np.ndarray]]]:
-    """
-    Create infinite training and validation streams for *most* Hugging Face text datasets.
-    - Uses streaming (no pre-download), multi-process sharding, and buffered shuffle.
-    - If no 'validation' split exists, falls back to 'test' or mirrors 'train'.
-    """
     seed = int(os.environ.get("SEED", "0"))
     shuffle_buffer = int(os.environ.get("SHUFFLE_BUFFER", "50000"))
 
-    # Try to open a validation split; fall back gracefully
-    train_ds = _load_streaming_split(dataset_name, dataset_config, "train", cache_dir, seed, shuffle_buffer)
+    train_ds = _load_streaming_split(
+        dataset_name, dataset_config, "train", cache_dir, seed, shuffle_buffer
+    )
     try:
-        val_ds = _load_streaming_split(dataset_name, dataset_config, "validation", cache_dir, seed + 1, shuffle_buffer)
+        val_ds = _load_streaming_split(
+            dataset_name,
+            dataset_config,
+            "validation",
+            cache_dir,
+            seed + 1,
+            shuffle_buffer,
+        )
     except Exception:
         try:
-            val_ds = _load_streaming_split(dataset_name, dataset_config, "test", cache_dir, seed + 1, shuffle_buffer)
+            val_ds = _load_streaming_split(
+                dataset_name,
+                dataset_config,
+                "test",
+                cache_dir,
+                seed + 1,
+                shuffle_buffer,
+            )
         except Exception:
-            print(f"[data] No validation/test split for {dataset_name}; using an independent train stream for eval.")
-            val_ds = _load_streaming_split(dataset_name, dataset_config, "train", cache_dir, seed + 1, shuffle_buffer)
+            print(
+                f"[data] No validation/test split for {dataset_name}; using an independent train stream for eval."
+            )
+            val_ds = _load_streaming_split(
+                dataset_name,
+                dataset_config,
+                "train",
+                cache_dir,
+                seed + 1,
+                shuffle_buffer,
+            )
 
-    # Detect text column once (on train split)
     text_col = _find_text_column(train_ds)
     if jax.process_index() == 0:
         print(f"[data] Using text column '{text_col}' for dataset '{dataset_name}'")
 
-    # Build infinite tokenized streams
     train_stream = DataStream(
         train_ds,
         tokenizer=tokenizer,

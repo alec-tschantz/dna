@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import textwrap
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -50,3 +51,30 @@ def load_checkpoint(
     meta = json.loads((run_dir / "meta.json").read_text())
     step = meta["step"]
     return (params_loaded, static_loaded), opt_loaded, step
+
+
+def print_prompt(prompt: str, output: str, width: int = 88):
+    body_lines = [f"Prompt: {prompt}", "\n\n", f"Output: {output}"]
+    print(_ansi_box("Generation", body_lines, width=width))
+
+
+def _ansi_box(title: str, body_lines: list[str], width: int = 88) -> str:
+    h, v = "─", "│"
+    tl, tr, bl, br = "┌", "┐", "└", "┘"
+    sep_left, sep_right = "├", "┤"
+
+    def pad(s: str) -> str:
+        s = s.replace("\t", " ")
+        return s + " " * max(0, width - 4 - len(s))
+
+    top = f"{tl}{h*(width-2)}{tr}"
+    title_line = f"{v} {pad(title)} {v}"
+    mid = f"{sep_left}{h*(width-2)}{sep_right}"
+    bot = f"{bl}{h*(width-2)}{br}"
+
+    lines = [top, title_line, mid]
+    for ln in body_lines:
+        for wrapped in textwrap.wrap(ln, width=width - 4, break_long_words=False):
+            lines.append(f"{v} {pad(wrapped)} {v}")
+    lines.append(bot)
+    return "\n".join(lines)

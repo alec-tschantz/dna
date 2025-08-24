@@ -9,27 +9,28 @@ import jax
 from jax import random
 import tyro
 
-from dna import Transformer, generate, setup_tokenizer
+from dna import Transformer, generate, setup_tokenizer, print_prompt
 
 
 @dataclass
 class SampleConfig:
     ckpt_dir: str = "checkpoints"
-    tokenizer_name: str = "gpt2"
     run_name: str = field(default="", help="Name of the run to load checkpoint from")
     prompts: List[str] = field(
         default_factory=lambda: [
-            "Once upon a time",
-            "The little robot",
-            "In a magical forest",
-            "The brave princess",
-            "The king of France",
-            "My mother met a dog",
-            "Oh no!",
-            "Somebody help",
+            "Explain how TLS certificates enable both authentication and encryption, in plain terms.",
+            "Why are stars twinkly but planets not? Answer for a curious 10-year-old.",
+            "You have 3 jugs of 3L, 5L, and 8L. How can you measure exactly 4L? Show steps.",
+            "A farmer has goats and chickens. There are 22 heads and 56 legs. How many of each?",
+            "Write a Python function that returns the top-k most frequent words in a list of strings.",
+            "Describe and compare BFS and DFS. When does each shine?",
+            "Derive the gradient of softmax cross-entropy loss with respect to the logits.",
+            "What is the difference between variance and standard deviation? Give an intuitive example.",
+            "In a small coastal village, a young cartographer discovers old maps that don't match the shoreline.",
+            "Summarize the main arguments for and against universal basic income in ~5 bullet points.",
         ]
     )
-    gen_max_new: int = 200
+    gen_max_new: int = 256
     gen_temperature: float = 0.8
 
 
@@ -57,7 +58,7 @@ def main():
     model_loaded = eqx.tree_deserialise_leaves(run_dir / "model.eqx", model_template)
     params, static = eqx.partition(model_loaded, eqx.is_inexact_array)
 
-    tokenizer = setup_tokenizer(config.tokenizer_name)
+    tokenizer = setup_tokenizer()
 
     key = random.PRNGKey(0)
     outputs = generate(
@@ -70,11 +71,8 @@ def main():
         temperature=cfg.gen_temperature,
     )
 
-    print("\n" + "=" * 80)
-    print("Generated text samples:")
-    for prompt, text in zip(cfg.prompts, outputs):
-        print(f"Prompt: {prompt}\n→ {text}\n")
-    print("=" * 80 + "\n")
+    for prompt, text in zip(config.prompts, generated):
+        print_prompt(prompt, text)
 
 
 if __name__ == "__main__":
